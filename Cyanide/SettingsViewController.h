@@ -52,6 +52,8 @@ extern NSString * const kSettingsThemerEnabled;
 extern NSString * const kSettingsThemerThemeID;
 extern NSString * const kSettingsThemerCustomThemePath;
 extern NSString * const kSettingsThemerCustomThemeName;
+extern NSString * const kSettingsNotepadEnabled;
+extern NSString * const kSettingsNotepadText;
 
 extern NSString * const kSettingsExperimentalTweaksEnabled;
 

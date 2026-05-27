@@ -17,6 +17,7 @@
 #import "tweaks/nano_registry.h"
 #import "tweaks/killallapps.h"
 #import "tweaks/themer.h"
+#import "tweaks/notepad_tweak.h"
 
 #import <objc/runtime.h>
 #import "DSKeepAlive.h"
@@ -169,6 +170,9 @@ NSString * const kSettingsThemerThemeID = @"ThemerThemeID";
 NSString * const kSettingsThemerCustomThemePath = @"ThemerCustomThemePath";
 NSString * const kSettingsThemerCustomThemeName = @"ThemerCustomThemeName";
 
+NSString * const kSettingsNotepadEnabled = @"NotepadEnabled";
+NSString * const kSettingsNotepadText = @"NotepadText";
+
 // Master gate for experimental tweaks. When NO (default), packages that opt
 // into the experimental category are hidden from the Installer and the
 // Settings bundle list, and any currently-enabled experimental tweak is
@@ -198,6 +202,8 @@ extern int  escape_sbx_demo3(void);
 static BOOL g_kexploit_done = NO;
 static volatile int g_settings_actions_running = 0;
 static volatile int g_settings_respring_cleanup_running = 0;
+static volatile int g_notepad_live_running = 0;
+static volatile int g_notepad_live_stop_requested = 0;
 static volatile int g_settings_actions_rerun_requested = 0;
 static volatile int g_springboard_rc_ready = 0;
 static volatile int g_springboard_sandbox_escaped = 0;
@@ -352,6 +358,7 @@ static NSArray<NSString *> *settings_rc_backed_tweak_keys(void)
             kSettingsDSDoubleTapToLock,
             kSettingsLayoutExtrasEnabled,
             kSettingsThemerEnabled,
+            kSettingsNotepadEnabled,
         ];
     });
     return keys;
@@ -568,6 +575,7 @@ static void settings_forget_springboard_tweak_state_locked(void)
     typebanner_forget_remote_state();
     killallapps_forget_remote_state();
     themer_forget_remote_state();
+    notepad_tweak_forget_remote_state();
 }
 
 static void settings_stop_springboard_tweaks_locked(const char *reason,
@@ -608,6 +616,7 @@ static void settings_stop_springboard_tweaks_locked(const char *reason,
     printf("[SETTINGS] %s Themer stop result=%d\n",
            reason ?: "SpringBoard cleanup", themeStopped);
 
+    notepad_tweak_stop_in_session();
     settings_forget_springboard_tweak_state_locked();
 }
 
@@ -2852,6 +2861,30 @@ static void settings_schedule_live_apply_for_key(NSString *key)
 
     NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
 
+    if ([key isEqualToString:kSettingsNotepadEnabled]) {
+        if ([d boolForKey:kSettingsNotepadEnabled] && g_springboard_rc_ready) {
+            dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                @synchronized (settings_rc_lock()) {
+                    if (settings_cleanup_in_progress() || !g_springboard_rc_ready) return;
+                    NSString *noteText = [d stringForKey:kSettingsNotepadText] ?: @"Hello from Cyanide!";
+                    bool ok = notepad_tweak_apply_in_session(noteText);
+                    settings_mark_tweak_applied(kSettingsNotepadEnabled,
+                                                ok && [d boolForKey:kSettingsNotepadEnabled]);
+                }
+                settings_notify_package_queue_changed_async();
+            });
+        } else if (![d boolForKey:kSettingsNotepadEnabled]) {
+            settings_mark_tweak_applied(kSettingsNotepadEnabled, NO);
+            settings_notify_package_queue_changed_async();
+            if (g_springboard_rc_ready) dispatch_async(dispatch_get_global_queue(0, 0), ^{
+                @synchronized (settings_rc_lock()) {
+                    if (g_springboard_rc_ready) notepad_tweak_stop_in_session();
+                }
+            });
+        }
+        return;
+    }
+
     if (settings_key_is_typebanner(key)) {
         // TypeBanner owns its own daemon + SpringBoard sessions, but its
         // bootstrap is serialized with the shared RemoteCall lock.
@@ -3108,6 +3141,8 @@ void settings_register_defaults(void)
         kSettingsNanoMinPairing:       @(kNanoDefaultMinPairing),
         kSettingsNanoMinPairingChipID: @(kNanoDefaultMinPairingChipID),
         kSettingsNanoMinQuickSwitch:   @(kNanoDefaultMinQuickSwitch),
+        kSettingsNotepadEnabled: @NO,
+        kSettingsNotepadText: @"Hello from Cyanide!",
     }];
     // Signal Readouts ships behind the experimental gate. If the master
     // experimental switch is off, force its enable bit off so a previously
@@ -3162,9 +3197,10 @@ void settings_run_actions(void)
             BOOL runTypeBanner = [d boolForKey:kSettingsTypeBannerEnabled];
             BOOL runThemer = [d boolForKey:kSettingsThemerEnabled];
             BOOL runLayoutExtras = [d boolForKey:kSettingsLayoutExtrasEnabled];
+            BOOL runNotepad = [d boolForKey:kSettingsNotepadEnabled];
             // TypeBanner prewarms its hidden SpringBoard window during Apply
             // and reuses the open SpringBoard session for text-only updates.
-            BOOL needsSpringBoard = runSandboxEscape || runSBC || runDarkTweaks || runStatBar || runRSSI || runAxonLite || runLayoutExtras || runTypeBanner || runThemer;
+            BOOL needsSpringBoard = runSandboxEscape || runSBC || runDarkTweaks || runStatBar || runRSSI || runAxonLite || runLayoutExtras || runTypeBanner || runThemer || runNotepad;
 
             NSUInteger total = 1;
             if (patchSandboxExt) total++;
@@ -3179,6 +3215,7 @@ void settings_run_actions(void)
             if (runRSSI) total++;
             if (runAxonLite) total++;
             if (runTypeBanner) total++;
+            if (runNotepad) total++;
             NSUInteger step = 0;
 
             settings_log_run_context();
@@ -3263,8 +3300,9 @@ void settings_run_actions(void)
                    runRSSI,
                    [d boolForKey:kSettingsRSSIDisplayWifi],
                    [d boolForKey:kSettingsRSSIDisplayCell],
-                   runAxonLite,
-                   g_springboard_rc_ready);
+	                   runAxonLite,
+	                   runNotepad,
+	                   g_springboard_rc_ready);
 
             if (runPowercuff) {
                 settings_progress(&step, total, "Applying Powercuff via thermalmonitord");
@@ -3434,10 +3472,18 @@ void settings_run_actions(void)
                                  (ok || deferred) ? "[OK]" : "[WARN]",
                                  ok ? "overlay is live" :
                                  (deferred ? "will start when notifications are visible" : "did not start cleanly"));
-                        cyanide_upload_log_milestone(ok ? @"axon-lite-initial-applied" :
-                                                     (deferred ? @"axon-lite-initial-deferred" : @"axon-lite-initial-failed"));
-                    }
-                }
+	                    cyanide_upload_log_milestone(ok ? @"axon-lite-initial-applied" :
+	                                                     (deferred ? @"axon-lite-initial-deferred" : @"axon-lite-initial-failed"));
+	                    }
+	
+	                    if ([d boolForKey:kSettingsNotepadEnabled]) {
+	                        NSString *noteText = [d stringForKey:kSettingsNotepadText] ?: @"Hello from Cyanide!";
+	                        bool ok = notepad_tweak_apply_in_session(noteText);
+	                        settings_mark_tweak_applied(kSettingsNotepadEnabled,
+	                                                    ok && [d boolForKey:kSettingsNotepadEnabled]);
+	                        printf("[SETTINGS] Notepad result=%d\n", ok);
+	                    }
+	                }
 
                 if (runStatBar) {
                     settings_start_statbar_live_loop();
@@ -3536,6 +3582,7 @@ typedef NS_ENUM(NSInteger, SettingsSection) {
     SectionLayoutExtras,
     SectionNanoRegistry,
     SectionThemer,
+    SectionNotepad,
     SectionCount,
 };
 
@@ -4222,6 +4269,15 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
     return @[];
 }
 
+- (NSArray<NSDictionary *> *)notepadRows
+{
+    return @[
+        @{ @"kind": @"info",
+           @"title": @"Notepad Text",
+           @"subtitle": @"Edit the text displayed in the SpringBoard notepad overlay." },
+    ];
+}
+
 - (NSArray<NSDictionary *> *)typebannerRows
 {
     return @[
@@ -4342,6 +4398,7 @@ static _CyanideMailDelegate *_cyanide_mail_delegate(void) {
         @{ @"title": @"Powercuff",          @"icon": @"bolt.slash.fill",                     @"color": [UIColor systemOrangeColor], @"section": @(SectionPowercuff) },
         @{ @"title": @"SpringBoard Tweaks", @"icon": @"apps.iphone",                         @"color": [UIColor systemIndigoColor], @"section": @(SectionDarkSwordTweaks) },
         @{ @"title": @"Home Layout Extras", @"icon": @"square.dashed.inset.filled",          @"color": [UIColor systemPurpleColor], @"section": @(SectionLayoutExtras) },
+        @{ @"title": @"Notepad",           @"icon": @"note.text",                          @"color": [UIColor systemYellowColor], @"section": @(SectionNotepad) },
     ];
 }
 

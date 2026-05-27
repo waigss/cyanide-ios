@@ -18,6 +18,7 @@ static const NSInteger kSecPowercuff    = 9;
 static const NSInteger kSecLayoutExtras = 11;
 static const NSInteger kSecNanoRegistry = 12;
 static const NSInteger kSecThemer       = 13;
+static const NSInteger kSecNotepad      = 14;
 
 + (NSArray<Package *> *)allPackages
 {
@@ -150,6 +151,19 @@ static const NSInteger kSecThemer       = 13;
                                           isNew:YES];
         layoutExtras.settingsSection = kSecLayoutExtras;
 
+        Package *notepad = [[Package alloc] initWithIdentifier:@"com.darksword.notepad"
+                                           name:@"Notepad"
+                               shortDescription:@"Sticky notepad overlay on SpringBoard"
+                                longDescription:@"Adds a semi-transparent notepad overlay window to SpringBoard. The overlay displays a short text note you set in the Settings tab. Tap Apply Tweaks to show it; tap again to update the text. Hides when the tweak is disabled."
+                                        version:version
+                                         author:@"zeroxjf"
+                                       category:@"SpringBoard Tweaks"
+                                     symbolName:@"note.text"
+                                           kind:PackageInstallKindToggle
+                                     enabledKey:kSettingsNotepadEnabled
+                                          isNew:YES];
+        notepad.settingsSection = kSecNotepad;
+
         Package *nanoRegistry = [[Package alloc] initWithIdentifier:@"com.darksword.nanoregistry"
                                            name:@"Watch Pairing Override"
                                shortDescription:@"Pair a newer watch or revive an older one"
@@ -247,6 +261,7 @@ static const NSInteger kSecThemer       = 13;
             nanoRegistry,
             typeBanner,
             themer,
+            notepad,
         ];
     });
     return list;
