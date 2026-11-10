@@ -1,0 +1,140 @@
+name: Build Cyanide IPA
+
+# Builds Cyanide (iOS tweak runner) into an *unsigned* .ipa on a macOS runner.
+# No signing certificate / provisioning profile is required: the IPA is meant
+# for TrollStore / AltStore / Sideloadly, which re-sign on install.
+
+on:
+  workflow_dispatch:
+    inputs:
+      configuration:
+        description: Xcode build configuration
+        type: choice
+        options:
+          - Release
+          - Debug
+        default: Release
+      publish_release:
+        description: Attach the built IPA to a GitHub Release
+        type: boolean
+        default: false
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build unsigned IPA
+    runs-on: macos-26
+    timeout-minutes: 90
+    env:
+      SCHEME: Cyanide
+      CONFIG: ${{ github.event.inputs.configuration || 'Release' }}
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Show toolchain
+        run: |
+          set -euo pipefail
+          xcode-select -p
+          xcodebuild -version
+          echo "iOS SDK: $(xcrun --sdk iphoneos --show-sdk-version)"
+          xcrun --sdk iphoneos --show-sdk-path
+
+      - name: Install ldid (signs libxpf.dylib for iOS)
+        run: |
+          set -euo pipefail
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid || brew install --HEAD ldid || {
+              echo "::group::building ldid from source"
+              git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+              make -C /tmp/ldid -j"$(sysctl -n hw.ncpu)"
+              sudo install -m 0755 /tmp/ldid/ldid /usr/local/bin/ldid
+              echo "::endgroup::"
+            }
+          fi
+          command -v ldid
+          ldid 2>&1 | head -3 || true
+
+      - name: Build XPF dylib for iphoneos
+        run: |
+          set -euo pipefail
+          make -C Cyanide/XPF output/ios/libxpf.dylib
+          file Cyanide/XPF/output/ios/libxpf.dylib
+          ls -l Cyanide/XPF/output/ios/
+          # Xcode copies this into Cyanide.app/Frameworks, so it must exist
+          # before xcodebuild runs.
+          test -f Cyanide/XPF/output/ios/libxpf.dylib
+
+      - name: Build app and package IPA
+        run: ./scripts/build.sh
+
+      - name: Verify IPA
+        id: verify
+        run: |
+          set -euo pipefail
+          ipa=$(ls -1 build/Cyanide-*.ipa | head -1)
+          echo "ipa=${ipa}" >> "$GITHUB_OUTPUT"
+          unzip -l "$ipa" | head -20
+
+          tmp=$(mktemp -d)
+          unzip -q "$ipa" -d "$tmp"
+          test -f "$tmp/Payload/Cyanide.app/Cyanide"
+          ver=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$tmp/Payload/Cyanide.app/Info.plist")
+          bid=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$tmp/Payload/Cyanide.app/Info.plist")
+          echo "version=${ver}" >> "$GITHUB_OUTPUT"
+          echo "bundle_id=${bid}" >> "$GITHUB_OUTPUT"
+
+          du -h "$ipa"
+          shasum -a 256 "$ipa" | tee "${ipa}.sha256"
+
+          {
+            echo "### Cyanide ${ver}"
+            echo ""
+            echo "- bundle id: \`${bid}\`"
+            echo "- configuration: \`${CONFIG}\`"
+            echo "- size: $(du -h "$ipa" | cut -f1)"
+            echo "- sha256: \`$(cut -d' ' -f1 "${ipa}.sha256")\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Cyanide-${{ steps.verify.outputs.version }}-${{ env.CONFIG }}
+          path: |
+            build/Cyanide-*.ipa
+            build/Cyanide-*.ipa.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        if: github.event.inputs.publish_release == 'true' || startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          ipa=$(ls -1 build/Cyanide-*.ipa | head -1)
+          ver="${{ steps.verify.outputs.version }}"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME}"
+          else
+            tag="ci-${GITHUB_RUN_NUMBER}"
+          fi
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "$ipa" "${ipa}.sha256" --clobber
+          else
+            gh release create "$tag" "$ipa" "${ipa}.sha256" \
+              --title "Cyanide ${ver} (${tag})" \
+              --notes "Unsigned IPA built from ${GITHUB_SHA} by GitHub Actions (configuration: ${CONFIG})."
+          fi
