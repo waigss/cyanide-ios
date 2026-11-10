@@ -6307,3 +6307,10 @@ void cyanide_present_contact(UIViewController *host)
 }
 
 @end
+
+// Public forwarder: lets other screens bring up kernel r/w without going
+// through the full settings action pipeline.
+BOOL settings_ensure_kernel_ready(void)
+{
+    return settings_ensure_kexploit();
+}
