@@ -119,9 +119,12 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
                                     useMigFilterBypass:(attempt == 1)
                                firstExceptionTimeoutMS:timeoutMS];
 
-        if (session) return session;
-
+        // 成功时 init_remote_call 已经消费并清零；失败时要自己清，
+        // 否则这个 override 会留给下一次别的进程的会话。
+        BOOL ok = (session != nil);
         g_RC_targetProcOverride = 0;
+
+        if (ok) return session;
 
         RemoteCallInitFailure failure = remote_call_last_init_failure();
         if (failure == RemoteCallInitFailureKRWUnavailable ||
@@ -362,6 +365,18 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 - (BOOL)installOverlayLocked
 {
     if (!kexploit_krw_ready()) return NO;
+
+    // proc_self() 还没解析出来时，proc_find_by_name() 会直接返回 0，
+    // init_remote_call 只会打一行 "process not found or invalid ... proc=0"。
+    // 与其打噪音日志，不如这一轮直接跳过，下一拍重新解析。
+    if (!proc_self()) {
+        kutils_reset_self_cache();
+        return NO;
+    }
+
+    // 上一次给目标进程设置的 override 绝不能被 SpringBoard 会话消费掉，
+    // 否则会把 remote call 的线程开进目标 App 里。
+    g_RC_targetProcOverride = 0;
 
     RemoteCallSession *session =
         [[RemoteCallSession alloc] initWithProcess:@"SpringBoard"
@@ -628,6 +643,13 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 {
     if (!kexploit_krw_ready()) {
         [self setStatusLineLocked:@"内核未就绪"];
+        return;
+    }
+
+    // 同上：self proc 没解析出来时整张进程表都走不动，先等下一拍。
+    if (!proc_self()) {
+        kutils_reset_self_cache();
+        [self setStatusLineLocked:@"内核会话建立中…"];
         return;
     }
 
