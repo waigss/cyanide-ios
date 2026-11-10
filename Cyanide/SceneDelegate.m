@@ -24,7 +24,7 @@
     struct utsname info;
     memset(&info, 0, sizeof(info));
     uname(&info);
-    clog(@"==== Cyanide 启动：iOS %@ 机型 %s 版本 %@ ====",
+    cyanide_log(@"==== Cyanide 启动：iOS %@ 机型 %s 版本 %@ ====",
          UIDevice.currentDevice.systemVersion,
          info.machine,
          [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?");
