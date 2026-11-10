@@ -39,9 +39,6 @@ static const NSTimeInterval kInitTimeout = 240.0;
 @property (nonatomic, assign) BOOL lastInitFailed;
 @property (nonatomic, assign) NSUInteger kernelInitToken;
 
-// 默认只看应用进程（UID 501）；点右上角可以在「仅应用 / 全部」之间切换。
-@property (nonatomic, assign) BOOL showAllProcesses;
-@property (nonatomic, strong) UIBarButtonItem *filterItem;
 
 @end
 
@@ -72,16 +69,10 @@ static const NSTimeInterval kInitTimeout = 240.0;
     self.searchController = search;
     self.definesPresentationContext = YES;
 
-    self.filterItem = [[UIBarButtonItem alloc] initWithTitle:@"全部"
-                                                      style:UIBarButtonItemStylePlain
-                                                     target:self
-                                                     action:@selector(toggleProcessFilter)];
-    self.navigationItem.rightBarButtonItems = @[
+    self.navigationItem.rightBarButtonItem =
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self
-                                                      action:@selector(reloadProcesses)],
-        self.filterItem,
-    ];
+                                                      action:@selector(reloadProcesses)];
 
     [self buildPlaceholderView];
 
@@ -184,8 +175,8 @@ static const NSTimeInterval kInitTimeout = 240.0;
     } else if (self.searchController.searchBar.text.length > 0) {
         text = [NSString stringWithFormat:@"没有匹配「%@」的进程",
                 self.searchController.searchBar.text];
-    } else if (!self.showAllProcesses && [self uidProbeUsable]) {
-        text = @"当前没有正在运行的应用进程。\n点右上角「全部」可以看到系统守护进程。";
+    } else if ([self uidProbeUsable]) {
+        text = @"当前没有正在运行的应用进程。";
     } else {
         text = @"没有读取到进程";
     }
@@ -314,19 +305,12 @@ static const NSTimeInterval kInitTimeout = 240.0;
     return NO;
 }
 
-- (void)toggleProcessFilter
-{
-    self.showAllProcesses = !self.showAllProcesses;
-    self.filterItem.title = self.showAllProcesses ? @"仅应用" : @"全部";
-    [self applyFilter];
-}
-
 - (void)applyFilter
 {
     NSString *query = self.searchController.searchBar.text ?: @"";
     query = [query stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
-    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+    BOOL appsOnly = [self uidProbeUsable];
 
     NSMutableArray<NSDictionary<NSString *, id> *> *filtered = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *row in self.allProcesses) {
@@ -361,7 +345,7 @@ static const NSTimeInterval kInitTimeout = 240.0;
 {
     if (self.visibleProcesses.count == 0) return nil;
 
-    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+    BOOL appsOnly = [self uidProbeUsable];
     if (appsOnly) {
         return [NSString stringWithFormat:@"共 %lu 个应用进程",
                 (unsigned long)self.visibleProcesses.count];
@@ -374,9 +358,9 @@ static const NSTimeInterval kInitTimeout = 240.0;
 {
     if (self.visibleProcesses.count == 0) return nil;
 
-    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+    BOOL appsOnly = [self uidProbeUsable];
     if (appsOnly) {
-        return @"默认只列出应用进程（UID 501）。点右上角「全部」可以看到系统守护进程。点任意一行查看该进程加载的模块与基址。";
+        return @"只列出应用进程（UID 501）。点任意一行查看该进程的库地址，再点可 dump 模块。";
     }
     return @"UID 501 为移动用户（普通 App），其余多为系统守护进程。点任意一行查看该进程加载的模块与基址。";
 }
