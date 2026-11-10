@@ -29,6 +29,7 @@
 #import "../tweaks/remote_objc.h"
 #import "../utils/sandbox.h"
 #import "CyanideLog.h"
+#import "KernelUserMemory.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -353,6 +354,34 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
             RemoteCallSession *session = cyanide_attach_to_process(name, procAddr, 12000, hint);
 
             if (!session) {
+                // 附加失败（目标被挂起或带反劫持保护）→ 改走内核页表直读。
+                cyanide_log(@"[库] 附加失败，改用内核页表直读 目标=%@", name);
+
+                NSString *kumError = nil;
+                NSArray<NSDictionary<NSString *, id> *> *kumRows = nil;
+                if (kum_prepare(procAddr)) {
+                    kumRows = kum_read_dyld_images(&kumError);
+                } else {
+                    kumError = @"页表上下文准备失败（pmap/tte 不可用）";
+                }
+
+                if (kumRows.count > 0) {
+                    NSUInteger idx = 0;
+                    for (NSDictionary<NSString *, id> *row in kumRows) {
+                        NSString *path = row[@"path"] ?: @"";
+                        if (idx == 0) {
+                            [mainItems addObject:row];
+                        } else if (module_path_is_third_party(path)) {
+                            [thirdItems addObject:row];
+                        } else {
+                            [systemItems addObject:row];
+                        }
+                        idx++;
+                    }
+                    cyanide_log(@"[库] 内核直读成功：%lu 个模块（未附加、未建线程）",
+                                (unsigned long)kumRows.count);
+                } else {
+                    cyanide_log(@"[库] 内核直读也失败：%@", kumError ?: @"未知原因");
                 RemoteCallInitFailure reason = remote_call_last_init_failure();
                 const char *desc = (reason != RemoteCallInitFailureNone)
                     ? remote_call_init_failure_description(reason) : NULL;
@@ -362,6 +391,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                            @"目标 App 被系统挂起时没有运行中的线程，异常端口劫持必然超时；"
                            @"SpringBoard 这类常驻进程一般可以成功。",
                            name, reasonText];
+                }
             } else {
                 uint64_t count = [session doRemoteCallStableWithTimeout:8000
                                                           functionName:"_dyld_image_count"
