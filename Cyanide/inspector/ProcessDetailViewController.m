@@ -26,6 +26,7 @@
 #import "../TaskRop/RemoteCall.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/kutils.h"
+#import "../tweaks/remote_objc.h"
 #import "../utils/sandbox.h"
 #import "CyanideLog.h"
 #import "../DSKeepAlive.h"
