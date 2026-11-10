@@ -8,10 +8,7 @@
 #import "SceneDelegate.h"
 #import "SettingsViewController.h"
 #import "UpdateChecker.h"
-#import "inspector/LibraryOverlayController.h"
-
-// 自动悬浮窗要观察的进程名（王者荣耀的可执行文件名）。
-static NSString * const kLibraryOverlayTargetProcess = @"smoba";
+#import "inspector/ProcessListViewController.h"
 
 @interface SceneDelegate ()
 @property (nonatomic, assign) BOOL didSelectInitialTab;
@@ -22,21 +19,14 @@ static NSString * const kLibraryOverlayTargetProcess = @"smoba";
 
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
-    UITabBarController *tab = (UITabBarController *)self.window.rootViewController;
-    if ([tab isKindOfClass:UITabBarController.class] && tab.viewControllers.count > 1) {
-        // iOS 26+: collapse the floating tab bar into a pill while the user
-        // scrolls down, expand it back on scroll up. Falls through silently
-        // on older OSes since the selector won't be present.
-        SEL minSel = NSSelectorFromString(@"setTabBarMinimizeBehavior:");
-        if ([tab respondsToSelector:minSel]) {
-            NSMethodSignature *sig = [tab methodSignatureForSelector:minSel];
-            NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
-            inv.target = tab;
-            inv.selector = minSel;
-            NSInteger onScrollDown = 1; // UITabBarMinimizeBehavior.onScrollDown
-            [inv setArgument:&onScrollDown atIndex:2];
-            [inv invoke];
-        }
+    // 精简版：不要 TabBar / 安装器 / 设置页，启动直接进「进程」页。
+    UIViewController *root = self.window.rootViewController;
+    if (root) {
+        ProcessListViewController *list =
+            [[ProcessListViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:list];
+        nav.navigationBar.prefersLargeTitles = NO;
+        self.window.rootViewController = nav;
     }
 }
 
@@ -91,7 +81,6 @@ static NSString * const kLibraryOverlayTargetProcess = @"smoba";
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     [self selectInitialTabIfNeeded];
     settings_application_did_become_active();
-    [self startLibraryOverlayIfNeeded];
     // Independent paths: log collection opt-in notice (one-time) and update
     // check (every foreground; UpdateChecker enforces a per-process + 24-hour
     // persisted throttle so the API isn't hammered).
@@ -101,17 +90,6 @@ static NSString * const kLibraryOverlayTargetProcess = @"smoba";
     [self runUpdateCheck];
 }
 
-
-- (void)startLibraryOverlayIfNeeded
-{
-    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
-    if ([overlay isActive]) return;
-    if (overlay.dismissed) return;   // 用户主动关过，本次运行内不再打扰
-
-    // 悬浮窗建在 SpringBoard 里，需要内核读写；控制器会先自动初始化内核，
-    // 成功后再把窗口挂出来，之后每 3 秒刷新一次目标进程的库列表。
-    [overlay autoStartForProcessName:kLibraryOverlayTargetProcess];
-}
 
 - (void)sceneWillResignActive:(UIScene *)scene {
     // Called when the scene will move from an active state to an inactive state.
