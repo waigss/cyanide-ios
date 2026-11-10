@@ -26,6 +26,7 @@
 #import "../TaskRop/RemoteCall.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../utils/sandbox.h"
+#import "CyanideLog.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
 // 从而读得到别的 App 容器里的文件。
@@ -34,14 +35,29 @@ extern int escape_sbx_demo2(void);
 // 拿到「能读 /private/var」的文件访问能力。已具备时直接返回，避免重复逃逸。
 static BOOL cyanide_ensure_file_access(void)
 {
-    if (check_sandbox_var_rw() == 0) return YES;
+    if (check_sandbox_var_rw() == 0) {
+        clog(@"[文件访问] 已具备 /private/var 读写，跳过逃逸");
+        return YES;
+    }
 
-    if (escape_sbx_demo2() == 0 && check_sandbox_var_rw() == 0) return YES;
+    clog(@"[文件访问] 当前无 /private/var 读写，开始逃逸");
 
-    if (patch_sandbox_ext() == 0 && check_sandbox_var_rw() == 0) return YES;
+    int r1 = escape_sbx_demo2();
+    int c1 = check_sandbox_var_rw();
+    clog(@"[文件访问] escape_sbx_demo2()=%d 校验=%d", r1, c1);
+    if (r1 == 0 && c1 == 0) return YES;
 
-    if (borrow_sandbox_ext("SpringBoard") == 0 && check_sandbox_var_rw() == 0) return YES;
+    int r2 = patch_sandbox_ext();
+    int c2 = check_sandbox_var_rw();
+    clog(@"[文件访问] patch_sandbox_ext()=%d 校验=%d", r2, c2);
+    if (r2 == 0 && c2 == 0) return YES;
 
+    int r3 = borrow_sandbox_ext("SpringBoard");
+    int c3 = check_sandbox_var_rw();
+    clog(@"[文件访问] borrow_sandbox_ext(SpringBoard)=%d 校验=%d", r3, c3);
+    if (r3 == 0 && c3 == 0) return YES;
+
+    clog(@"[文件访问] 三种方式全部失败");
     return NO;
 }
 
@@ -142,6 +158,9 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                                                     void (^hint)(NSString *text))
 {
     for (int attempt = 0; attempt < 3; attempt++) {
+        NSString *strategy = attempt == 0 ? @"普通"
+                            : (attempt == 1 ? @"MIG-filter-bypass" : @"original-thread-only");
+
         if (hint) {
             NSString *text = nil;
             if (attempt == 0) {
@@ -154,10 +173,13 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
             hint(text);
         }
 
+        clog(@"[附加] 目标=%@ proc=0x%llx 策略=%@ 开始", name, procAddr, strategy);
+
         if (procAddr != 0) {
             g_RC_targetProcOverride = procAddr;
         }
 
+        CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
         RemoteCallSession *session = nil;
         if (attempt == 0) {
             session = [[RemoteCallSession alloc] initWithProcess:name
@@ -173,18 +195,32 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                                         firstExceptionTimeoutMS:12000
                                              originalThreadOnly:YES];
         }
+        double elapsedMS = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
 
-        if (session) return session;
+        if (session) {
+            clog(@"[附加] 成功 策略=%@ 耗时=%.0fms 目标pid=%u",
+                 strategy, elapsedMS, session.pid);
+            return session;
+        }
 
         g_RC_targetProcOverride = 0;
 
         RemoteCallInitFailure lastFailure = remote_call_last_init_failure();
+        const char *desc = (lastFailure != RemoteCallInitFailureNone)
+            ? remote_call_init_failure_description(lastFailure) : NULL;
+        clog(@"[附加] 失败 策略=%@ 耗时=%.0fms 原因=%s(%d) 失败pid=%u krw_ready=%d self_proc=0x%llx",
+             strategy, elapsedMS, desc ? desc : "未知", (int)lastFailure,
+             remote_call_last_init_failure_pid(),
+             kexploit_krw_ready() ? 1 : 0, proc_self());
+
         if (lastFailure == RemoteCallInitFailureKRWUnavailable ||
             lastFailure == RemoteCallInitFailureProcessMissing) {
-            break;  // 再重试也没有意义
+            clog(@"[附加] 该原因重试无意义，停止");
+            break;
         }
     }
 
+    clog(@"[附加] 三种策略全部失败：目标=%@ proc=0x%llx", name, procAddr);
     return nil;
 }
 
@@ -315,6 +351,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                                                           functionName:"_dyld_image_count"
                                                                     x0:0 x1:0 x2:0 x3:0
                                                                     x4:0 x5:0 x6:0 x7:0];
+                clog(@"[库] 目标=%@ 模块数=%llu", name, count);
                 if (count == 0) {
                     failure = @"目标进程没有报告任何库（_dyld_image_count 返回 0）。";
                 } else if (count > kModuleCountLimit) {
@@ -370,6 +407,10 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
             }
             // session 由 ARC 释放，dealloc 里会收掉目标线程。
         }
+
+        clog(@"[库] 读取结束 主程序=%lu 第三方=%lu 系统=%lu 截断=%d",
+             (unsigned long)mainItems.count, (unsigned long)thirdItems.count,
+             (unsigned long)systemItems.count, truncated ? 1 : 0);
 
         if (mainItems.count > 0) {
             [sections addObject:@{@"kind": kGroupKindMain, @"title": @"主程序", @"items": mainItems}];
@@ -541,6 +582,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
         NSString *resultMessage = nil;
 
         if (!kexploit_krw_ready()) {
+            clog(@"[Dump] 中止：内核未就绪");
             resultTitle = @"内核未就绪";
             resultMessage = @"请先回到「进程」页初始化内核。";
         } else if (!cyanide_ensure_file_access()) {
@@ -562,8 +604,15 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
             fileName = [fileName stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
             NSString *destPath = [dumpDir stringByAppendingPathComponent:fileName];
 
+            clog(@"[Dump] 源文件=%@", sourcePath);
+            clog(@"[Dump] 目标文件=%@", destPath);
+
+            CFAbsoluteTime copyStart = CFAbsoluteTimeGetCurrent();
             NSError *error = nil;
             BOOL copied = [fm copyItemAtPath:sourcePath toPath:destPath error:&error];
+            clog(@"[Dump] 复制结果=%d 耗时=%.0fms 错误=%@",
+                 copied ? 1 : 0, (CFAbsoluteTimeGetCurrent() - copyStart) * 1000.0,
+                 error.localizedDescription ?: @"无");
 
             if (copied) {
                 NSDictionary *attrs = [fm attributesOfItemAtPath:destPath error:NULL];
