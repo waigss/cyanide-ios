@@ -12,6 +12,8 @@
 #import "../kexploit/kutils.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/offsets.h"
+#import "../kexploit/xpaci.h"
+#import "CyanideLog.h"
 
 #import <string.h>
 #import <stdlib.h>
@@ -172,23 +174,46 @@ static BOOL kum_probe_all_image_infos(uint64_t va, uint32_t *outCount, uint64_t 
     return YES;
 }
 
-// 在 task 结构里找 all_image_info_addr：值必须是目标地址空间内的指针对齐地址，
-// 且指向的内容通过上面的形态校验。
-static uint64_t kum_find_all_image_info(uint64_t *outCount, uint64_t *outArray)
+// 在 task 结构里找 all_image_info_addr。
+// 注意：这个字段是「用户态地址」，必须用 kread64 原样读；
+// 用 kread_ptr（内部 xpaci）会把用户指针弄坏。为兼容 PAC 签名的情况，
+// 每个字段同时尝试「原始值」和「xpaci 后的值」两种形态。
+static uint64_t kum_find_all_image_info(uint64_t *outCount, uint64_t *outArray,
+                                        uint64_t *outOffset)
 {
+    uint64_t inRange = 0;
+    uint64_t probed = 0;
+
     for (uint64_t off = 0x18; off < 0x800; off += 8) {
-        uint64_t candidate = kread_ptr(gTask + off);
-        if (candidate < gMapMin || candidate >= gMapMax) continue;
-        if ((candidate & 0x7) != 0) continue;
+        uint64_t raw = kread64(gTask + off);
+        if (raw == 0) continue;
 
-        uint32_t count = 0;
-        uint64_t array = 0;
-        if (!kum_probe_all_image_infos(candidate, &count, &array)) continue;
+        uint64_t forms[2];
+        forms[0] = raw;
+        forms[1] = xpaci(raw);
 
-        if (outCount) *outCount = count;
-        if (outArray) *outArray = array;
-        return candidate;
+        for (int k = 0; k < 2; k++) {
+            uint64_t candidate = forms[k];
+            if (candidate == 0) continue;
+            if (candidate < gMapMin || candidate >= gMapMax) continue;
+            if ((candidate & 0x7) != 0) continue;
+
+            inRange += 1;
+
+            uint32_t count = 0;
+            uint64_t array = 0;
+            probed += 1;
+            if (!kum_probe_all_image_infos(candidate, &count, &array)) continue;
+
+            if (outCount) *outCount = count;
+            if (outArray) *outArray = array;
+            if (outOffset) *outOffset = off;
+            return candidate;
+        }
     }
+
+    cyanide_log(@"[KUM] task 扫描结束：落在地址空间内的候选 %llu 个，形态校验全部未通过",
+                (unsigned long long)inRange);
     return 0;
 }
 
@@ -202,11 +227,17 @@ NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOu
     uint32_t count = 0;
     uint64_t infoArray = 0;
 
-    uint64_t found = kum_find_all_image_info(&count, &infoArray);
+    uint64_t infoOffset = 0;
+    cyanide_log(@"[KUM] 目标地址空间 0x%llx - 0x%llx", gMapMin, gMapMax);
+
+    uint64_t found = kum_find_all_image_info(&count, &infoArray, &infoOffset);
     if (found == 0) {
         if (errorOut) *errorOut = @"没有在 task 里找到 dyld_all_image_infos";
         return nil;
     }
+
+    cyanide_log(@"[KUM] 找到 dyld_all_image_infos：task+0x%llx -> 0x%llx，共 %u 个模块",
+                (unsigned long long)infoOffset, found, count);
 
     NSMutableArray<NSDictionary<NSString *, id> *> *rows =
         [NSMutableArray arrayWithCapacity:count];
