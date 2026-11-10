@@ -23,6 +23,8 @@
 
 #import "ProcessDetailViewController.h"
 
+#import "LibraryOverlayController.h"
+
 #import "../TaskRop/RemoteCall.h"
 #import "../kexploit/kexploit_opa334.h"
 
@@ -82,8 +84,66 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
 
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"悬浮窗"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(toggleOverlay)];
+
     [self buildPlaceholderView];
     [self loadModules];
+}
+
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    [self refreshOverlayButton];
+}
+
+#pragma mark - 悬浮窗
+
+- (void)refreshOverlayButton
+{
+    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
+    BOOL sameTarget = [[overlay activeProcessName] isEqualToString:self.processName];
+    self.navigationItem.rightBarButtonItem.title = sameTarget ? @"关闭悬浮窗" : @"悬浮窗";
+}
+
+- (void)toggleOverlay
+{
+    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
+    BOOL sameTarget = [[overlay activeProcessName] isEqualToString:self.processName];
+
+    if (sameTarget) {
+        [overlay stop];
+        [self refreshOverlayButton];
+        [self presentAlertWithTitle:@"悬浮窗已关闭" message:nil];
+        return;
+    }
+
+    BOOL wasActive = [overlay isActive];
+    [overlay startForProcessName:self.processName pid:self.pid procAddr:self.procAddr];
+    [self refreshOverlayButton];
+
+    NSString *message = [NSString stringWithFormat:
+        @"已在 SpringBoard 里挂好悬浮窗。\n\n现在切到 %@，悬浮窗会自动显示它的库与基址。\n\n"
+        @"说明：读库要在本进程里附着目标，所以只有目标在前台时才能成功；"
+        @"已自动开启静音保活让 Cyanide 留在后台继续探测。关闭悬浮窗请回到本页再点一次按钮。",
+        self.processName];
+    [self presentAlertWithTitle:(wasActive ? @"已切换悬浮窗目标" : @"悬浮窗已开启")
+                        message:message];
+}
+
+- (void)presentAlertWithTitle:(NSString *)title message:(NSString *)message
+{
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"好"
+                                              style:UIAlertActionStyleDefault
+                                            handler:nil]];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark - 分组规则
