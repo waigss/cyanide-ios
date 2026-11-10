@@ -28,6 +28,7 @@
 #import "../kexploit/kutils.h"
 #import "../utils/sandbox.h"
 #import "CyanideLog.h"
+#import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
 // 从而读得到别的 App 容器里的文件。
@@ -90,6 +91,12 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 @property (nonatomic, copy) NSString *failureReason;
 @property (nonatomic, assign) BOOL truncated;
 
+// 后台监听：目标被挂起时附加必然超时，所以等它真在跑的时候再读。
+@property (nonatomic, assign) BOOL watching;
+@property (nonatomic, strong) dispatch_source_t watchTimer;
+@property (nonatomic, strong) dispatch_queue_t watchQueue;
+@property (nonatomic, assign) NSUInteger watchAttempt;
+
 @property (nonatomic, strong) UIView *placeholderView;
 @property (nonatomic, strong) UILabel *placeholderLabel;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
@@ -117,6 +124,12 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
     self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"后台监听"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(toggleBackgroundWatch)];
 
     [self buildPlaceholderView];
     [self loadModules];
@@ -156,6 +169,7 @@ static BOOL module_path_is_third_party(NSString *path)
 // 失败原因留在 remote_call_last_init_failure() 里，由调用方读取。
 static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                                                     uint64_t procAddr,
+                                                    int timeoutMS,
                                                     void (^hint)(NSString *text))
 {
     for (int attempt = 0; attempt < 3; attempt++) {
@@ -174,7 +188,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
             hint(text);
         }
 
-        cyanide_log(@"[附加] 目标=%@ proc=0x%llx 策略=%@ 开始", name, procAddr, strategy);
+        cyanide_log(@"[附加] 目标=%@ proc=0x%llx 策略=%@ 超时=%dms", name, procAddr, strategy, timeoutMS);
 
         if (procAddr != 0) {
             g_RC_targetProcOverride = procAddr;
@@ -185,15 +199,15 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
         if (attempt == 0) {
             session = [[RemoteCallSession alloc] initWithProcess:name
                                              useMigFilterBypass:NO
-                                        firstExceptionTimeoutMS:12000];
+                                        firstExceptionTimeoutMS:timeoutMS];
         } else if (attempt == 1) {
             session = [[RemoteCallSession alloc] initWithProcess:name
                                              useMigFilterBypass:YES
-                                        firstExceptionTimeoutMS:12000];
+                                        firstExceptionTimeoutMS:timeoutMS];
         } else {
             session = [[RemoteCallSession alloc] initWithProcess:name
                                              useMigFilterBypass:YES
-                                        firstExceptionTimeoutMS:12000
+                                        firstExceptionTimeoutMS:timeoutMS
                                              originalThreadOnly:YES];
         }
         double elapsedMS = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
@@ -335,7 +349,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                 });
             };
 
-            RemoteCallSession *session = cyanide_attach_to_process(name, procAddr, hint);
+            RemoteCallSession *session = cyanide_attach_to_process(name, procAddr, 12000, hint);
 
             if (!session) {
                 RemoteCallInitFailure reason = remote_call_last_init_failure();
@@ -563,6 +577,204 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
 
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - 后台监听
+
+// 关掉页面时停止监听。
+- (void)dealloc
+{
+    if (self.watchTimer) {
+        dispatch_source_cancel(self.watchTimer);
+        self.watchTimer = nil;
+    }
+}
+
+- (void)toggleBackgroundWatch
+{
+    if (self.watching) {
+        [self stopBackgroundWatch];
+        [self presentAlertWithTitle:@"已停止后台监听" message:nil];
+        return;
+    }
+
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    self.watching = YES;
+    self.watchAttempt = 0;
+    self.navigationItem.rightBarButtonItem.title = @"停止监听";
+
+    // 切到目标 App 后本进程要活着才能继续重试。
+    ds_keepalive_apply_enabled(YES);
+
+    if (!self.watchQueue) {
+        self.watchQueue = dispatch_queue_create("com.cyanide.watchattach", DISPATCH_QUEUE_SERIAL);
+    }
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.watchQueue);
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
+                              (uint64_t)(2.0 * NSEC_PER_SEC),
+                              (uint64_t)(0.3 * NSEC_PER_SEC));
+    dispatch_source_set_event_handler(timer, ^{
+        __strong typeof(weakSelf) self = weakSelf;
+        if (!self || !self.watching) return;
+        [self watchTick];
+    });
+    dispatch_resume(timer);
+    self.watchTimer = timer;
+
+    cyanide_log(@"[监听] 开始后台监听 %@（每 2 秒重试一次附加，超时 1.5 秒）", self.processName);
+
+    [self presentAlertWithTitle:@"已开始后台监听"
+                        message:[NSString stringWithFormat:
+                                 @"现在切到 %@ 并让它跑起来。\n\n"
+                                 @"游戏在前台运行时，这里每 2 秒会试一次附加，成功后自动读取库列表并写入文件。\n\n"
+                                 @"玩一会儿再回 Cyanide 看「日志」即可。", self.processName]];
+}
+
+- (void)stopBackgroundWatch
+{
+    self.watching = NO;
+    self.navigationItem.rightBarButtonItem.title = @"后台监听";
+
+    if (self.watchTimer) {
+        dispatch_source_cancel(self.watchTimer);
+        self.watchTimer = nil;
+    }
+}
+
+- (void)watchTick
+{
+    if (!self.watching) return;
+
+    self.watchAttempt += 1;
+    NSUInteger attempt = self.watchAttempt;
+
+    // 目标被挂起时每次都要等满超时，所以这里用短超时（1.5s），
+    // 保证 2 秒一次的重试节奏不会被拖垮。
+    RemoteCallSession *session = cyanide_attach_to_process(self.processName, self.procAddr, 1500, nil);
+    if (!session) {
+        if (attempt % 10 == 1) {
+            cyanide_log(@"[监听] 第 %lu 次尝试：目标还没在运行（附加超时属正常，继续等）",
+                        (unsigned long)attempt);
+        }
+        return;
+    }
+
+    cyanide_log(@"[监听] 第 %lu 次尝试：附加成功，开始读取库列表", (unsigned long)attempt);
+
+    NSString *report = [self buildLibraryReportWithSession:session];
+    if (report.length == 0) {
+        cyanide_log(@"[监听] 附加成功但没读到模块（dyld 返回 0）");
+        return;
+    }
+
+    NSString *documents =
+        NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
+    NSString *dumpDir = [documents stringByAppendingPathComponent:@"dumps"];
+    [[NSFileManager defaultManager] createDirectoryAtPath:dumpDir
+                             withIntermediateDirectories:YES
+                                              attributes:nil
+                                                   error:NULL];
+
+    NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+    stamp.dateFormat = @"yyyyMMdd-HHmmss";
+    NSString *fileName = [NSString stringWithFormat:@"%@-库列表-%@.txt",
+                          self.processName ?: @"proc", [stamp stringFromDate:[NSDate date]]];
+    NSString *path = [dumpDir stringByAppendingPathComponent:fileName];
+
+    NSError *error = nil;
+    BOOL wrote = [report writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&error];
+    cyanide_log(@"[监听] 写入报告 %@ -> %d %@", fileName, wrote ? 1 : 0, error.localizedDescription ?: @"");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [self stopBackgroundWatch];
+        [self presentAlertWithTitle:@"后台监听成功"
+                            message:[NSString stringWithFormat:
+                                     @"已读取 %@ 的库列表并保存：\n\n%@\n\n"
+                                     @"（「文件」App → 我的 iPhone → Cyanide → dumps 里可取）",
+                                     self.processName, fileName]];
+    });
+}
+
+// 把模块列表拼成纯文本报告（不依赖界面）。
+- (NSString *)buildLibraryReportWithSession:(RemoteCallSession *)session
+{
+    NSMutableString *report = [NSMutableString string];
+    [report appendFormat:@"进程：%@ (PID %d)\n", self.processName, self.pid];
+
+    NSMutableArray<NSString *> *mainLines = [NSMutableArray array];
+    NSMutableArray<NSString *> *thirdLines = [NSMutableArray array];
+    NSMutableArray<NSString *> *systemLines = [NSMutableArray array];
+
+    __block NSUInteger total = 0;
+    __block BOOL truncated = NO;
+
+    remote_call_with_session(session, ^{
+        uint64_t count = r_dlsym_call(2, "_dyld_image_count", 0, 0, 0, 0, 0, 0, 0, 0);
+        if (count == 0 || count > 4096) return;
+
+        CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + 15.0;
+
+        for (uint64_t i = 0; i < count; i++) {
+            if (CFAbsoluteTimeGetCurrent() > deadline) {
+                truncated = YES;
+                break;
+            }
+
+            uint64_t base = r_dlsym_call(2, "_dyld_get_image_header", i, 0, 0, 0, 0, 0, 0, 0);
+            uint64_t namePtr = r_dlsym_call(2, "_dyld_get_image_name", i, 0, 0, 0, 0, 0, 0, 0);
+
+            char buffer[512] = {0};
+            if (namePtr != 0) {
+                remote_read(namePtr, buffer, sizeof(buffer) - 1);
+            }
+
+            NSString *path = [NSString stringWithUTF8String:buffer];
+            if (path.length == 0) path = @"";
+
+            NSString *line = [NSString stringWithFormat:@"  0x%llx %@",
+                              (unsigned long long)base, path];
+
+            total += 1;
+            if (i == 0) {
+                [mainLines addObject:line];
+            } else if (module_path_is_third_party(path)) {
+                [thirdLines addObject:line];
+            } else {
+                [systemLines addObject:line];
+            }
+        }
+    });
+
+    if (total == 0) return @"";
+
+    [report appendFormat:@"共 %lu 项（第三方 %lu · 系统 %lu）%@\n\n",
+     (unsigned long)total, (unsigned long)thirdLines.count, (unsigned long)systemLines.count,
+     truncated ? @"［超时，不完整］" : @""];
+
+    if (mainLines.count > 0) {
+        [report appendString:@"== 主程序 ==\n"];
+        for (NSString *line in mainLines) [report appendFormat:@"%@\n", line];
+        [report appendString:@"\n"];
+    }
+    if (thirdLines.count > 0) {
+        [report appendString:@"== 第三方库 ==\n"];
+        for (NSString *line in thirdLines) [report appendFormat:@"%@\n", line];
+        [report appendString:@"\n"];
+    }
+    if (systemLines.count > 0) {
+        [report appendString:@"== 系统库 ==\n"];
+        for (NSString *line in systemLines) [report appendFormat:@"%@\n", line];
+    }
+
+    return report;
 }
 
 #pragma mark - Dump 模块
