@@ -2,15 +2,22 @@
 //  ProcessDetailViewController.m
 //  Cyanide
 //
-//  读取目标进程的已加载模块列表。做法是借 RemoteCallSession 在目标进程里执行
-//  dyld 的公开 C 接口：
+//  读取目标进程已加载的 image，并按「主程序 / 第三方库 / 系统库」分三组列出，
+//  每项带 ASLR 后的加载基址。
+//
+//  实现：借 RemoteCallSession 在目标进程里执行 dyld 的公开 C 接口
 //
 //      _dyld_image_count()                  -> 模块数量
 //      _dyld_get_image_header(i)            -> 第 i 个模块的加载基址（mach_header *）
 //      _dyld_get_image_name(i)              -> 第 i 个模块的路径（目标进程内的 const char *）
 //
+//  分组规则：
+//      index 0                -> 主程序（dyld 保证第 0 个 image 是可执行文件本身）
+//      /var/ /private/var/ /Library/  -> 第三方库（App 自带库、TrollStore、越狱注入库都在这些前缀下）
+//      其余（/usr/lib、/System/...）   -> 系统库
+//
 //  session 的建立/查询全在后台队列做，完成后再回主线程刷新。
-//  整表可能几十到几百条，每条 1~2 次远程调用，所以加了一个总时长上限，
+//  整表可能几十到几百条，每条 1~2 次远程调用，所以加了总时长上限，
 //  超时就返回已经拿到的部分并标注「结果不完整」。
 //
 
@@ -22,6 +29,10 @@
 static NSString * const kModuleCellIdentifier = @"CyanideModuleCell";
 static const NSTimeInterval kModuleLoadDeadline = 30.0;
 static const uint64_t kModuleCountLimit = 4096;
+
+static NSString * const kGroupKindMain   = @"main";
+static NSString * const kGroupKindThird  = @"third";
+static NSString * const kGroupKindSystem = @"system";
 
 typedef NS_ENUM(NSInteger, ModuleListState) {
     ModuleListStateIdle = 0,
@@ -35,7 +46,8 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 @property (nonatomic, copy) NSString *processName;
 @property (nonatomic, assign) int pid;
 
-@property (nonatomic, copy) NSArray<NSDictionary<NSString *, id> *> *modules;
+// 每个元素：@{@"kind": 分组标识, @"title": 分组标题, @"items": @[ @{name,path,base} ]}
+@property (nonatomic, copy) NSArray<NSDictionary<NSString *, id> *> *sections;
 @property (nonatomic, assign) ModuleListState state;
 @property (nonatomic, copy) NSString *failureReason;
 @property (nonatomic, assign) BOOL truncated;
@@ -62,12 +74,22 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 {
     [super viewDidLoad];
 
-    self.title = self.processName.length > 0 ? self.processName : @"模块";
+    self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
-    self.tableView.keyboardDismissMode = UIScrollViewKeyboardDismissModeOnDrag;
 
     [self buildPlaceholderView];
     [self loadModules];
+}
+
+#pragma mark - 分组规则
+
+static BOOL module_path_is_third_party(NSString *path)
+{
+    if (path.length == 0) return NO;
+    if ([path hasPrefix:@"/var/"]) return YES;
+    if ([path hasPrefix:@"/private/var/"]) return YES;
+    if ([path hasPrefix:@"/Library/"]) return YES;
+    return NO;
 }
 
 #pragma mark - 空状态
@@ -107,7 +129,7 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
 - (void)refreshPlaceholderState
 {
-    if (self.modules.count > 0) {
+    if (self.sections.count > 0) {
         self.tableView.backgroundView = nil;
         [self.spinner stopAnimating];
         return;
@@ -118,7 +140,7 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     switch (self.state) {
         case ModuleListStateLoading:
             self.placeholderLabel.text = [NSString stringWithFormat:
-                @"正在附加到 %@ (PID %d) 并读取模块列表…\n首次附加可能要几秒。",
+                @"正在附加到 %@ (PID %d) 并读取库列表…\n首次附加可能要几秒。",
                 self.processName, self.pid];
             [self.spinner startAnimating];
             break;
@@ -127,7 +149,7 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
             [self.spinner stopAnimating];
             break;
         case ModuleListStateLoaded:
-            self.placeholderLabel.text = @"该进程没有加载任何模块。";
+            self.placeholderLabel.text = @"该进程没有加载任何库。";
             [self.spinner stopAnimating];
             break;
         case ModuleListStateIdle:
@@ -151,7 +173,11 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     __weak typeof(self) weakSelf = self;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        NSMutableArray<NSDictionary<NSString *, id> *> *rows = [NSMutableArray array];
+        NSMutableArray<NSDictionary<NSString *, id> *> *mainItems = [NSMutableArray array];
+        NSMutableArray<NSDictionary<NSString *, id> *> *thirdItems = [NSMutableArray array];
+        NSMutableArray<NSDictionary<NSString *, id> *> *systemItems = [NSMutableArray array];
+        NSMutableArray<NSDictionary<NSString *, id> *> *sections = [NSMutableArray array];
+
         __block NSString *failure = nil;
         __block BOOL truncated = NO;
 
@@ -176,9 +202,9 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                                                     x0:0 x1:0 x2:0 x3:0
                                                                     x4:0 x5:0 x6:0 x7:0];
                 if (count == 0) {
-                    failure = @"目标进程没有报告任何模块（_dyld_image_count 返回 0）。";
+                    failure = @"目标进程没有报告任何库（_dyld_image_count 返回 0）。";
                 } else if (count > kModuleCountLimit) {
-                    failure = [NSString stringWithFormat:@"模块数量异常（%llu），已放弃读取。",
+                    failure = [NSString stringWithFormat:@"库数量异常（%llu），已放弃读取。",
                                (unsigned long long)count];
                 } else {
                     CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + kModuleLoadDeadline;
@@ -209,25 +235,43 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
                         NSString *display = path.lastPathComponent;
                         if (display.length == 0) {
-                            display = path.length > 0 ? path : @"（未知模块）";
+                            display = path.length > 0 ? path : @"（未知库）";
                         }
 
-                        [rows addObject:@{
+                        NSDictionary *item = @{
                             @"name": display,
                             @"path": path,
                             @"base": @(base),
-                        }];
+                        };
+
+                        if (i == 0) {
+                            [mainItems addObject:item];
+                        } else if (module_path_is_third_party(path)) {
+                            [thirdItems addObject:item];
+                        } else {
+                            [systemItems addObject:item];
+                        }
                     }
                 }
             }
-            // session 由 ARC 释放，dealloc 里会收掉远程线程。
+            // session 由 ARC 释放，dealloc 里会收掉目标线程。
+        }
+
+        if (mainItems.count > 0) {
+            [sections addObject:@{@"kind": kGroupKindMain, @"title": @"主程序", @"items": mainItems}];
+        }
+        if (thirdItems.count > 0) {
+            [sections addObject:@{@"kind": kGroupKindThird, @"title": @"第三方库", @"items": thirdItems}];
+        }
+        if (systemItems.count > 0) {
+            [sections addObject:@{@"kind": kGroupKindSystem, @"title": @"系统库", @"items": systemItems}];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
 
-            self.modules = rows;
+            self.sections = sections;
             self.truncated = truncated;
             if (failure.length > 0) {
                 self.state = ModuleListStateFailed;
@@ -241,27 +285,63 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     });
 }
 
+#pragma mark - 数据访问
+
+- (NSArray<NSDictionary<NSString *, id> *> *)itemsInSection:(NSInteger)section
+{
+    if (section < 0 || section >= (NSInteger)self.sections.count) return @[];
+    return self.sections[(NSUInteger)section][@"items"];
+}
+
+- (NSDictionary<NSString *, id> *)itemAtIndexPath:(NSIndexPath *)indexPath
+{
+    NSArray<NSDictionary<NSString *, id> *> *items = [self itemsInSection:indexPath.section];
+    if (indexPath.row < 0 || indexPath.row >= (NSInteger)items.count) return nil;
+    return items[(NSUInteger)indexPath.row];
+}
+
 #pragma mark - UITableViewDataSource
+
+- (NSInteger)numberOfSectionsInTableView:(UITableView *)tableView
+{
+    return (NSInteger)self.sections.count;
+}
 
 - (NSInteger)tableView:(UITableView *)tableView numberOfRowsInSection:(NSInteger)section
 {
-    return (NSInteger)self.modules.count;
+    return (NSInteger)[self itemsInSection:section].count;
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForHeaderInSection:(NSInteger)section
 {
-    if (self.modules.count == 0) return nil;
-
-    NSString *text = [NSString stringWithFormat:@"共 %lu 个模块 · PID %d",
-                      (unsigned long)self.modules.count, self.pid];
-    if (self.truncated) text = [text stringByAppendingString:@" · 读取超时，结果不完整"];
-    return text;
+    if (section < 0 || section >= (NSInteger)self.sections.count) return nil;
+    NSDictionary<NSString *, id> *sec = self.sections[(NSUInteger)section];
+    return [NSString stringWithFormat:@"%@（%lu）",
+            sec[@"title"], (unsigned long)[sec[@"items"] count]];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
-    if (self.modules.count == 0) return nil;
-    return @"基址是该模块 mach_header 在目标进程里的实际加载地址（已含 ASLR 偏移）。点按一行可复制。";
+    if (self.sections.count == 0) return nil;
+    if (section != (NSInteger)self.sections.count - 1) return nil;
+
+    NSUInteger third = 0;
+    NSUInteger system = 0;
+    NSUInteger total = 0;
+    for (NSDictionary<NSString *, id> *sec in self.sections) {
+        NSUInteger n = [sec[@"items"] count];
+        total += n;
+        if ([sec[@"kind"] isEqualToString:kGroupKindThird]) third = n;
+        if ([sec[@"kind"] isEqualToString:kGroupKindSystem]) system = n;
+    }
+
+    NSMutableString *text = [NSMutableString stringWithFormat:
+        @"共 %lu 项（第三方库 %lu · 系统库 %lu）。基址是该库 mach_header 在目标进程里的实际加载地址（含 ASLR 偏移）。点按一行可复制。",
+        (unsigned long)total, (unsigned long)third, (unsigned long)system];
+    if (self.truncated) {
+        [text appendString:@"\n读取超时，结果不完整。"];
+    }
+    return text;
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -277,7 +357,7 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                                                      weight:UIFontWeightRegular];
     }
 
-    NSDictionary<NSString *, id> *row = self.modules[(NSUInteger)indexPath.row];
+    NSDictionary<NSString *, id> *row = [self itemAtIndexPath:indexPath];
     uint64_t base = [row[@"base"] unsignedLongLongValue];
     NSString *path = row[@"path"];
 
@@ -292,11 +372,12 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
 
-    NSDictionary<NSString *, id> *row = self.modules[(NSUInteger)indexPath.row];
+    NSDictionary<NSString *, id> *row = [self itemAtIndexPath:indexPath];
+    if (!row) return;
+
     uint64_t base = [row[@"base"] unsignedLongLongValue];
     NSString *copy = [NSString stringWithFormat:@"%@ 0x%llx %@",
                       row[@"name"], (unsigned long long)base, row[@"path"] ?: @""];
-
     [UIPasteboard generalPasteboard].string = copy;
 
     UIImpactFeedbackGenerator *feedback =
