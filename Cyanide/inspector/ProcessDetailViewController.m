@@ -30,6 +30,7 @@
 #import "../utils/sandbox.h"
 #import "CyanideLog.h"
 #import "KernelUserMemory.h"
+#import "MemoryReaderViewController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -127,11 +128,16 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
 
-    self.navigationItem.rightBarButtonItem =
+    self.navigationItem.rightBarButtonItems = @[
+        [[UIBarButtonItem alloc] initWithTitle:@"读内存"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(showMemoryReader)],
         [[UIBarButtonItem alloc] initWithTitle:@"后台监听"
                                          style:UIBarButtonItemStylePlain
                                         target:self
-                                        action:@selector(toggleBackgroundWatch)];
+                                        action:@selector(toggleBackgroundWatch)],
+    ];
 
     [self buildPlaceholderView];
     [self loadModules];
@@ -623,6 +629,23 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
 
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - 读内存
+
+- (void)showMemoryReader
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    MemoryReaderViewController *reader =
+        [[MemoryReaderViewController alloc] initWithProcessName:self.processName
+                                                            pid:self.pid
+                                                       procAddr:self.procAddr];
+    [self.navigationController pushViewController:reader animated:YES];
 }
 
 #pragma mark - 后台监听
