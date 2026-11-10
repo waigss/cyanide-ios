@@ -610,6 +610,12 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
         [self dumpModuleAtPath:path displayName:name];
     }]];
 
+    [sheet addAction:[UIAlertAction actionWithTitle:@"直接读内存（前 64 字节，不附加）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self readModuleMemoryAtBase:base name:name];
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
 
     // iPad 上 action sheet 需要锚点，否则会崩。
@@ -863,6 +869,43 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     }
 
     return report;
+}
+
+#pragma mark - 内核直读内存
+
+// 不附加、不建线程，直接从内核页表读目标进程的内存。
+- (void)readModuleMemoryAtBase:(uint64_t)base name:(NSString *)name
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪" message:@"请先在「进程」页初始化内核。"];
+        return;
+    }
+
+    if (!kum_prepare(self.procAddr)) {
+        cyanide_log(@"[直读] 页表上下文准备失败 proc=0x%llx", self.procAddr);
+        [self presentAlertWithTitle:@"直读失败" message:@"页表上下文准备失败（pmap/tte 不可用）。"];
+        return;
+    }
+
+    uint8_t buffer[64] = {0};
+    if (!kum_read(base, buffer, sizeof(buffer))) {
+        cyanide_log(@"[直读] 读取失败 %@ @0x%llx（地址未映射）", name, base);
+        [self presentAlertWithTitle:@"直读失败"
+                            message:[NSString stringWithFormat:@"0x%llx 在目标进程里没有映射。",
+                                     (unsigned long long)base]];
+        return;
+    }
+
+    NSMutableString *hex = [NSMutableString string];
+    for (size_t i = 0; i < sizeof(buffer); i++) {
+        if (i > 0 && (i % 16) == 0) [hex appendString:@"\n"];
+        [hex appendFormat:@"%02x ", buffer[i]];
+    }
+
+    cyanide_log(@"[直读] %@ @0x%llx = %@", name, base, hex);
+
+    [self presentAlertWithTitle:[NSString stringWithFormat:@"%@ @0x%llx", name, (unsigned long long)base]
+                        message:hex];
 }
 
 #pragma mark - Dump 模块
