@@ -18,6 +18,8 @@
 #import "LogViewerController.h"
 
 #import "../kexploit/kutils.h"
+#import "../kexploit/krw.h"
+#import "../kexploit/offsets.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../SettingsViewController.h"
 
@@ -45,6 +47,74 @@ static const NSTimeInterval kInitTimeout = 240.0;
 @end
 
 @implementation ProcessListViewController
+
+#pragma mark - 内核只读探测（定位 pmap 偏移用）
+
+// 只读：把我们自己进程的 task / vm_map 结构前若干字节原样打进日志。
+// 全部读取都发生在已知已分配的内核结构内部，不写任何数据。
+- (void)confirmKernelProbe
+{
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"内核只读探测"
+                                            message:@"将把本进程的 task / vm_map 结构前几百字节写入日志，"
+                                                    @"用于定位 pmap 字段偏移。\n\n"
+                                                    @"只读取内核结构，不写入任何数据，也不会改动系统状态。\n\n"
+                                                    @"日志里会出现 [PMAP] 开头的十六进制行，请把它们发回分析。"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"开始探测"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self performKernelProbe];
+    }]];
+
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)performKernelProbe
+{
+    if (!kexploit_krw_ready()) {
+        cyanide_log(@"[PMAP] 探测中止：内核未就绪");
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        uint64_t selfProc = proc_self();
+        uint64_t task = proc_task(selfProc);
+        uint64_t map = task ? kread64(task + off_task_map) : 0;
+
+        cyanide_log(@"[PMAP] ==== 开始只读探测 ====");
+        cyanide_log(@"[PMAP] off_task_map=0x%x off_vm_map_hdr=0x%x off_vm_map_header_nentries=0x%x",
+                    off_task_map, off_vm_map_hdr, off_vm_map_header_nentries);
+        cyanide_log(@"[PMAP] self_proc=0x%llx task=0x%llx map=0x%llx",
+                    selfProc, task, map);
+
+        [self dumpWordsAt:task length:0x400 label:@"task"];
+        [self dumpWordsAt:map length:0x300 label:@"map"];
+
+        cyanide_log(@"[PMAP] ==== 探测结束 ====");
+    });
+}
+
+- (void)dumpWordsAt:(uint64_t)addr length:(NSUInteger)length label:(NSString *)label
+{
+    if (addr == 0 || !is_kaddr_valid(addr)) {
+        cyanide_log(@"[PMAP] %@ 地址无效：0x%llx", label, addr);
+        return;
+    }
+
+    NSMutableData *data = [NSMutableData dataWithLength:length];
+    if (!data) return;
+
+    kreadbuf(addr, data.mutableBytes, (uint64_t)length);
+
+    const uint64_t *words = (const uint64_t *)data.bytes;
+    NSUInteger count = length / 8;
+    for (NSUInteger i = 0; i < count; i++) {
+        cyanide_log(@"[PMAP] %@+0x%03lx = 0x%016llx", label, (unsigned long)(i * 8), words[i]);
+    }
+}
 
 - (void)showLog
 {
@@ -85,6 +155,10 @@ static const NSTimeInterval kInitTimeout = 240.0;
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(showLog)],
+        [[UIBarButtonItem alloc] initWithTitle:@"探测"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(confirmKernelProbe)],
     ];
 
     [self buildPlaceholderView];
