@@ -115,7 +115,7 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     BOOL sameTarget = [[overlay activeProcessName] isEqualToString:self.processName];
 
     if (sameTarget) {
-        [overlay stop];
+        [overlay stopByUser];
         [self refreshOverlayButton];
         [self presentAlertWithTitle:@"悬浮窗已关闭" message:nil];
         return;
