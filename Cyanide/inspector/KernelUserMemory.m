@@ -2,8 +2,15 @@
 //  KernelUserMemory.m
 //  Cyanide
 //
-//  实现见头文件说明。所有地址都先过页表校验，未映射的地址直接返回 NO，
-//  不会触发内核异常（之前闪退就是因为直接读了一个未映射地址）。
+//  不附加目标进程、不创建线程，直接从内核页表读目标进程的用户态内存。
+//
+//  地址翻译：proc → task → vm_map → pmap → 根页表(tte)
+//            tte - ttep = 页表窗口线性偏移
+//            16KB 页、3 级：L0 VA[47:36] / L1 VA[35:25] / L2 VA[24:14] / 页内 [13:0]
+//            页表项物理地址 = bit[47:14]
+//
+//  dyld 模块表定位：先用 _dyld_image_count() 作基准，在自己 task 结构里校准出
+//  all_image_info_addr 的偏移，再把这个偏移用到目标进程上（确定性，不靠猜）。
 //
 
 #import "KernelUserMemory.h"
@@ -13,15 +20,16 @@
 #import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/offsets.h"
 #import "../kexploit/xpaci.h"
+
 #import "CyanideLog.h"
 
 #import <string.h>
 #import <stdlib.h>
+#import <mach-o/dyld.h>
 
-// 16KB 页、3 级页表
 static const uint64_t kPageSize      = 0x4000ULL;
 static const uint64_t kPageMask      = 0x3FFFULL;
-static const uint64_t kPaMask        = 0x0000FFFFFFFFC000ULL;  // 页表项里的物理地址：bit[47:14]
+static const uint64_t kPaMask        = 0x0000FFFFFFFFC000ULL;   // 页表项物理地址 bit[47:14]
 static const unsigned int kL0Shift   = 36;
 static const unsigned int kL1Shift   = 25;
 static const unsigned int kL2Shift   = 14;
@@ -29,63 +37,31 @@ static const uint64_t kL0IndexMask   = 0xFFFULL;
 static const uint64_t kL1IndexMask   = 0x7FFULL;
 static const uint64_t kL2IndexMask   = 0x7FFULL;
 
-// _vm_map.pmap 的偏移（对照 xnu-11417 的 struct _vm_map 布局得出，已在 iOS 18.5 实测验证）
+// _vm_map.pmap 偏移（对照 xnu-11417 struct _vm_map，已在 iOS 18.5 实测验证）
 static const uint64_t kPmapOffsetInVmMap = 0x40;
 
 static uint64_t gPmap = 0;
-static uint64_t gRootTable = 0;       // tte：根页表的内核虚拟地址
-static uint64_t gWindowOffset = 0;    // tte - ttep：物理地址 → 内核虚拟地址的线性偏移
+static uint64_t gRootTable = 0;
+static uint64_t gWindowOffset = 0;
 static uint64_t gMapMin = 0;
 static uint64_t gMapMax = 0;
 static uint64_t gTask = 0;
-static uint64_t gInfoOffset = 0;      // task 里 all_image_info_addr 的偏移（由本进程校准得出）
-
-// dyld 导出的私有接口：返回本进程的 dyld_all_image_infos 地址。
-extern void *_dyld_get_all_image_infos(void);
-
-// 用我们自己的进程做基准：拿到真实的 dyld_all_image_infos 地址后，
-// 在自己 task 结构里反查它落在哪个偏移，这样目标进程的偏移就是确定的，不用猜。
-BOOL kum_discover_info_offset(void)
-{
-    if (gInfoOffset != 0) return YES;
-    if (!kexploit_krw_ready()) return NO;
-
-    void *mine = _dyld_get_all_image_infos();
-    if (mine == NULL) {
-        cyanide_log(@"[KUM] _dyld_get_all_image_infos() 返回空，无法校准");
-        return NO;
-    }
-
-    uint64_t mineAddr = (uint64_t)(uintptr_t)mine;
-    uint64_t myTask = proc_task(proc_self());
-    if (!is_kaddr_valid(myTask)) return NO;
-
-    for (uint64_t off = 0x18; off < 0x800; off += 8) {
-        uint64_t raw = kread64(myTask + off);
-        if (raw == mineAddr || xpaci(raw) == mineAddr) {
-            gInfoOffset = off;
-            cyanide_log(@"[KUM] 校准成功：all_image_info_addr 位于 task+0x%llx（自身地址 0x%llx）",
-                        (unsigned long long)off, mineAddr);
-            return YES;
-        }
-    }
-
-    cyanide_log(@"[KUM] 校准失败：自身 task 里没找到 0x%llx", mineAddr);
-    return NO;
-}
-
-
+static uint64_t gInfoOffset = 0;      // task 里 all_image_info_addr 的偏移
 static BOOL gPrepared = NO;
 
-BOOL kum_prepare(uint64_t proc)
+// ---------------------------------------------------------------------------
+// 上下文准备
+// ---------------------------------------------------------------------------
+
+static BOOL kum_prepare_context(uint64_t proc)
 {
-    gPrepared = NO;
     gPmap = 0;
     gRootTable = 0;
     gWindowOffset = 0;
     gMapMin = 0;
     gMapMax = 0;
     gTask = 0;
+    gPrepared = NO;
 
     if (!kexploit_krw_ready()) return NO;
     if (!is_kaddr_valid(proc)) return NO;
@@ -110,47 +86,11 @@ BOOL kum_prepare(uint64_t proc)
     gMapMin = kread64(map + 0x20);
     gMapMax = kread64(map + 0x28);
     gPrepared = YES;
-
-    kum_discover_info_offset();
-
     return YES;
 }
 
-uint64_t kum_map_min(void) { return gMapMin; }
-uint64_t kum_map_max(void) { return gMapMax; }
-
-// 把当前页表上下文里的一段物理页映射成可读内核地址；失败返回 0。
-static uint64_t kum_kva_for_page(uint64_t va, uint64_t *outAvail)
-{
-    if (!gPrepared) return 0;
-
-    uint64_t l0Index = (va >> kL0Shift) & kL0IndexMask;
-    uint64_t e0 = kread64(gRootTable + l0Index * 8);
-    if ((e0 & 1) == 0) return 0;
-
-    uint64_t l1Kva = (e0 & kPaMask) + gWindowOffset;
-    uint64_t l1Index = (va >> kL1Shift) & kL1IndexMask;
-    uint64_t e1 = kread64(l1Kva + l1Index * 8);
-    if ((e1 & 1) == 0) return 0;
-
-    // bit1 = 0 表示块映射（大页），这里按 16KB 页处理，遇到块直接放弃
-    if ((e1 & 2) == 0) return 0;
-
-    uint64_t l2Kva = (e1 & kPaMask) + gWindowOffset;
-    uint64_t l2Index = (va >> kL2Shift) & kL2IndexMask;
-    uint64_t e2 = kread64(l2Kva + l2Index * 8);
-    if ((e2 & 1) == 0) return 0;
-    if ((e2 & 2) == 0) return 0;
-
-    uint64_t pagePa = e2 & kPaMask;
-    if (outAvail) {
-        uint64_t inPage = va & kPageMask;
-        *outAvail = kPageSize - inPage;
-    }
-    return pagePa + gWindowOffset;
-}
-
-BOOL kum_read(uint64_t va, void *dst, size_t len)
+// 当前上下文里把一段用户地址读到本地；地址未映射返回 NO。
+static BOOL kum_read_context(uint64_t va, void *dst, size_t len)
 {
     if (!gPrepared || !dst || len == 0) return NO;
     if (va < gMapMin || va + len > gMapMax) return NO;
@@ -160,14 +100,26 @@ BOOL kum_read(uint64_t va, void *dst, size_t len)
     uint64_t cursor = va;
 
     while (remaining > 0) {
-        uint64_t avail = 0;
-        uint64_t kva = kum_kva_for_page(cursor, &avail);
-        if (kva == 0 || avail == 0) return NO;
+        uint64_t l0Index = (cursor >> kL0Shift) & kL0IndexMask;
+        uint64_t e0 = kread64(gRootTable + l0Index * 8);
+        if ((e0 & 1) == 0) return NO;
 
+        uint64_t l1Kva = (e0 & kPaMask) + gWindowOffset;
+        uint64_t l1Index = (cursor >> kL1Shift) & kL1IndexMask;
+        uint64_t e1 = kread64(l1Kva + l1Index * 8);
+        if ((e1 & 1) == 0 || (e1 & 2) == 0) return NO;
+
+        uint64_t l2Kva = (e1 & kPaMask) + gWindowOffset;
+        uint64_t l2Index = (cursor >> kL2Shift) & kL2IndexMask;
+        uint64_t e2 = kread64(l2Kva + l2Index * 8);
+        if ((e2 & 1) == 0 || (e2 & 2) == 0) return NO;
+
+        uint64_t pageKva = (e2 & kPaMask) + gWindowOffset;
         uint64_t inPage = cursor & kPageMask;
+        uint64_t avail = kPageSize - inPage;
         size_t chunk = (size_t)((remaining < avail) ? remaining : avail);
 
-        kreadbuf(kva + inPage, out, (uint64_t)chunk);
+        kreadbuf(pageKva + inPage, out, (uint64_t)chunk);
 
         out += chunk;
         cursor += chunk;
@@ -177,103 +129,91 @@ BOOL kum_read(uint64_t va, void *dst, size_t len)
     return YES;
 }
 
-static BOOL kum_read_u32(uint64_t va, uint32_t *value)
+// ---------------------------------------------------------------------------
+// 用自身进程校准 all_image_info_addr 的偏移
+// ---------------------------------------------------------------------------
+
+static void kum_calibrate(void)
 {
-    return kum_read(va, value, sizeof(*value));
+    if (gInfoOffset != 0 || !gPrepared) return;
+
+    uint32_t expected = _dyld_image_count();
+    if (expected == 0) return;
+
+    for (uint64_t off = 0x18; off < 0x800; off += 8) {
+        uint64_t raw = kread64(gTask + off);
+        if (raw == 0) continue;
+
+        uint64_t forms[2] = { raw, xpaci(raw) };
+
+        for (int k = 0; k < 2; k++) {
+            uint64_t candidate = forms[k];
+            if (candidate < gMapMin || candidate >= gMapMax) continue;
+            if ((candidate & 0x7) != 0) continue;
+
+            uint32_t count = 0;
+            uint64_t array = 0;
+            if (!kum_read_context(candidate + 4, &count, sizeof(count))) continue;
+            if (count != expected) continue;
+            if (!kum_read_context(candidate + 8, &array, sizeof(array))) continue;
+            if (array < gMapMin || array >= gMapMax) continue;
+
+            gInfoOffset = off;
+            cyanide_log(@"[KUM] 校准成功：all_image_info_addr 在 task+0x%llx（自身模块数 %u）",
+                        (unsigned long long)off, expected);
+            return;
+        }
+    }
+
+    cyanide_log(@"[KUM] 校准失败：自身 task 里没有与 _dyld_image_count()=%u 匹配的候选", expected);
 }
 
-static BOOL kum_read_u64(uint64_t va, uint64_t *value)
+// ---------------------------------------------------------------------------
+// 对外接口
+// ---------------------------------------------------------------------------
+
+BOOL kum_prepare(uint64_t proc)
 {
-    return kum_read(va, value, sizeof(*value));
+    if (!kexploit_krw_ready()) return NO;
+
+    // 先用自己校准偏移（只需要做一次）。
+    if (gInfoOffset == 0) {
+        uint64_t me = proc_self();
+        if (is_kaddr_valid(me) && kum_prepare_context(me)) {
+            kum_calibrate();
+        }
+    }
+
+    return kum_prepare_context(proc);
 }
 
-// dyld_all_image_infos 的形态校验：
-//   +0x00 uint32 version（1..8）
-//   +0x04 uint32 infoArrayCount（1..4096）
-//   +0x08 uint64 infoArray（落在目标地址空间内）
+uint64_t kum_map_min(void) { return gMapMin; }
+uint64_t kum_map_max(void) { return gMapMax; }
+
+BOOL kum_read(uint64_t va, void *dst, size_t len)
+{
+    return kum_read_context(va, dst, len);
+}
+
 static BOOL kum_probe_all_image_infos(uint64_t va, uint32_t *outCount, uint64_t *outArray)
 {
     uint32_t version = 0;
     uint32_t count = 0;
     uint64_t array = 0;
 
-    if (!kum_read_u32(va, &version)) return NO;
-    if (version < 1 || version > 8) return NO;
+    if (!kum_read_context(va, &version, sizeof(version))) return NO;
+    if (version < 1 || version > 64) return NO;
 
-    if (!kum_read_u32(va + 4, &count)) return NO;
-    if (count == 0 || count > 4096) return NO;
+    if (!kum_read_context(va + 4, &count, sizeof(count))) return NO;
+    if (count == 0 || count > 8192) return NO;
 
-    if (!kum_read_u64(va + 8, &array)) return NO;
+    if (!kum_read_context(va + 8, &array, sizeof(array))) return NO;
     if (array < gMapMin || array >= gMapMax) return NO;
     if ((array & 0x7) != 0) return NO;
 
     if (outCount) *outCount = count;
     if (outArray) *outArray = array;
     return YES;
-}
-
-// 在 task 结构里找 all_image_info_addr。
-// 注意：这个字段是「用户态地址」，必须用 kread64 原样读；
-// 用 kread_ptr（内部 xpaci）会把用户指针弄坏。为兼容 PAC 签名的情况，
-// 每个字段同时尝试「原始值」和「xpaci 后的值」两种形态。
-static uint64_t kum_find_all_image_info(uint64_t *outCount, uint64_t *outArray,
-                                        uint64_t *outOffset)
-{
-    uint64_t inRange = 0;
-    uint64_t probed = 0;
-
-    for (uint64_t off = 0x18; off < 0x800; off += 8) {
-        uint64_t raw = kread64(gTask + off);
-        if (raw == 0) continue;
-
-        uint64_t forms[2];
-        forms[0] = raw;
-        forms[1] = xpaci(raw);
-
-        for (int k = 0; k < 2; k++) {
-            uint64_t candidate = forms[k];
-            if (candidate == 0) continue;
-            if (candidate < gMapMin || candidate >= gMapMax) continue;
-            if ((candidate & 0x7) != 0) continue;
-
-            inRange += 1;
-            probed += 1;
-
-            // 把候选解出来看看到底像什么，失败时也有诊断信息。
-            uint32_t ver = 0;
-            uint32_t cnt = 0;
-            uint64_t arr = 0;
-            BOOL okv = kum_read_u32(candidate, &ver);
-            BOOL okc = kum_read_u32(candidate + 4, &cnt);
-            BOOL oka = kum_read_u64(candidate + 8, &arr);
-
-            if (inRange <= 16) {
-                cyanide_log(@"[KUM] 候选 task+0x%03llx 值=0x%llx 形态=%s ver=%s%u cnt=%s%u arr=%s0x%llx",
-                            (unsigned long long)off,
-                            candidate,
-                            (k == 0 ? "raw" : "xpaci"),
-                            okv ? "" : "?",
-                            okv ? ver : 0,
-                            okc ? "" : "?",
-                            okc ? cnt : 0,
-                            oka ? "" : "?",
-                            oka ? arr : 0);
-            }
-
-            uint32_t count = 0;
-            uint64_t array = 0;
-            if (!kum_probe_all_image_infos(candidate, &count, &array)) continue;
-
-            if (outCount) *outCount = count;
-            if (outArray) *outArray = array;
-            if (outOffset) *outOffset = off;
-            return candidate;
-        }
-    }
-
-    cyanide_log(@"[KUM] task 扫描结束：落在地址空间内的候选 %llu 个，形态校验全部未通过",
-                (unsigned long long)inRange);
-    return 0;
 }
 
 NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOut)
@@ -283,46 +223,33 @@ NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOu
         return nil;
     }
 
-    uint32_t count = 0;
-    uint64_t infoArray = 0;
-
-    uint64_t infoOffset = 0;
-    cyanide_log(@"[KUM] 目标地址空间 0x%llx - 0x%llx", gMapMin, gMapMax);
-
-    uint64_t found = 0;
-
-    // 先用自身校准出来的偏移直接取，这是确定性做法。
-    if (gInfoOffset != 0) {
-        uint64_t raw = kread64(gTask + gInfoOffset);
-        uint64_t forms[2] = { raw, xpaci(raw) };
-        for (int k = 0; k < 2; k++) {
-            uint64_t candidate = forms[k];
-            if (candidate == 0) continue;
-            if (candidate < gMapMin || candidate >= gMapMax) continue;
-            uint32_t c = 0;
-            uint64_t a = 0;
-            if (kum_probe_all_image_infos(candidate, &c, &a)) {
-                found = candidate;
-                count = c;
-                infoArray = a;
-                infoOffset = gInfoOffset;
-                cyanide_log(@"[KUM] 用校准偏移 task+0x%llx 直取成功：0x%llx，%u 个模块",
-                            (unsigned long long)gInfoOffset, candidate, c);
-                break;
-            }
-        }
-    }
-
-    if (found == 0) {
-        found = kum_find_all_image_info(&count, &infoArray, &infoOffset);
-    }
-    if (found == 0) {
-        if (errorOut) *errorOut = @"没有在 task 里找到 dyld_all_image_infos";
+    if (gInfoOffset == 0) {
+        if (errorOut) *errorOut = @"自身校准未成功，缺少 all_image_info 偏移";
         return nil;
     }
 
-    cyanide_log(@"[KUM] 找到 dyld_all_image_infos：task+0x%llx -> 0x%llx，共 %u 个模块",
-                (unsigned long long)infoOffset, found, count);
+    uint64_t infoAddr = 0;
+    uint32_t count = 0;
+    uint64_t infoArray = 0;
+
+    uint64_t raw = kread64(gTask + gInfoOffset);
+    uint64_t forms[2] = { raw, xpaci(raw) };
+
+    for (int k = 0; k < 2 && infoAddr == 0; k++) {
+        uint64_t candidate = forms[k];
+        if (candidate == 0) continue;
+        if (candidate < gMapMin || candidate >= gMapMax) continue;
+        if (kum_probe_all_image_infos(candidate, &count, &infoArray)) {
+            infoAddr = candidate;
+        }
+    }
+
+    if (infoAddr == 0) {
+        if (errorOut) *errorOut = @"目标进程的 dyld_all_image_infos 校验未通过";
+        return nil;
+    }
+
+    cyanide_log(@"[KUM] 目标 dyld_all_image_infos=0x%llx，%u 个模块", infoAddr, count);
 
     NSMutableArray<NSDictionary<NSString *, id> *> *rows =
         [NSMutableArray arrayWithCapacity:count];
@@ -332,12 +259,12 @@ NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOu
 
         uint64_t loadAddress = 0;
         uint64_t pathPtr = 0;
-        if (!kum_read_u64(entry, &loadAddress)) continue;
-        if (!kum_read_u64(entry + 8, &pathPtr)) continue;
+        if (!kum_read_context(entry, &loadAddress, sizeof(loadAddress))) continue;
+        if (!kum_read_context(entry + 8, &pathPtr, sizeof(pathPtr))) continue;
         if (pathPtr == 0) continue;
 
         char pathBuffer[512] = {0};
-        if (!kum_read(pathPtr, pathBuffer, sizeof(pathBuffer) - 1)) continue;
+        if (!kum_read_context(pathPtr, pathBuffer, sizeof(pathBuffer) - 1)) continue;
 
         NSString *path = [NSString stringWithUTF8String:pathBuffer];
         if (path.length == 0) path = @"";
@@ -357,5 +284,6 @@ NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOu
         return nil;
     }
 
+    cyanide_log(@"[KUM] 成功读出 %lu 个模块（未附加、未建线程）", (unsigned long)rows.count);
     return rows;
 }
