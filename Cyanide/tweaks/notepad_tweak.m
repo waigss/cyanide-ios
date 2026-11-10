@@ -1,104 +1,175 @@
+//
+//  notepad_tweak.m
+//  Cyanide -- floating notepad panel inside SpringBoard.
+//
+//  Ported to the current remote_objc.h API. The previous revision of this file
+//  still called the removed helpers r_objc_getClass / r_msg2_ptr /
+//  r_sel_registerName and passed arguments in the old variadic shape, so it did
+//  not compile against a current Xcode (implicit function declarations are hard
+//  errors since Clang 16). Semantics are unchanged; only the call convention
+//  was updated:
+//
+//      r_objc_getClass(x)              -> r_class(x)
+//      r_sel_registerName(x)           -> r_sel(x)          (interned pointer)
+//      r_msg2_ptr(o, sel, a0, a1)      -> r_msg2(o, sel, a0, a1, 0, 0)
+//      r_msg2_main(o, sel, n, a...)    -> r_msg2_main(o, sel, a0, 0, 0, 0)
+//      doubles / CGRects               -> r_msg2_main_raw(o, sel, &v, sizeof(v), ...)
+//      struct return (CGRect)          -> r_msg2_main_struct_ret(...)
+//      r_dlsym_call(name, n, a...)     -> r_dlsym_call(R_TIMEOUT, name, a0..a7)
+//
+
 #import "notepad_tweak.h"
 #import "remote_objc.h"
 #import "../TaskRop/RemoteCall.h"
 #import <objc/runtime.h>
+#import <CoreGraphics/CoreGraphics.h>
+
+#define NP_LABEL_TAG 1337
+#define NP_ASSOC_KEY "cyanideNotepadWindow"
+#define NP_OBJC_ASSOCIATION_RETAIN_NONATOMIC 1
 
 static uint64_t g_remote_window = 0;
 
-bool notepad_tweak_apply_in_session(NSString *text) {
+// objc_msgSend in the target process (off the main thread), no arguments.
+static uint64_t np_msg(uint64_t obj, const char *selName)
+{
+    if (!r_is_objc_ptr(obj)) return 0;
+    return r_msg2(obj, selName, 0, 0, 0, 0);
+}
+
+// objc_msgSend in the target process with one pointer/integer argument.
+static uint64_t np_msg1(uint64_t obj, const char *selName, uint64_t a0)
+{
+    if (!r_is_objc_ptr(obj)) return 0;
+    return r_msg2(obj, selName, a0, 0, 0, 0);
+}
+
+// objc_msgSend on the target's main thread, one pointer/integer argument.
+static void np_msg_main(uint64_t obj, const char *selName, uint64_t a0)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    r_msg2_main(obj, selName, a0, 0, 0, 0);
+}
+
+// CGFloat / double argument (passed by value, so hand over the raw bytes).
+static void np_msg_main_double(uint64_t obj, const char *selName, double value)
+{
+    if (!r_is_objc_ptr(obj)) return;
+    r_msg2_main_raw(obj, selName, &value, sizeof(value), NULL, 0, NULL, 0, NULL, 0);
+}
+
+bool notepad_tweak_apply_in_session(NSString *text)
+{
     if (!text) text = @"Hello from Cyanide!";
-    
-    // Get UIApplication sharedApplication
-    uint64_t uiAppClass = r_objc_getClass("UIApplication");
-    uint64_t app = r_msg2_ptr(uiAppClass, r_sel_registerName("sharedApplication"));
-    if (!app) return false;
 
-    // Try to get existing window from associated object
-    const char *assocKey = "cyanideNotepadWindow";
-    g_remote_window = r_dlsym_call("objc_getAssociatedObject", 2, app, r_sel_registerName(assocKey));
+    uint64_t app = np_msg(r_class("UIApplication"), "sharedApplication");
+    if (!r_is_objc_ptr(app)) return false;
 
-    if (!g_remote_window) {
-        // Create new UIWindow
-        uint64_t windowClass = r_objc_getClass("UIWindow");
-        g_remote_window = r_msg2_ptr(windowClass, r_sel_registerName("alloc"));
-        
-        // UIScreen mainScreen bounds
-        uint64_t screenClass = r_objc_getClass("UIScreen");
-        uint64_t screen = r_msg2_ptr(screenClass, r_sel_registerName("mainScreen"));
-        CGRect bounds;
-        r_msg2_main_raw(screen, r_sel_registerName("bounds"), 0, NULL, &bounds, sizeof(bounds));
-        
-        // window = [window initWithFrame:CGRectMake(20, 100, bounds.size.width - 40, 100)]
+    // The panel is kept alive by an associated object on UIApplication, so a
+    // second apply reuses the existing window instead of stacking a new one.
+    // The key must be the *interned* selector pointer, hence r_sel().
+    uint64_t assocKey = r_sel(NP_ASSOC_KEY);
+    g_remote_window = r_dlsym_call(R_TIMEOUT, "objc_getAssociatedObject",
+                                   app, assocKey, 0, 0, 0, 0, 0, 0);
+
+    if (!r_is_objc_ptr(g_remote_window)) {
+        uint64_t windowAlloc = np_msg(r_class("UIWindow"), "alloc");
+        if (!r_is_objc_ptr(windowAlloc)) return false;
+
+        uint64_t screen = np_msg(r_class("UIScreen"), "mainScreen");
+        CGRect bounds = CGRectZero;
+        if (r_is_objc_ptr(screen)) {
+            r_msg2_main_struct_ret(screen, "bounds",
+                                   &bounds, sizeof(bounds),
+                                   NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+        }
+        if (bounds.size.width <= 1.0) bounds = CGRectMake(0, 0, 390, 844);
+
         CGRect frame = CGRectMake(20, 100, bounds.size.width - 40, 100);
-        r_msg2_main_raw(g_remote_window, r_sel_registerName("initWithFrame:"), 1, &frame, &g_remote_window, sizeof(g_remote_window));
-        
-        // window.windowLevel = 2000 (UIWindowLevelStatusBar + 1)
-        double level = 2000.0;
-        r_msg2_main(g_remote_window, r_sel_registerName("setWindowLevel:"), 1, level);
-        
-        // window.backgroundColor = [UIColor colorWithWhite:0 alpha:0.5]
-        uint64_t uiColorClass = r_objc_getClass("UIColor");
-        uint64_t color = r_msg2_ptr(uiColorClass, r_sel_registerName("colorWithWhite:alpha:"), 0.0, 0.5);
-        r_msg2_main(g_remote_window, r_sel_registerName("setBackgroundColor:"), 1, color);
-        
-        // window.layer.cornerRadius = 15
-        uint64_t layer = r_msg2_ptr(g_remote_window, r_sel_registerName("layer"));
-        r_msg2_main(layer, r_sel_registerName("setCornerRadius:"), 1, 15.0);
-        r_msg2_main(layer, r_sel_registerName("setMasksToBounds:"), 1, (bool)true);
+        g_remote_window = r_msg2_main_raw(windowAlloc, "initWithFrame:",
+                                          &frame, sizeof(frame),
+                                          NULL, 0, NULL, 0, NULL, 0);
+        if (!r_is_objc_ptr(g_remote_window)) {
+            g_remote_window = 0;
+            return false;
+        }
 
-        // Create UILabel
-        uint64_t labelClass = r_objc_getClass("UILabel");
-        uint64_t label = r_msg2_ptr(labelClass, r_sel_registerName("alloc"));
-        CGRect labelFrame = CGRectMake(10, 10, frame.size.width - 20, frame.size.height - 20);
-        r_msg2_main_raw(label, r_sel_registerName("initWithFrame:"), 1, &labelFrame, &label, sizeof(label));
-        
-        r_msg2_main(label, r_sel_registerName("setNumberOfLines:"), 1, (int)0);
-        r_msg2_main(label, r_sel_registerName("setTextAlignment:"), 1, (int)1); // Center
-        uint64_t whiteColor = r_msg2_ptr(uiColorClass, r_sel_registerName("whiteColor"));
-        r_msg2_main(label, r_sel_registerName("setTextColor:"), 1, whiteColor);
-        
-        uint64_t fontClass = r_objc_getClass("UIFont");
-        uint64_t font = r_msg2_ptr(fontClass, r_sel_registerName("systemFontOfSize:weight:"), 16.0, 0.0);
-        r_msg2_main(label, r_sel_registerName("setFont:"), 1, font);
-        
-        r_msg2_main(label, r_sel_registerName("setTag:"), 1, (int)1337);
-        r_msg2_main(g_remote_window, r_sel_registerName("addSubview:"), 1, label);
+        // Above UIWindowLevelStatusBar (1000) so the panel floats over SpringBoard.
+        np_msg_main_double(g_remote_window, "setWindowLevel:", 2000.0);
 
-        // Store window in associated object
-        r_dlsym_call("objc_setAssociatedObject", 4, app, r_sel_registerName(assocKey), g_remote_window, 1); // OBJC_ASSOCIATION_RETAIN_NONATOMIC
+        uint64_t uiColorClass = r_class("UIColor");
+        double white = 0.0;
+        double alpha = 0.5;
+        uint64_t color = r_msg2_main_raw(uiColorClass, "colorWithWhite:alpha:",
+                                         &white, sizeof(white),
+                                         &alpha, sizeof(alpha),
+                                         NULL, 0, NULL, 0);
+        np_msg_main(g_remote_window, "setBackgroundColor:", color);
+
+        uint64_t layer = np_msg(g_remote_window, "layer");
+        np_msg_main_double(layer, "setCornerRadius:", 15.0);
+        np_msg_main(layer, "setMasksToBounds:", 1);
+
+        uint64_t label = np_msg(r_class("UILabel"), "alloc");
+        CGRect labelFrame = CGRectMake(10, 10,
+                                       frame.size.width - 20, frame.size.height - 20);
+        label = r_msg2_main_raw(label, "initWithFrame:",
+                                &labelFrame, sizeof(labelFrame),
+                                NULL, 0, NULL, 0, NULL, 0);
+
+        np_msg_main(label, "setNumberOfLines:", 0);
+        np_msg_main(label, "setTextAlignment:", 1); // NSTextAlignmentCenter
+        np_msg_main(label, "setTextColor:", np_msg(uiColorClass, "whiteColor"));
+
+        double fontSize = 16.0;
+        double fontWeight = 0.0; // UIFontWeightRegular
+        uint64_t font = r_msg2_main_raw(r_class("UIFont"), "systemFontOfSize:weight:",
+                                        &fontSize, sizeof(fontSize),
+                                        &fontWeight, sizeof(fontWeight),
+                                        NULL, 0, NULL, 0);
+        np_msg_main(label, "setFont:", font);
+
+        np_msg_main(label, "setTag:", NP_LABEL_TAG);
+        np_msg_main(g_remote_window, "addSubview:", label);
+
+        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
+                     app, assocKey, g_remote_window,
+                     NP_OBJC_ASSOCIATION_RETAIN_NONATOMIC, 0, 0, 0, 0);
     }
 
-    // Update text
-    uint64_t label = r_msg2_ptr(g_remote_window, r_sel_registerName("viewWithTag:"), 1337);
-    if (label) {
-        uint64_t r_text = r_alloc_str([text UTF8String]);
-        r_msg2_main(label, r_sel_registerName("setText:"), 1, r_text);
-        r_free(r_text);
+    uint64_t label = np_msg1(g_remote_window, "viewWithTag:", NP_LABEL_TAG);
+    if (r_is_objc_ptr(label)) {
+        uint64_t remoteText = r_alloc_str([text UTF8String]);
+        if (remoteText) {
+            np_msg_main(label, "setText:", remoteText);
+            r_free(remoteText);
+        }
     }
 
-    // Show window
-    r_msg2_main(g_remote_window, r_sel_registerName("setHidden:"), 1, (bool)false);
-    r_msg2_main(g_remote_window, r_sel_registerName("makeKeyAndVisible"), 0);
+    np_msg_main(g_remote_window, "setHidden:", 0);
+    r_msg2_main(g_remote_window, "makeKeyAndVisible", 0, 0, 0, 0);
 
     return true;
 }
 
-void notepad_tweak_stop_in_session(void) {
-    uint64_t uiAppClass = r_objc_getClass("UIApplication");
-    uint64_t app = r_msg2_ptr(uiAppClass, r_sel_registerName("sharedApplication"));
-    if (!app) return;
+void notepad_tweak_stop_in_session(void)
+{
+    uint64_t app = np_msg(r_class("UIApplication"), "sharedApplication");
+    if (!r_is_objc_ptr(app)) return;
 
-    const char *assocKey = "cyanideNotepadWindow";
-    uint64_t window = r_dlsym_call("objc_getAssociatedObject", 2, app, r_sel_registerName(assocKey));
-    
-    if (window) {
-        r_msg2_main(window, r_sel_registerName("setHidden:"), 1, (bool)true);
-        // Clear associated object
-        r_dlsym_call("objc_setAssociatedObject", 4, app, r_sel_registerName(assocKey), (uint64_t)0, 1);
+    uint64_t assocKey = r_sel(NP_ASSOC_KEY);
+    uint64_t window = r_dlsym_call(R_TIMEOUT, "objc_getAssociatedObject",
+                                   app, assocKey, 0, 0, 0, 0, 0, 0);
+    if (r_is_objc_ptr(window)) {
+        np_msg_main(window, "setHidden:", 1);
+        // Dropping the association releases the panel.
+        r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
+                     app, assocKey, 0, NP_OBJC_ASSOCIATION_RETAIN_NONATOMIC, 0, 0, 0, 0);
     }
     g_remote_window = 0;
 }
 
-void notepad_tweak_forget_remote_state(void) {
+void notepad_tweak_forget_remote_state(void)
+{
     g_remote_window = 0;
 }
