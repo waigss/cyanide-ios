@@ -38,6 +38,42 @@ static uint64_t gWindowOffset = 0;    // tte - ttep：物理地址 → 内核虚
 static uint64_t gMapMin = 0;
 static uint64_t gMapMax = 0;
 static uint64_t gTask = 0;
+static uint64_t gInfoOffset = 0;      // task 里 all_image_info_addr 的偏移（由本进程校准得出）
+
+// dyld 导出的私有接口：返回本进程的 dyld_all_image_infos 地址。
+extern void *_dyld_get_all_image_infos(void);
+
+// 用我们自己的进程做基准：拿到真实的 dyld_all_image_infos 地址后，
+// 在自己 task 结构里反查它落在哪个偏移，这样目标进程的偏移就是确定的，不用猜。
+BOOL kum_discover_info_offset(void)
+{
+    if (gInfoOffset != 0) return YES;
+    if (!kexploit_krw_ready()) return NO;
+
+    void *mine = _dyld_get_all_image_infos();
+    if (mine == NULL) {
+        cyanide_log(@"[KUM] _dyld_get_all_image_infos() 返回空，无法校准");
+        return NO;
+    }
+
+    uint64_t mineAddr = (uint64_t)(uintptr_t)mine;
+    uint64_t myTask = proc_task(proc_self());
+    if (!is_kaddr_valid(myTask)) return NO;
+
+    for (uint64_t off = 0x18; off < 0x800; off += 8) {
+        uint64_t raw = kread64(myTask + off);
+        if (raw == mineAddr || xpaci(raw) == mineAddr) {
+            gInfoOffset = off;
+            cyanide_log(@"[KUM] 校准成功：all_image_info_addr 位于 task+0x%llx（自身地址 0x%llx）",
+                        (unsigned long long)off, mineAddr);
+            return YES;
+        }
+    }
+
+    cyanide_log(@"[KUM] 校准失败：自身 task 里没找到 0x%llx", mineAddr);
+    return NO;
+}
+
 
 static BOOL gPrepared = NO;
 
@@ -74,6 +110,8 @@ BOOL kum_prepare(uint64_t proc)
     gMapMin = kread64(map + 0x20);
     gMapMax = kread64(map + 0x28);
     gPrepared = YES;
+
+    kum_discover_info_offset();
 
     return YES;
 }
@@ -251,7 +289,33 @@ NSArray<NSDictionary<NSString *, id> *> *kum_read_dyld_images(NSString **errorOu
     uint64_t infoOffset = 0;
     cyanide_log(@"[KUM] 目标地址空间 0x%llx - 0x%llx", gMapMin, gMapMax);
 
-    uint64_t found = kum_find_all_image_info(&count, &infoArray, &infoOffset);
+    uint64_t found = 0;
+
+    // 先用自身校准出来的偏移直接取，这是确定性做法。
+    if (gInfoOffset != 0) {
+        uint64_t raw = kread64(gTask + gInfoOffset);
+        uint64_t forms[2] = { raw, xpaci(raw) };
+        for (int k = 0; k < 2; k++) {
+            uint64_t candidate = forms[k];
+            if (candidate == 0) continue;
+            if (candidate < gMapMin || candidate >= gMapMax) continue;
+            uint32_t c = 0;
+            uint64_t a = 0;
+            if (kum_probe_all_image_infos(candidate, &c, &a)) {
+                found = candidate;
+                count = c;
+                infoArray = a;
+                infoOffset = gInfoOffset;
+                cyanide_log(@"[KUM] 用校准偏移 task+0x%llx 直取成功：0x%llx，%u 个模块",
+                            (unsigned long long)gInfoOffset, candidate, c);
+                break;
+            }
+        }
+    }
+
+    if (found == 0) {
+        found = kum_find_all_image_info(&count, &infoArray, &infoOffset);
+    }
     if (found == 0) {
         if (errorOut) *errorOut = @"没有在 task 里找到 dyld_all_image_infos";
         return nil;
