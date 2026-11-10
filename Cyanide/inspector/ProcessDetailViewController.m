@@ -45,6 +45,8 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
 @property (nonatomic, copy) NSString *processName;
 @property (nonatomic, assign) int pid;
+@property (nonatomic, assign) uint64_t procAddr;
+@property (nonatomic, copy) NSString *loadingHintText;
 
 // 每个元素：@{@"kind": 分组标识, @"title": 分组标题, @"items": @[ @{name,path,base} ]}
 @property (nonatomic, copy) NSArray<NSDictionary<NSString *, id> *> *sections;
@@ -60,12 +62,15 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
 @implementation ProcessDetailViewController
 
-- (instancetype)initWithProcessName:(NSString *)processName pid:(int)pid
+- (instancetype)initWithProcessName:(NSString *)processName
+                                pid:(int)pid
+                           procAddr:(uint64_t)procAddr
 {
     self = [super initWithStyle:UITableViewStyleInsetGrouped];
     if (self) {
         _processName = [processName copy];
         _pid = pid;
+        _procAddr = procAddr;
     }
     return self;
 }
@@ -90,6 +95,66 @@ static BOOL module_path_is_third_party(NSString *path)
     if ([path hasPrefix:@"/private/var/"]) return YES;
     if ([path hasPrefix:@"/Library/"]) return YES;
     return NO;
+}
+
+#pragma mark - 附加
+
+// 依次尝试三种附加策略：
+//   1. 普通 init_remote_call
+//   2. MIG filter bypass（目标对 mach 消息有 filter 时用）
+//   3. MIG filter bypass + original-thread-only（目标已有异常端口时用）
+// procAddr 非 0 时直接把 g_RC_targetProcOverride 设成枚举到的 struct proc 地址，
+// 这样不会被 proc_find_by_name 找到同名的另一个进程。
+// 失败原因留在 remote_call_last_init_failure() 里，由调用方读取。
+static RemoteCallSession *cyanide_attach_to_process(NSString *name,
+                                                    uint64_t procAddr,
+                                                    void (^hint)(NSString *text))
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        if (hint) {
+            NSString *text = nil;
+            if (attempt == 0) {
+                text = @"正在附加到目标进程…";
+            } else if (attempt == 1) {
+                text = @"第一次附加没有成功，改用 MIG filter bypass 重试…";
+            } else {
+                text = @"还在失败，最后改用 original-thread-only 重试…";
+            }
+            hint(text);
+        }
+
+        if (procAddr != 0) {
+            g_RC_targetProcOverride = procAddr;
+        }
+
+        RemoteCallSession *session = nil;
+        if (attempt == 0) {
+            session = [[RemoteCallSession alloc] initWithProcess:name
+                                             useMigFilterBypass:NO
+                                        firstExceptionTimeoutMS:12000];
+        } else if (attempt == 1) {
+            session = [[RemoteCallSession alloc] initWithProcess:name
+                                             useMigFilterBypass:YES
+                                        firstExceptionTimeoutMS:12000];
+        } else {
+            session = [[RemoteCallSession alloc] initWithProcess:name
+                                             useMigFilterBypass:YES
+                                        firstExceptionTimeoutMS:12000
+                                             originalThreadOnly:YES];
+        }
+
+        if (session) return session;
+
+        g_RC_targetProcOverride = 0;
+
+        RemoteCallInitFailure lastFailure = remote_call_last_init_failure();
+        if (lastFailure == RemoteCallInitFailureKRWUnavailable ||
+            lastFailure == RemoteCallInitFailureProcessMissing) {
+            break;  // 再重试也没有意义
+        }
+    }
+
+    return nil;
 }
 
 #pragma mark - 空状态
@@ -139,9 +204,13 @@ static BOOL module_path_is_third_party(NSString *path)
 
     switch (self.state) {
         case ModuleListStateLoading:
-            self.placeholderLabel.text = [NSString stringWithFormat:
-                @"正在附加到 %@ (PID %d) 并读取库列表…\n首次附加可能要几秒。",
-                self.processName, self.pid];
+            if (self.loadingHintText.length > 0) {
+                self.placeholderLabel.text = self.loadingHintText;
+            } else {
+                self.placeholderLabel.text = [NSString stringWithFormat:
+                    @"正在附加到 %@ (PID %d) 并读取库列表…\n首次附加可能要几秒。",
+                    self.processName, self.pid];
+            }
             [self.spinner startAnimating];
             break;
         case ModuleListStateFailed:
@@ -167,9 +236,11 @@ static BOOL module_path_is_third_party(NSString *path)
     if (self.state == ModuleListStateLoading) return;
 
     self.state = ModuleListStateLoading;
+    self.loadingHintText = nil;
     [self refreshPlaceholderState];
 
     NSString *name = [self.processName copy];
+    uint64_t procAddr = self.procAddr;
     __weak typeof(self) weakSelf = self;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -186,16 +257,28 @@ static BOOL module_path_is_third_party(NSString *path)
         } else if (name.length == 0) {
             failure = @"进程名为空。";
         } else {
-            // 15s 而不是默认的 120s：目标挂起时不要让界面等两分钟。
-            RemoteCallSession *session =
-                [[RemoteCallSession alloc] initWithProcess:name
-                                        useMigFilterBypass:NO
-                                   firstExceptionTimeoutMS:15000];
+            // 目标挂起时不要让界面等两分钟：每次尝试 12s，最多三次。
+            void (^hint)(NSString *) = ^(NSString *text) {
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    __strong typeof(weakSelf) strongSelf = weakSelf;
+                    if (!strongSelf) return;
+                    strongSelf.loadingHintText = text;
+                    [strongSelf refreshPlaceholderState];
+                });
+            };
+
+            RemoteCallSession *session = cyanide_attach_to_process(name, procAddr, hint);
 
             if (!session) {
+                RemoteCallInitFailure reason = remote_call_last_init_failure();
+                const char *desc = (reason != RemoteCallInitFailureNone)
+                    ? remote_call_init_failure_description(reason) : NULL;
+                NSString *reasonText = desc ? [NSString stringWithUTF8String:desc] : @"未知原因";
                 failure = [NSString stringWithFormat:
-                           @"无法附加到 %@。\n可能是目标已挂起、正在退出，或系统不允许创建远程线程。",
-                           name];
+                           @"无法附加到 %@（%@）。\n"
+                           @"目标 App 被系统挂起时没有运行中的线程，异常端口劫持必然超时；"
+                           @"SpringBoard 这类常驻进程一般可以成功。",
+                           name, reasonText];
             } else {
                 uint64_t count = [session doRemoteCallStableWithTimeout:8000
                                                           functionName:"_dyld_image_count"
