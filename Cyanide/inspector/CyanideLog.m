@@ -12,7 +12,7 @@ static dispatch_queue_t gQueue = NULL;
 static NSString *gFilePath = nil;
 static NSDateFormatter *gFormatter = nil;
 
-void clog_init(void)
+void cyanide_log_init(void)
 {
     static dispatch_once_t once;
     dispatch_once(&once, ^{
@@ -28,9 +28,9 @@ void clog_init(void)
     });
 }
 
-NSString *clog_file_path(void)
+NSString *cyanide_log_file_path(void)
 {
-    clog_init();
+    cyanide_log_init();
     return gFilePath;
 }
 
@@ -57,11 +57,11 @@ static void clog_append_to_file(NSString *line)
     }
 }
 
-void clog(NSString *format, ...)
+void cyanide_log(NSString *format, ...)
 {
     if (format.length == 0) return;
 
-    clog_init();
+    cyanide_log_init();
 
     va_list args;
     va_start(args, format);
@@ -85,9 +85,9 @@ void clog(NSString *format, ...)
     });
 }
 
-NSArray<NSString *> *clog_lines(void)
+NSArray<NSString *> *cyanide_log_lines(void)
 {
-    clog_init();
+    cyanide_log_init();
 
     __block NSArray<NSString *> *snapshot = @[];
     dispatch_sync(gQueue, ^{
@@ -96,9 +96,9 @@ NSArray<NSString *> *clog_lines(void)
     return snapshot;
 }
 
-void clog_clear(void)
+void cyanide_log_clear(void)
 {
-    clog_init();
+    cyanide_log_init();
     dispatch_async(gQueue, ^{
         [gLines removeAllObjects];
     });
