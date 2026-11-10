@@ -7,7 +7,7 @@ on:
 
 jobs:
   build:
-    runs-on: macos-latest
+    runs-on: macos-latest 
 
     steps:
       - name: Checkout repository
@@ -15,18 +15,8 @@ jobs:
 
       - name: Build and Package IPA
         run: |
-          # 强制禁用签名进行编译
-          xcodebuild -project Cyanide.xcodeproj -scheme Cyanide -sdk iphoneos -configuration Release CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO build
-          
-          # 创建打包目录
-          mkdir -p build/Payload
-          
-          # 把编译好的 .app 复制到 Payload 目录
-          cp -R build/Release-iphoneos/Cyanide.app build/Payload/
-          
-          # 压缩成 .ipa 文件
-          cd build
-          zip -r Cyanide.ipa Payload
+          chmod +x ./scripts/build.sh
+          ./scripts/build.sh
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
