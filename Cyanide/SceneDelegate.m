@@ -8,6 +8,10 @@
 #import "SceneDelegate.h"
 #import "SettingsViewController.h"
 #import "UpdateChecker.h"
+#import "inspector/LibraryOverlayController.h"
+
+// 自动悬浮窗要观察的进程名（王者荣耀的可执行文件名）。
+static NSString * const kLibraryOverlayTargetProcess = @"smoba";
 
 @interface SceneDelegate ()
 @property (nonatomic, assign) BOOL didSelectInitialTab;
@@ -87,6 +91,7 @@
 - (void)sceneDidBecomeActive:(UIScene *)scene {
     [self selectInitialTabIfNeeded];
     settings_application_did_become_active();
+    [self startLibraryOverlayIfNeeded];
     // Independent paths: log collection opt-in notice (one-time) and update
     // check (every foreground; UpdateChecker enforces a per-process + 24-hour
     // persisted throttle so the API isn't hammered).
@@ -96,6 +101,17 @@
     [self runUpdateCheck];
 }
 
+
+- (void)startLibraryOverlayIfNeeded
+{
+    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
+    if ([overlay isActive]) return;
+    if (overlay.dismissed) return;   // 用户主动关过，本次运行内不再打扰
+
+    // 悬浮窗建在 SpringBoard 里，需要内核读写；控制器会先自动初始化内核，
+    // 成功后再把窗口挂出来，之后每 3 秒刷新一次目标进程的库列表。
+    [overlay autoStartForProcessName:kLibraryOverlayTargetProcess];
+}
 
 - (void)sceneWillResignActive:(UIScene *)scene {
     // Called when the scene will move from an active state to an inactive state.
