@@ -99,17 +99,19 @@ static const NSTimeInterval kInitTimeout = 240.0;
             return;
         }
 
-        // 允许范围：内核堆（0xffffff00.. ~ 0xfffffdff..）。
-        // 明确排除 physmap 0xfffffe.. 与内核代码段 0xfffffff0..，上次 panic 就踩在前者上。
-        const uint64_t kHeapLow  = 0xffffff0000000000ULL;
-        const uint64_t kHeapHigh = 0xfffffe0000000000ULL;
+        // 允许范围按实测分布来定：内核堆对象的高 32 位落在 0xffffffc0..0xffffffdf
+        // （本次日志里 vm_map=0xffffffdd、itk_space=0xffffffdf）。
+        // physmap 是 0xffffffe1..，内核代码/数据段是 0xfffffff0..，都被排除。
+        const uint32_t kHeapLow32  = 0xffffffc0;
+        const uint32_t kHeapHigh32 = 0xffffffdf;
 
         for (NSUInteger off = 0x30; off < 0xF0; off += 8) {
             uint64_t candidate = xpaci(kread64(map + off));
             if (!is_kaddr_valid(candidate)) continue;
-            if (candidate < kHeapLow || candidate >= kHeapHigh) {
-                cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx（不在内核堆范围，跳过）",
-                            (unsigned long)off, candidate);
+            uint32_t high32 = (uint32_t)(candidate >> 32);
+            if (high32 < kHeapLow32 || high32 > kHeapHigh32) {
+                cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx（高32位 0x%08x 不是堆段，跳过）",
+                            (unsigned long)off, candidate, high32);
                 continue;
             }
             if (candidate == task) {
