@@ -85,6 +85,31 @@ void cyanide_log(NSString *format, ...)
     });
 }
 
+void cyanide_log_sync(NSString *format, ...)
+{
+    if (format.length == 0) return;
+
+    cyanide_log_init();
+
+    va_list args;
+    va_start(args, format);
+    NSString *body = [[NSString alloc] initWithFormat:format arguments:args];
+    va_end(args);
+
+    if (body.length == 0) return;
+
+    NSString *line = [NSString stringWithFormat:@"%@ %@", [gFormatter stringFromDate:[NSDate date]], body];
+    printf("[CYANIDE] %s\n", line.UTF8String);
+
+    dispatch_sync(gQueue, ^{
+        [gLines addObject:line];
+        if (gLines.count > 4000) {
+            [gLines removeObjectsInRange:NSMakeRange(0, 1000)];
+        }
+        clog_append_to_file(line);
+    });
+}
+
 NSArray<NSString *> *cyanide_log_lines(void)
 {
     cyanide_log_init();
