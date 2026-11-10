@@ -288,6 +288,7 @@ static const NSTimeInterval kInitTimeout = 240.0;
             @"name": name,
             @"pid":  @(buffer[i].pid),
             @"uid":  @(buffer[i].uid),
+            @"proc": @(buffer[i].proc),
         }];
     }
 
@@ -409,7 +410,8 @@ static const NSTimeInterval kInitTimeout = 240.0;
     NSDictionary<NSString *, id> *row = self.visibleProcesses[(NSUInteger)indexPath.row];
     ProcessDetailViewController *detail =
         [[ProcessDetailViewController alloc] initWithProcessName:row[@"name"]
-                                                             pid:[row[@"pid"] intValue]];
+                                                             pid:[row[@"pid"] intValue]
+                                                        procAddr:[row[@"proc"] unsignedLongLongValue]];
     [self.navigationController pushViewController:detail animated:YES];
 }
 
