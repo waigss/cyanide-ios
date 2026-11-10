@@ -115,6 +115,8 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
 
         const uint64_t va = (uint64_t)(uintptr_t)kPmapSelfTest;
         const uint64_t pageMask = 0x3FFFULL;      // 16KB 页
+        // arm64 页表项：bit[47:14] 才是输出物理地址，高位是属性/软件标志位
+        const uint64_t paMask = 0x0000FFFFFFFFC000ULL;
         const uint64_t inPageOffset = va & pageMask;
 
         cyanide_log_sync(@"[PMAP] 被测 VA=0x%llx 页内偏移=0x%llx", va, inPageOffset);
@@ -129,8 +131,8 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
         }
 
         // ---- L1 ----
-        uint64_t l1Kva = (e0 & ~pageMask) + windowOffset;
-        cyanide_log_sync(@"[PMAP] L1 物理=0x%llx L1 KVA=0x%llx", e0 & ~pageMask, l1Kva);
+        uint64_t l1Kva = (e0 & paMask) + windowOffset;
+        cyanide_log_sync(@"[PMAP] L1 物理=0x%llx L1 KVA=0x%llx", e0 & paMask, l1Kva);
 
         uint64_t l1Index = (va >> 25) & 0x7FFULL;
         uint64_t e1 = kread64(l1Kva + l1Index * 8);
@@ -141,8 +143,8 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
         }
 
         // ---- L2 ----
-        uint64_t l2Kva = (e1 & ~pageMask) + windowOffset;
-        cyanide_log_sync(@"[PMAP] L2 物理=0x%llx L2 KVA=0x%llx", e1 & ~pageMask, l2Kva);
+        uint64_t l2Kva = (e1 & paMask) + windowOffset;
+        cyanide_log_sync(@"[PMAP] L2 物理=0x%llx L2 KVA=0x%llx", e1 & paMask, l2Kva);
 
         uint64_t l2Index = (va >> 14) & 0x7FFULL;
         uint64_t e2 = kread64(l2Kva + l2Index * 8);
@@ -153,7 +155,7 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
         }
 
         // ---- 数据页 ----
-        uint64_t dataPagePa = e2 & ~pageMask;
+        uint64_t dataPagePa = e2 & paMask;
         uint64_t dataKva = dataPagePa + windowOffset + inPageOffset;
         cyanide_log_sync(@"[PMAP] 数据页物理=0x%llx 读取地址=0x%llx", dataPagePa, dataKva);
 
