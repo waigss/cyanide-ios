@@ -83,54 +83,52 @@ static const NSTimeInterval kInitTimeout = 240.0;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         uint64_t selfProc = proc_self();
         uint64_t task = proc_task(selfProc);
+        uint64_t map = task ? kread_ptr(task + off_task_map) : 0;
 
-        cyanide_log(@"[PMAP] ==== 安全诊断 v4（找 pmap） ====");
-        cyanide_log(@"[PMAP] getpid=%d proc=0x%llx task=0x%llx", getpid(), selfProc, task);
+        cyanide_log(@"[PMAP] ==== 诊断 v5：确认 pmap 并检查根页表 ====");
+        cyanide_log(@"[PMAP] task=0x%llx map=0x%llx", task, map);
 
-        if (!is_kaddr_valid(task)) {
-            cyanide_log(@"[PMAP] task 不可信，停止");
-            return;
-        }
-
-        uint64_t map = kread_ptr(task + off_task_map);
-        cyanide_log(@"[PMAP] map = 0x%llx", map);
         if (!is_kaddr_valid(map)) {
             cyanide_log(@"[PMAP] map 无效，停止");
             return;
         }
 
-        // 允许范围按实测分布来定：内核堆对象的高 32 位落在 0xffffffc0..0xffffffdf
-        // （本次日志里 vm_map=0xffffffdd、itk_space=0xffffffdf）。
-        // physmap 是 0xffffffe1..，内核代码/数据段是 0xfffffff0..，都被排除。
-        const uint32_t kHeapLow32  = 0xffffffc0;
-        const uint32_t kHeapHigh32 = 0xffffffdf;
+        // _vm_map.pmap 紧跟在 vm_map_header 之后，实测与 xnu-11417 源码一致。
+        const NSUInteger kPmapOffset = 0x40;
+        uint64_t pmap = kread_ptr(map + kPmapOffset);
+        cyanide_log(@"[PMAP] pmap = kread_ptr(map+0x%lx) = 0x%llx", (unsigned long)kPmapOffset, pmap);
 
-        for (NSUInteger off = 0x30; off < 0xF0; off += 8) {
-            uint64_t candidate = xpaci(kread64(map + off));
-            if (!is_kaddr_valid(candidate)) continue;
-            uint32_t high32 = (uint32_t)(candidate >> 32);
-            if (high32 < kHeapLow32 || high32 > kHeapHigh32) {
-                cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx（高32位 0x%08x 不是堆段，跳过）",
-                            (unsigned long)off, candidate, high32);
-                continue;
-            }
-            if (candidate == task) {
-                cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx（回指 task，跳过）",
-                            (unsigned long)off, candidate);
-                continue;
-            }
+        if (!is_kaddr_valid(pmap)) {
+            cyanide_log(@"[PMAP] pmap 无效，停止");
+            return;
+        }
 
-            cyanide_log(@"[PMAP] ---- map+0x%03lx 候选 0x%llx 的前 0x40 字节 ----",
-                        (unsigned long)off, candidate);
+        uint64_t tte = kread_ptr(pmap + 0x00);    // 根页表的内核虚拟地址
+        uint64_t ttep = kread64(pmap + 0x08);     // 根页表的物理地址
+        uint64_t pmin = kread64(pmap + 0x10);     // 支持的最低 VA
+        uint64_t pmax = kread64(pmap + 0x18);     // 支持的最高 VA
+        cyanide_log(@"[PMAP] tte=0x%llx ttep=0x%llx min=0x%llx max=0x%llx", tte, ttep, pmin, pmax);
 
-            for (NSUInteger inner = 0; inner < 0x40; inner += 8) {
-                uint64_t word = kread64(candidate + inner);
-                BOOL physLike = (word >= 0x1000ULL) && (word < 0x100000000000ULL) &&
-                                ((word & 0x3FFFULL) == 0);
-                cyanide_log(@"[PMAP]   +0x%02lx = 0x%016llx%@",
-                            (unsigned long)inner, word,
-                            physLike ? @"  ★ 16KB 对齐物理地址（pm_l0？）" : @"");
-            }
+        // ttep 含 RAM 基址 0x800000000，减掉才是真实物理页号
+        if (ttep > 0x800000000ULL) {
+            cyanide_log(@"[PMAP] ttep - 0x800000000 = 0x%llx（真实物理地址）", ttep - 0x800000000ULL);
+        }
+
+        if (!is_kaddr_valid(tte)) {
+            cyanide_log(@"[PMAP] tte 不是可读内核地址，停止");
+            return;
+        }
+
+        cyanide_log(@"[PMAP] ---- 根页表前 0x80 字节（判断是不是页表） ----");
+        for (NSUInteger off = 0; off < 0x80; off += 8) {
+            uint64_t entry = kread64(tte + off);
+            BOOL valid = (entry & 0x1ULL) != 0;
+            BOOL paLike = ((entry & ~0x3FFFULL) >= 0x800000000ULL) &&
+                          ((entry & ~0x3FFFULL) < 0x10000000000ULL);
+            cyanide_log(@"[PMAP] tte+0x%02lx = 0x%016llx%@%@",
+                        (unsigned long)off, entry,
+                        valid ? @"  有效位=1" : @"",
+                        paLike ? @"  指向 RAM 区间（像页表项）" : @"");
         }
 
         cyanide_log(@"[PMAP] ==== 诊断结束 ====");
