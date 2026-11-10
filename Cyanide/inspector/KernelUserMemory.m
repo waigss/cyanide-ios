@@ -199,10 +199,31 @@ static uint64_t kum_find_all_image_info(uint64_t *outCount, uint64_t *outArray,
             if ((candidate & 0x7) != 0) continue;
 
             inRange += 1;
+            probed += 1;
+
+            // 把候选解出来看看到底像什么，失败时也有诊断信息。
+            uint32_t ver = 0;
+            uint32_t cnt = 0;
+            uint64_t arr = 0;
+            BOOL okv = kum_read_u32(candidate, &ver);
+            BOOL okc = kum_read_u32(candidate + 4, &cnt);
+            BOOL oka = kum_read_u64(candidate + 8, &arr);
+
+            if (inRange <= 16) {
+                cyanide_log(@"[KUM] 候选 task+0x%03llx 值=0x%llx 形态=%s ver=%s%u cnt=%s%u arr=%s0x%llx",
+                            (unsigned long long)off,
+                            candidate,
+                            (k == 0 ? "raw" : "xpaci"),
+                            okv ? "" : "?",
+                            okv ? ver : 0,
+                            okc ? "" : "?",
+                            okc ? cnt : 0,
+                            oka ? "" : "?",
+                            oka ? arr : 0);
+            }
 
             uint32_t count = 0;
             uint64_t array = 0;
-            probed += 1;
             if (!kum_probe_all_image_infos(candidate, &count, &array)) continue;
 
             if (outCount) *outCount = count;
