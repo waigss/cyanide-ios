@@ -82,32 +82,50 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         uint64_t selfProc = proc_self();
-        uint64_t procPid = kread32(selfProc + off_proc_p_pid);
-        uint64_t procRo = kread_ptr(selfProc + off_proc_p_proc_ro);
         uint64_t task = proc_task(selfProc);
 
-        cyanide_log(@"[PMAP] ==== 安全诊断 v2（只读） ====");
-        cyanide_log(@"[PMAP] getpid=%d p_pid=%llu proc=0x%llx proc_ro=0x%llx task=0x%llx",
-                    getpid(), (unsigned long long)procPid, selfProc, procRo, task);
+        cyanide_log(@"[PMAP] ==== 安全诊断 v3（仅读同堆区候选） ====");
+        cyanide_log(@"[PMAP] getpid=%d proc=0x%llx task=0x%llx", getpid(), selfProc, task);
 
-        if (procPid != (uint64_t)getpid() || !is_kaddr_valid(task)) {
-            cyanide_log(@"[PMAP] proc/task 不可信，停止");
+        if (!is_kaddr_valid(task)) {
+            cyanide_log(@"[PMAP] task 不可信，停止");
             return;
         }
 
-        // 关键：map 指针是 PAC 签名的，必须用 kread_ptr（内部 xpaci）来读。
         uint64_t map = kread_ptr(task + off_task_map);
-        cyanide_log(@"[PMAP] map = kread_ptr(task+0x%x) = 0x%llx", off_task_map, map);
-
-        [self logPointerWordsAt:task length:0x80 label:@"task"];
-
+        cyanide_log(@"[PMAP] map = 0x%llx", map);
         if (!is_kaddr_valid(map)) {
-            cyanide_log(@"[PMAP] map 不是合法内核指针，停止");
+            cyanide_log(@"[PMAP] map 无效，停止");
             return;
         }
 
-        cyanide_log(@"[PMAP] ---- vm_map 内容（找 pmap） ----");
-        [self logPointerWordsAt:map length:0x140 label:@"map"];
+        // 只在 vm_map 自身所在的那个堆区里找候选，避免碰到 physmap / 内核代码段。
+        uint64_t mapRegion = map & 0xFFFFFFFF00000000ULL;
+        cyanide_log(@"[PMAP] 只检查与 map 同属 0x%llx 段的指针（其余一律不碰）", mapRegion);
+
+        for (NSUInteger off = 0x30; off < 0xF0; off += 8) {
+            uint64_t raw = kread64(map + off);
+            uint64_t candidate = xpaci(raw);
+            if (!is_kaddr_valid(candidate)) continue;
+
+            if ((candidate & 0xFFFFFFFF00000000ULL) != mapRegion) {
+                cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx（不同区段，跳过）",
+                            (unsigned long)off, candidate);
+                continue;
+            }
+
+            // 只读这个候选对象的前 16 字节，用来判断它是不是 pmap。
+            uint64_t first = kread64(candidate);
+            uint64_t second = kread64(candidate + 8);
+
+            BOOL physLike = (first >= 0x1000ULL) && (first < 0x100000000000ULL) &&
+                            ((first & 0x3FFFULL) == 0);
+
+            cyanide_log(@"[PMAP] map+0x%03lx -> 0x%llx first=0x%016llx second=0x%016llx %@",
+                        (unsigned long)off, candidate, first, second,
+                        physLike ? @"★ 首字段是 16KB 对齐的物理地址，很像 pmap" : @"");
+        }
+
         cyanide_log(@"[PMAP] ==== 诊断结束 ====");
     });
 }
