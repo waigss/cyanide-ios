@@ -351,7 +351,16 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                 });
             };
 
-            RemoteCallSession *session = cyanide_attach_to_process(name, procAddr, 12000, hint);
+            // 只做一次短超时尝试（4s）：这个目标历史上附加从未成功，
+            // 失败后立刻走内核直读，不让用户白等三个策略共 40 多秒。
+            RemoteCallSession *session = nil;
+            if (procAddr != 0) {
+                g_RC_targetProcOverride = procAddr;
+            }
+            session = [[RemoteCallSession alloc] initWithProcess:name
+                                             useMigFilterBypass:NO
+                                        firstExceptionTimeoutMS:4000];
+            g_RC_targetProcOverride = 0;
 
             if (!session) {
                 // 附加失败（目标被挂起或带反劫持保护）→ 改走内核页表直读。
