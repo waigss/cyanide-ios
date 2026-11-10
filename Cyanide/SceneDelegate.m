@@ -9,6 +9,8 @@
 #import "SettingsViewController.h"
 #import "UpdateChecker.h"
 #import "inspector/ProcessListViewController.h"
+#import "inspector/CyanideLog.h"
+#import <sys/utsname.h>
 
 @interface SceneDelegate ()
 @property (nonatomic, assign) BOOL didSelectInitialTab;
@@ -19,6 +21,14 @@
 
 
 - (void)scene:(UIScene *)scene willConnectToSession:(UISceneSession *)session options:(UISceneConnectionOptions *)connectionOptions {
+    struct utsname info;
+    memset(&info, 0, sizeof(info));
+    uname(&info);
+    clog(@"==== Cyanide 启动：iOS %@ 机型 %s 版本 %@ ====",
+         UIDevice.currentDevice.systemVersion,
+         info.machine,
+         [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleShortVersionString"] ?: @"?");
+
     // 精简版：不要 TabBar / 安装器 / 设置页，启动直接进「进程」页。
     UIViewController *root = self.window.rootViewController;
     if (root) {
