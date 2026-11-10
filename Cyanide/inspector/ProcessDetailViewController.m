@@ -650,12 +650,59 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     }
 }
 
+// 每轮重新在内核进程表里按名字查一次：目标可能被杀掉重开，pid 和 proc 地址都会变。
+// 返回 NO 表示当前内核表里没有这个进程。
+- (BOOL)refreshTargetFromKernel
+{
+    if (!kexploit_krw_ready()) return NO;
+    if (self.processName.length == 0) return NO;
+
+    const char *want = self.processName.UTF8String;
+    if (!want) return NO;
+
+    const int capacity = 1024;
+    proc_entry_t *buffer = calloc((size_t)capacity, sizeof(proc_entry_t));
+    if (!buffer) return NO;
+
+    int count = proc_list_all(buffer, capacity);
+    BOOL found = NO;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(buffer[i].name, want) != 0) continue;
+
+        int newPid = (int)buffer[i].pid;
+        uint64_t newProc = buffer[i].proc;
+
+        if (newPid != self.pid || newProc != self.procAddr) {
+            cyanide_log(@"[监听] 目标刷新：pid %d -> %d，proc 0x%llx -> 0x%llx",
+                        self.pid, newPid, self.procAddr, newProc);
+        }
+
+        self.pid = newPid;
+        self.procAddr = newProc;
+        found = YES;
+        break;
+    }
+
+    free(buffer);
+    return found;
+}
+
 - (void)watchTick
 {
     if (!self.watching) return;
 
     self.watchAttempt += 1;
     NSUInteger attempt = self.watchAttempt;
+
+    // 每轮都重新查一次 pid / proc：目标被杀掉重开时旧地址会指向已退出的进程。
+    if (![self refreshTargetFromKernel]) {
+        if (attempt % 10 == 1) {
+            cyanide_log(@"[监听] 第 %lu 次：内核进程表里没有 %@（未启动或已退出，继续等）",
+                        (unsigned long)attempt, self.processName);
+        }
+        return;
+    }
 
     // 目标被挂起时每次都要等满超时，所以这里用短超时（1.5s），
     // 保证 2 秒一次的重试节奏不会被拖垮。
@@ -668,7 +715,8 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
         return;
     }
 
-    cyanide_log(@"[监听] 第 %lu 次尝试：附加成功，开始读取库列表", (unsigned long)attempt);
+    cyanide_log(@"[监听] 第 %lu 次尝试：附加成功（pid=%d），开始读取库列表",
+                (unsigned long)attempt, self.pid);
 
     NSString *report = [self buildLibraryReportWithSession:session];
     if (report.length == 0) {
