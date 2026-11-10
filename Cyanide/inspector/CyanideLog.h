@@ -11,18 +11,18 @@
 NS_ASSUME_NONNULL_BEGIN
 
 // 初始化（首次调用 clog 时会自动调用，可重复调用）。
-void clog_init(void);
+void cyanide_log_init(void);
 
 // 记录一行。自带时间戳；同时 printf 到系统日志、追加到文件。
-void clog(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
+void cyanide_log(NSString *format, ...) NS_FORMAT_FUNCTION(1, 2);
 
 // 当前缓冲区里的所有行（拷贝）。
-NSArray<NSString *> *clog_lines(void);
+NSArray<NSString *> *cyanide_log_lines(void);
 
 // 清空内存缓冲（文件保留）。
-void clog_clear(void);
+void cyanide_log_clear(void);
 
 // 日志文件路径。
-NSString *clog_file_path(void);
+NSString *cyanide_log_file_path(void);
 
 NS_ASSUME_NONNULL_END
