@@ -217,7 +217,7 @@ static const NSTimeInterval kInitTimeout = 240.0;
     self.initializing = YES;
     self.lastInitFailed = NO;
 
-    clog(@"[内核] 开始初始化：krw_ready=%d", kexploit_krw_ready() ? 1 : 0);
+    cyanide_log(@"[内核] 开始初始化：krw_ready=%d", kexploit_krw_ready() ? 1 : 0);
     CFAbsoluteTime initStart = CFAbsoluteTimeGetCurrent();
     self.kernelInitToken += 1;
     NSUInteger token = self.kernelInitToken;
@@ -236,13 +236,13 @@ static const NSTimeInterval kInitTimeout = 240.0;
     // settings_run_actions() 内部自己起后台队列，这里只是触发；
     // 完成后会给 kSettingsActionsDidCompleteNotification。
     settings_run_actions();
-    clog(@"[内核] 已下发初始化请求（settings_run_actions）");
+    cyanide_log(@"[内核] 已下发初始化请求（settings_run_actions）");
 }
 
 - (void)actionsDidComplete:(NSNotification *)note
 {
     BOOL ok = [note.userInfo[kSettingsActionsDidCompleteSuccessKey] boolValue];
-    clog(@"[内核] 初始化回调 成功=%d krw_ready=%d self_proc=0x%llx",
+    cyanide_log(@"[内核] 初始化回调 成功=%d krw_ready=%d self_proc=0x%llx",
          ok ? 1 : 0, kexploit_krw_ready() ? 1 : 0, proc_self());
     if (self.initializing) {
         self.initializing = NO;
@@ -289,10 +289,10 @@ static const NSTimeInterval kInitTimeout = 240.0;
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     uint64_t selfProc = proc_self();
     int count = proc_list_all(buffer, kProcessCapacity);
-    clog(@"[进程表] self_proc=0x%llx 读取到 %d 个进程 耗时=%.0fms",
+    cyanide_log(@"[进程表] self_proc=0x%llx 读取到 %d 个进程 耗时=%.0fms",
          selfProc, count, (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
     if (count <= 0) {
-        clog(@"[进程表] 读取为空：krw_ready=%d self_proc=0x%llx（若 self_proc 为 0，说明内核会话没真正建立）",
+        cyanide_log(@"[进程表] 读取为空：krw_ready=%d self_proc=0x%llx（若 self_proc 为 0，说明内核会话没真正建立）",
              kexploit_krw_ready() ? 1 : 0, selfProc);
     }
 
