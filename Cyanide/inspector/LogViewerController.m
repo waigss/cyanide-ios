@@ -75,7 +75,7 @@
 {
     if (!self.view.window) return;
 
-    NSUInteger count = clog_lines().count;
+    NSUInteger count = cyanide_log_lines().count;
     if (count != self.lastLineCount) {
         [self reloadText];
     }
@@ -83,11 +83,11 @@
 
 - (void)reloadText
 {
-    NSArray<NSString *> *lines = clog_lines();
+    NSArray<NSString *> *lines = cyanide_log_lines();
     self.lastLineCount = lines.count;
 
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"日志文件：%@\n", clog_file_path()];
+    [text appendFormat:@"日志文件：%@\n", cyanide_log_file_path()];
     [text appendFormat:@"共 %lu 行（在「文件」App → 我的 iPhone → Cyanide 里可以导出 cyanide.log）\n\n",
      (unsigned long)lines.count];
 
@@ -109,13 +109,13 @@
 
 - (void)clearLog
 {
-    clog_clear();
+    cyanide_log_clear();
     [self reloadText];
 }
 
 - (void)shareLog
 {
-    NSString *path = clog_file_path();
+    NSString *path = cyanide_log_file_path();
     NSURL *url = [NSURL fileURLWithPath:path];
     if (![[NSFileManager defaultManager] fileExistsAtPath:path]) {
         [self reloadText];
@@ -124,7 +124,7 @@
 
     UIActivityViewController *share = url
         ? [[UIActivityViewController alloc] initWithActivityItems:@[url] applicationActivities:nil]
-        : [[UIActivityViewController alloc] initWithActivityItems:@[clog_lines()] applicationActivities:nil];
+        : [[UIActivityViewController alloc] initWithActivityItems:@[cyanide_log_lines()] applicationActivities:nil];
     share.popoverPresentationController.barButtonItem = self.navigationItem.rightBarButtonItems.firstObject;
 
     [self presentViewController:share animated:YES completion:nil];
