@@ -2,15 +2,20 @@
 //  LibraryOverlayController.m
 //  Cyanide
 //
-//  在 SpringBoard 里挂一个悬浮窗显示指定进程的库与基址。
+//  SpringBoard 悬浮窗：显示目标进程（默认 smoba）的库与基址。
 //
-//  工作流程：
-//    1. startForProcessName:pid:procAddr:  打开静音保活、注册前台变化通知、起 2s 轮询
-//    2. 每轮先确保 SpringBoard 会话与悬浮窗存在，然后尝试附着目标进程
-//    3. 目标在前台（有可劫持线程）时附着成功 → 读 dyld 列表 → 写回悬浮窗文本
-//    4. 目标被系统挂起时附着失败 → 悬浮窗显示「等待目标进入前台」
+//  窗口结构（全部用远程调用在 SpringBoard 里搭）：
+//      UIWindow (level 999999)
+//        ├─ UILabel   标题      "Cyanide · 库地址"
+//        ├─ UILabel   "执行"
+//        ├─ UISwitch  执行开关   <- 用户点它；本进程轮询 isOn 读取状态
+//        └─ UILabel   正文      状态行 + 库列表
 //
-//  所有远程调用都串行跑在一条专用队列上：两个 RemoteCallSession（SpringBoard /
+//  交互说明：远程 UI 无法绑定 target/action（block 不能跨进程创建），所以按钮用
+//  UISwitch 实现 —— 它的 isOn 可以被本进程远程读出，读完再由本进程 setOn:animated:
+//  复位。轮询间隔 0.6s，按下到响应不超过一秒。
+//
+//  所有远程调用串行跑在一条专用队列上，两个 RemoteCallSession（SpringBoard /
 //  目标进程）通过 remote_call_with_session() 分时压栈，避免互相污染状态。
 //
 
@@ -19,16 +24,25 @@
 #import "../TaskRop/RemoteCall.h"
 #import "../tweaks/remote_objc.h"
 #import "../kexploit/kexploit_opa334.h"
+#import "../kexploit/kutils.h"
 #import "../DSKeepAlive.h"
+#import "../SettingsViewController.h"
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
+#import <stdlib.h>
+#import <string.h>
 
 static const char *kOverlayAssocKey = "cyanideLibraryOverlayWindow";
-static const int kOverlayLabelTag = 0x43A1;
+static const int kOverlayTitleTag = 0x43A1;
+static const int kOverlayBodyTag = 0x43A2;
+static const int kOverlaySwitchTag = 0x43A3;
+static const int kOverlayRunLabelTag = 0x43A4;
 
-static const NSTimeInterval kOverlayRetryInterval = 2.0;
+static const NSTimeInterval kOverlayTickInterval = 0.6;
+static const NSTimeInterval kOverlayRefreshInterval = 3.0;
 static const NSTimeInterval kOverlayDylibDeadline = 15.0;
+static const int kOverlayAttachTimeoutMS = 3000;
 static const int kOverlayDylibCallTimeout = 2;
 
 static const int kOverlayMaxThirdParty = 8;
@@ -92,16 +106,18 @@ static BOOL ov_path_is_third_party(NSString *path)
 }
 
 // 附着目标进程：先用精确 proc 地址命中，失败再换 MIG filter bypass。
-// 超时故意设短（4s）：悬浮窗要周期性试探，不能让每次失败阻塞太久。
-static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
+static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
+                                    int timeoutMS, BOOL allowBypassRetry)
 {
-    for (int attempt = 0; attempt < 2; attempt++) {
+    int attempts = allowBypassRetry ? 2 : 1;
+
+    for (int attempt = 0; attempt < attempts; attempt++) {
         if (procAddr != 0) g_RC_targetProcOverride = procAddr;
 
         RemoteCallSession *session =
             [[RemoteCallSession alloc] initWithProcess:name
                                     useMigFilterBypass:(attempt == 1)
-                               firstExceptionTimeoutMS:4000];
+                               firstExceptionTimeoutMS:timeoutMS];
 
         if (session) return session;
 
@@ -124,21 +140,26 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
 @property (nonatomic, assign) int pid;
 @property (nonatomic, assign) uint64_t procAddr;
 
-@property (nonatomic, assign) BOOL active;
+@property (nonatomic, assign, getter=isActive) BOOL active;
+@property (nonatomic, assign) BOOL dismissed;
 @property (nonatomic, assign) BOOL busy;
-@property (nonatomic, assign) BOOL needRefresh;
+@property (nonatomic, assign) BOOL autoInitKernel;
 
 @property (nonatomic, strong) dispatch_queue_t queue;
 @property (nonatomic, strong) RemoteCallSession *springboardSession;
+
 @property (nonatomic, assign) uint64_t window;
-@property (nonatomic, assign) uint64_t label;
+@property (nonatomic, assign) uint64_t titleLabel;
+@property (nonatomic, assign) uint64_t bodyLabel;
+@property (nonatomic, assign) uint64_t runSwitch;
 
 @property (nonatomic, assign) int frontmostToken;
-@property (nonatomic, strong) dispatch_source_t retryTimer;
+@property (nonatomic, strong) dispatch_source_t timer;
 
-// 屏幕尺寸在 start（主线程）时取好，避免在队列线程上碰 UIKit。
 @property (nonatomic, assign) CGSize screenSize;
-@property (nonatomic, copy) NSString *lastText;
+@property (nonatomic, assign) NSTimeInterval lastRefreshAt;
+@property (nonatomic, copy) NSString *lastListText;
+@property (nonatomic, copy) NSString *statusLine;
 
 @end
 
@@ -160,21 +181,19 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
     if (self) {
         _queue = dispatch_queue_create("com.cyanide.libraryoverlay", DISPATCH_QUEUE_SERIAL);
         _frontmostToken = -1;
+        _statusLine = @"准备中…";
     }
     return self;
 }
 
-- (BOOL)isActive
-{
-    return self.active;
-}
-
-- (NSString *)activeProcessName
-{
-    return self.active ? self.processName : nil;
-}
+- (NSString *)activeProcessName { return self.active ? self.processName : nil; }
 
 #pragma mark - 生命周期
+
+- (void)autoStartForProcessName:(NSString *)processName
+{
+    [self startForProcessName:processName pid:0 procAddr:0];
+}
 
 - (void)startForProcessName:(NSString *)processName pid:(int)pid procAddr:(uint64_t)procAddr
 {
@@ -186,12 +205,15 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
     self.pid = pid;
     self.procAddr = procAddr;
     self.active = YES;
-    self.needRefresh = YES;
+    self.dismissed = NO;
     self.busy = NO;
-    self.lastText = nil;
+    self.autoInitKernel = YES;
+    self.lastListText = nil;
+    self.lastRefreshAt = 0;
+    self.statusLine = @"准备中…";
     self.screenSize = [UIScreen mainScreen].bounds.size;
 
-    // 切到目标 App 后本进程要活着才能继续探测，靠静音音频保活。
+    // 切到目标 App 后本进程要活着才能继续刷新，靠静音音频保活。
     ds_keepalive_apply_enabled(YES);
 
     __weak typeof(self) weakSelf = self;
@@ -204,45 +226,40 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
             (void)t;
             __strong typeof(weakSelf) self = weakSelf;
             if (!self) return;
-            self.needRefresh = YES;
+            // 前台切换时立刻补一轮，不等 3 秒轮询。
+            self.lastRefreshAt = 0;
         });
         self.frontmostToken = token;
     }
 
-    if (!self.retryTimer) {
+    if (!self.timer) {
         dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self.queue);
         if (timer) {
             dispatch_source_set_timer(timer,
                                       dispatch_time(DISPATCH_TIME_NOW, (int64_t)(NSEC_PER_SEC)),
-                                      (uint64_t)(kOverlayRetryInterval * NSEC_PER_SEC),
-                                      (uint64_t)(0.5 * NSEC_PER_SEC));
+                                      (uint64_t)(kOverlayTickInterval * NSEC_PER_SEC),
+                                      (uint64_t)(0.2 * NSEC_PER_SEC));
             dispatch_source_set_event_handler(timer, ^{
                 __strong typeof(weakSelf) self = weakSelf;
                 if (!self) return;
                 [self tick];
             });
             dispatch_resume(timer);
-            self.retryTimer = timer;
+            self.timer = timer;
         }
     }
-
-    dispatch_async(self.queue, ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-        [self tick];
-    });
 }
 
 - (void)stop
 {
-    if (!self.active && !self.retryTimer) return;
+    BOOL hadSession = (self.springboardSession != nil);
 
     self.active = NO;
-    self.needRefresh = NO;
+    self.autoInitKernel = NO;
 
-    if (self.retryTimer) {
-        dispatch_source_cancel(self.retryTimer);
-        self.retryTimer = nil;
+    if (self.timer) {
+        dispatch_source_cancel(self.timer);
+        self.timer = nil;
     }
 
     if (self.frontmostToken >= 0) {
@@ -250,39 +267,94 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
         self.frontmostToken = -1;
     }
 
-    dispatch_sync(self.queue, ^{
-        [self removeOverlayLocked];
-    });
+    if (hadSession) {
+        dispatch_sync(self.queue, ^{
+            [self removeOverlayLocked];
+        });
+    }
 
     self.springboardSession = nil;
     self.processName = nil;
+    self.lastListText = nil;
 }
 
-#pragma mark - 轮询
+- (void)stopByUser
+{
+    [self stop];
+    self.dismissed = YES;
+}
+
+#pragma mark - 主轮询
 
 - (void)tick
 {
-    if (!self.active || self.busy || !self.needRefresh) return;
+    if (!self.active || self.busy) return;
 
     self.busy = YES;
     @try {
-        if (!self.springboardSession && ![self installOverlayLocked]) {
-            return;
+        // 窗口本身依赖内核读写（要在 SpringBoard 里开 RemoteCall 会话），
+        // 所以没就绪时先尝试初始化，成功后再建窗。
+        if (!self.springboardSession) {
+            if (!kexploit_krw_ready()) {
+                if (!self.autoInitKernel) return;
+                [self setStatusLineLocked:@"正在初始化内核…"];
+                BOOL ok = settings_ensure_kernel_ready();
+                if (!ok) {
+                    [self setStatusLineLocked:@"内核初始化失败，稍后自动重试…"];
+                    return;
+                }
+                [self setStatusLineLocked:@"内核已就绪，正在挂载悬浮窗…"];
+            }
+
+            if (![self installOverlayLocked]) {
+                [self setStatusLineLocked:@"悬浮窗挂载失败，稍后重试…"];
+                return;
+            }
+            self.lastRefreshAt = 0;
         }
 
-        NSString *text = [self libraryTextLocked];
-        if (text.length > 0) {
-            [self updateOverlayTextLocked:text];
-            self.needRefresh = NO;
-        } else {
-            [self updateOverlayTextLocked:
-                [NSString stringWithFormat:
-                 @"%@ (PID %d)\n等待目标进入前台…\n（切到该 App 后会自动读取）",
-                 self.processName, self.pid]];
+        [self pollRunSwitchLocked];
+
+        NSTimeInterval now = CFAbsoluteTimeGetCurrent();
+        if (now - self.lastRefreshAt >= kOverlayRefreshInterval) {
+            self.lastRefreshAt = now;
+            [self refreshLibrariesLocked];
         }
     } @finally {
         self.busy = NO;
     }
+}
+
+#pragma mark - 开关轮询
+
+- (void)pollRunSwitchLocked
+{
+    if (!r_is_objc_ptr(self.runSwitch) || !self.springboardSession) return;
+
+    __block BOOL pressed = NO;
+    remote_call_with_session(self.springboardSession, ^{
+        pressed = (r_msg2_main(self.runSwitch, "isOn", 0, 0, 0, 0) & 0xff) != 0;
+        if (pressed) {
+            // 由本进程复位，用户看到的是一个会自动弹回的开关。
+            r_msg2_main(self.runSwitch, "setOn:animated:", 0, 0, 0, 0);
+        }
+    });
+
+    if (!pressed) return;
+
+    [self setStatusLineLocked:@"已按下：正在初始化内核并查找目标…"];
+
+    BOOL ok = settings_ensure_kernel_ready();
+    if (!ok) {
+        [self setStatusLineLocked:@"内核初始化失败，详见 Cyanide 的 Log 页"];
+        return;
+    }
+
+    // 重新按名字定位，避免用旧的 proc 地址。
+    self.procAddr = 0;
+    self.pid = 0;
+    self.lastRefreshAt = CFAbsoluteTimeGetCurrent();
+    [self refreshLibrariesLocked];
 }
 
 #pragma mark - 悬浮窗
@@ -301,7 +373,12 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
 
     __block BOOL ok = NO;
     __block uint64_t builtWindow = 0;
-    __block uint64_t builtLabel = 0;
+    __block uint64_t builtTitle = 0;
+    __block uint64_t builtBody = 0;
+    __block uint64_t builtSwitch = 0;
+
+    CGFloat screenW = MAX(200.0, self.screenSize.width);
+    CGFloat screenH = MAX(320.0, self.screenSize.height);
 
     remote_call_with_session(session, ^{
         uint64_t UIApplication = r_class("UIApplication");
@@ -330,58 +407,102 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
             ? r_msg2_main(allocated, "initWithWindowScene:", scene, 0, 0, 0) : 0;
         if (!r_is_objc_ptr(window)) return;
 
-        CGRect screen = CGRectMake(0, 0, MAX(200.0, self.screenSize.width), MAX(320.0, self.screenSize.height));
-        CGFloat width = MAX(200.0, screen.size.width - 16.0);
-        CGFloat height = MIN(screen.size.height * 0.45, 420.0);
-        CGRect windowRect = CGRectMake(8.0, 60.0, width, height);
+        // 这个窗口会吃掉它覆盖区域内的触摸，所以别开太大，
+        // 保住屏幕下半部分仍然可以正常操作目标 App。
+        CGFloat width = MIN(MAX(240.0, screenW - 16.0), 380.0);
+        CGFloat height = MIN(screenH * 0.34, 330.0);
+        CGRect windowRect = CGRectMake(8.0, 56.0, width, height);
 
         ov_set_rect(window, "setFrame:", windowRect);
         ov_set_double(window, "setWindowLevel:", 999999.0);
-        r_msg2_main(window, "setUserInteractionEnabled:", 0, 0, 0, 0);
+        r_msg2_main(window, "setUserInteractionEnabled:", 1, 0, 0, 0);
 
-        uint64_t background = ov_color(0.0, 0.82);
+        uint64_t background = ov_color(0.0, 0.85);
         if (r_is_objc_ptr(background)) {
             r_msg2_main(window, "setBackgroundColor:", background, 0, 0, 0);
         }
 
         uint64_t UILabelClass = r_class("UILabel");
-        uint64_t labelAllocated = r_is_objc_ptr(UILabelClass)
-            ? r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0) : 0;
-        uint64_t label = r_is_objc_ptr(labelAllocated)
-            ? r_msg2_main(labelAllocated, "init", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(label)) return;
-
-        r_msg2_main(label, "setNumberOfLines:", 0, 0, 0, 0);
-        r_msg2_main(label, "setTag:", kOverlayLabelTag, 0, 0, 0);
-        r_msg2_main(label, "setTextAlignment:", 0, 0, 0, 0);
-
-        double fontSize = 9.0;
-        double fontWeight = 0.0;
         uint64_t UIFontClass = r_class("UIFont");
-        uint64_t font = r_is_objc_ptr(UIFontClass)
-            ? r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
-                              &fontSize, sizeof(fontSize),
-                              &fontWeight, sizeof(fontWeight),
-                              NULL, 0, NULL, 0) : 0;
-        if (r_is_objc_ptr(font)) {
-            r_msg2_main(label, "setFont:", font, 0, 0, 0);
+        uint64_t UIColorClass = r_class("UIColor");
+        if (!r_is_objc_ptr(UILabelClass) || !r_is_objc_ptr(UIFontClass)) return;
+
+        uint64_t whiteColor = r_is_objc_ptr(UIColorClass)
+            ? r_msg2_main(UIColorClass, "whiteColor", 0, 0, 0, 0) : 0;
+
+        // 标题
+        uint64_t titleAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+        uint64_t title = r_is_objc_ptr(titleAllocated)
+            ? r_msg2_main(titleAllocated, "init", 0, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(title)) return;
+
+        r_msg2_main(title, "setTag:", kOverlayTitleTag, 0, 0, 0);
+        double titleSize = 11.0;
+        double bold = 0.4;
+        uint64_t titleFont = r_msg2_main_raw(UIFontClass, "systemFontOfSize:weight:",
+                                             &titleSize, sizeof(titleSize),
+                                             &bold, sizeof(bold),
+                                             NULL, 0, NULL, 0);
+        if (r_is_objc_ptr(titleFont)) r_msg2_main(title, "setFont:", titleFont, 0, 0, 0);
+        if (r_is_objc_ptr(whiteColor)) r_msg2_main(title, "setTextColor:", whiteColor, 0, 0, 0);
+        ov_set_rect(title, "setFrame:", CGRectMake(10.0, 6.0, width - 130.0, 18.0));
+        uint64_t titleStr = ov_nsstring("Cyanide · 库地址");
+        if (r_is_objc_ptr(titleStr)) r_msg2_main(title, "setText:", titleStr, 0, 0, 0);
+        r_msg2_main(window, "addSubview:", title, 0, 0, 0);
+
+        // 「执行」标签
+        uint64_t runAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+        uint64_t runLabel = r_is_objc_ptr(runAllocated)
+            ? r_msg2_main(runAllocated, "init", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(runLabel)) {
+            r_msg2_main(runLabel, "setTag:", kOverlayRunLabelTag, 0, 0, 0);
+            double runSize = 11.0;
+            uint64_t runFont = r_msg2_main_raw(UIFontClass, "systemFontOfSize:",
+                                               &runSize, sizeof(runSize),
+                                               NULL, 0, NULL, 0, NULL, 0);
+            if (r_is_objc_ptr(runFont)) r_msg2_main(runLabel, "setFont:", runFont, 0, 0, 0);
+            if (r_is_objc_ptr(whiteColor)) r_msg2_main(runLabel, "setTextColor:", whiteColor, 0, 0, 0);
+            ov_set_rect(runLabel, "setFrame:", CGRectMake(width - 120.0, 8.0, 44.0, 16.0));
+            uint64_t runText = ov_nsstring("执行");
+            if (r_is_objc_ptr(runText)) r_msg2_main(runLabel, "setText:", runText, 0, 0, 0);
+            r_msg2_main(window, "addSubview:", runLabel, 0, 0, 0);
         }
 
-        uint64_t whiteColor = r_is_objc_ptr(r_class("UIColor"))
-            ? r_msg2_main(r_class("UIColor"), "whiteColor", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(whiteColor)) {
-            r_msg2_main(label, "setTextColor:", whiteColor, 0, 0, 0);
+        // 执行开关
+        uint64_t switchClass = r_class("UISwitch");
+        uint64_t switchAllocated = r_is_objc_ptr(switchClass)
+            ? r_msg2_main(switchClass, "alloc", 0, 0, 0, 0) : 0;
+        uint64_t runSwitch = r_is_objc_ptr(switchAllocated)
+            ? r_msg2_main(switchAllocated, "init", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(runSwitch)) {
+            r_msg2_main(runSwitch, "setTag:", kOverlaySwitchTag, 0, 0, 0);
+            r_msg2_main(runSwitch, "setOn:", 0, 0, 0, 0);
+            ov_set_rect(runSwitch, "setFrame:", CGRectMake(width - 74.0, 0.0, 64.0, 32.0));
+            r_msg2_main(window, "addSubview:", runSwitch, 0, 0, 0);
+            builtSwitch = runSwitch;
         }
 
-        CGRect labelRect = CGRectMake(8.0, 8.0,
-                                      MAX(1.0, windowRect.size.width - 16.0),
-                                      MAX(1.0, windowRect.size.height - 16.0));
-        ov_set_rect(label, "setFrame:", labelRect);
+        // 正文
+        uint64_t bodyAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+        uint64_t body = r_is_objc_ptr(bodyAllocated)
+            ? r_msg2_main(bodyAllocated, "init", 0, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(body)) return;
 
-        r_msg2_main(window, "addSubview:", label, 0, 0, 0);
+        r_msg2_main(body, "setTag:", kOverlayBodyTag, 0, 0, 0);
+        r_msg2_main(body, "setNumberOfLines:", 0, 0, 0, 0);
+        double bodySize = 9.0;
+        double regular = 0.0;
+        uint64_t bodyFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                            &bodySize, sizeof(bodySize),
+                                            &regular, sizeof(regular),
+                                            NULL, 0, NULL, 0);
+        if (r_is_objc_ptr(bodyFont)) r_msg2_main(body, "setFont:", bodyFont, 0, 0, 0);
+        if (r_is_objc_ptr(whiteColor)) r_msg2_main(body, "setTextColor:", whiteColor, 0, 0, 0);
+        ov_set_rect(body, "setFrame:", CGRectMake(10.0, 40.0, width - 20.0, height - 50.0));
+
+        r_msg2_main(window, "addSubview:", body, 0, 0, 0);
         r_msg2_main(window, "setHidden:", 0, 0, 0, 0);
 
-        // 把 window 挂到 SpringBoard 的 UIApplication 上，避免被释放。
         uint64_t key = r_sel(kOverlayAssocKey);
         if (key) {
             r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
@@ -389,33 +510,52 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
         }
 
         builtWindow = window;
-        builtLabel = label;
+        builtTitle = title;
+        builtBody = body;
         ok = YES;
     });
 
     self.window = builtWindow;
-    self.label = builtLabel;
+    self.titleLabel = builtTitle;
+    self.bodyLabel = builtBody;
+    self.runSwitch = builtSwitch;
 
     if (!ok) {
         self.springboardSession = nil;
+        return NO;
     }
-    return ok;
+
+    [self setStatusLineLocked:@"就绪：按右上角「执行」初始化内核并读取目标"];
+    return YES;
 }
 
-- (void)updateOverlayTextLocked:(NSString *)text
+- (void)setStatusLineLocked:(NSString *)line
 {
-    if (!self.springboardSession || !r_is_objc_ptr(self.label)) return;
-    if (text.length == 0 || [text isEqualToString:self.lastText]) return;
+    self.statusLine = line ?: @"";
+    [self pushBodyTextLocked];
+}
+
+- (void)pushBodyTextLocked
+{
+    if (!self.springboardSession || !r_is_objc_ptr(self.bodyLabel)) return;
+
+    NSMutableString *text = [NSMutableString string];
+    [text appendFormat:@"目标: %@%@\n", self.processName ?: @"?",
+     self.pid > 0 ? [NSString stringWithFormat:@" (PID %d)", self.pid] : @""];
+    [text appendFormat:@"%@\n", self.statusLine ?: @""];
+
+    if (self.lastListText.length > 0) {
+        [text appendString:@"\n"];
+        [text appendString:self.lastListText];
+    }
 
     const char *utf8 = text.UTF8String;
     if (!utf8) return;
 
-    self.lastText = text;
-
     remote_call_with_session(self.springboardSession, ^{
         uint64_t str = ov_nsstring(utf8);
         if (r_is_objc_ptr(str)) {
-            r_msg2_main(self.label, "setText:", str, 0, 0, 0);
+            r_msg2_main(self.bodyLabel, "setText:", str, 0, 0, 0);
         }
     });
 }
@@ -424,7 +564,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
 {
     if (!self.springboardSession) {
         self.window = 0;
-        self.label = 0;
+        self.titleLabel = 0;
+        self.bodyLabel = 0;
+        self.runSwitch = 0;
         return;
     }
 
@@ -445,30 +587,73 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
     });
 
     self.window = 0;
-    self.label = 0;
+    self.titleLabel = 0;
+    self.bodyLabel = 0;
+    self.runSwitch = 0;
+}
+
+#pragma mark - 目标定位
+
+// 按名字在内核进程表里找目标，顺便拿到精确的 struct proc 地址。
+- (BOOL)lookupTargetLocked
+{
+    if (!kexploit_krw_ready()) return NO;
+    if (self.processName.length == 0) return NO;
+
+    const char *want = self.processName.UTF8String;
+    if (!want) return NO;
+
+    const int capacity = 1024;
+    proc_entry_t *buffer = calloc((size_t)capacity, sizeof(proc_entry_t));
+    if (!buffer) return NO;
+
+    int count = proc_list_all(buffer, capacity);
+    BOOL found = NO;
+
+    for (int i = 0; i < count; i++) {
+        if (strcmp(buffer[i].name, want) != 0) continue;
+        self.procAddr = buffer[i].proc;
+        self.pid = (int)buffer[i].pid;
+        found = YES;
+        break;
+    }
+
+    free(buffer);
+    return found;
 }
 
 #pragma mark - 读库
 
-// 返回 nil 表示这次没读到（目标大概被挂起了）。
-- (NSString *)libraryTextLocked
+- (void)refreshLibrariesLocked
 {
-    if (!kexploit_krw_ready()) return nil;
+    if (!kexploit_krw_ready()) {
+        [self setStatusLineLocked:@"内核未就绪"];
+        return;
+    }
 
-    RemoteCallSession *session = ov_attach(self.processName, self.procAddr);
-    if (!session) return nil;
+    if (![self lookupTargetLocked]) {
+        self.lastListText = nil;
+        [self setStatusLineLocked:[NSString stringWithFormat:@"没有找到进程 %@（未运行？）",
+                                   self.processName ?: @"?"]];
+        return;
+    }
+
+    RemoteCallSession *session = ov_attach(self.processName, self.procAddr,
+                                           kOverlayAttachTimeoutMS, NO);
+    if (!session) {
+        [self setStatusLineLocked:@"目标当前不在前台（已挂起），等待中…"];
+        return;
+    }
 
     NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"%@ (PID %d)\n", self.processName, self.pid];
+    NSMutableArray<NSString *> *mainLines = [NSMutableArray array];
+    NSMutableArray<NSString *> *thirdLines = [NSMutableArray array];
+    NSMutableArray<NSString *> *systemLines = [NSMutableArray array];
 
     __block NSUInteger total = 0;
     __block NSUInteger thirdCount = 0;
     __block NSUInteger systemCount = 0;
     __block BOOL truncated = NO;
-
-    NSMutableArray<NSString *> *mainLines = [NSMutableArray array];
-    NSMutableArray<NSString *> *thirdLines = [NSMutableArray array];
-    NSMutableArray<NSString *> *systemLines = [NSMutableArray array];
 
     remote_call_with_session(session, ^{
         uint64_t count = r_dlsym_call(kOverlayDylibCallTimeout, "_dyld_image_count",
@@ -500,31 +685,31 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
 
             if (i == 0) {
                 [mainLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                      (unsigned long long)base,
-                                      ov_short_name(path, 26)]];
+                                      (unsigned long long)base, ov_short_name(path, 26)]];
             } else if (ov_path_is_third_party(path)) {
                 thirdCount += 1;
                 if (thirdLines.count < kOverlayMaxThirdParty) {
                     [thirdLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                           (unsigned long long)base,
-                                           ov_short_name(path, 24)]];
+                                           (unsigned long long)base, ov_short_name(path, 24)]];
                 }
             } else {
                 systemCount += 1;
                 if (systemLines.count < kOverlayMaxSystem) {
                     [systemLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                            (unsigned long long)base,
-                                            ov_short_name(path, 24)]];
+                                            (unsigned long long)base, ov_short_name(path, 24)]];
                 }
             }
         }
     });
 
-    if (total == 0) return nil;
+    if (total == 0) {
+        [self setStatusLineLocked:@"读取失败（dyld 返回 0）"];
+        return;
+    }
 
     [text appendFormat:@"共 %lu 项 · 第三方 %lu · 系统 %lu%@\n",
      (unsigned long)total, (unsigned long)thirdCount, (unsigned long)systemCount,
-     truncated ? @"（超时，不完整）" : @""];
+     truncated ? @"（超时）" : @""];
 
     if (mainLines.count > 0) {
         [text appendString:@"主程序\n"];
@@ -545,7 +730,12 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr)
         }
     }
 
-    return text;
+    self.lastListText = text;
+
+    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
+    formatter.dateFormat = @"HH:mm:ss";
+    [self setStatusLineLocked:[NSString stringWithFormat:@"已更新 %@",
+                               [formatter stringFromDate:[NSDate date]]]];
 }
 
 @end
