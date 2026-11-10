@@ -13,6 +13,8 @@
 
 #import "ProcessListViewController.h"
 
+#import "ProcessDetailViewController.h"
+
 #import "../kexploit/kutils.h"
 #import "../kexploit/kexploit_opa334.h"
 #import "../SettingsViewController.h"
@@ -36,6 +38,10 @@ static const NSTimeInterval kInitTimeout = 240.0;
 @property (nonatomic, assign) BOOL initializing;
 @property (nonatomic, assign) BOOL lastInitFailed;
 @property (nonatomic, assign) NSUInteger kernelInitToken;
+
+// 默认只看应用进程（UID 501）；点右上角可以在「仅应用 / 全部」之间切换。
+@property (nonatomic, assign) BOOL showAllProcesses;
+@property (nonatomic, strong) UIBarButtonItem *filterItem;
 
 @end
 
@@ -66,10 +72,16 @@ static const NSTimeInterval kInitTimeout = 240.0;
     self.searchController = search;
     self.definesPresentationContext = YES;
 
-    self.navigationItem.rightBarButtonItem =
+    self.filterItem = [[UIBarButtonItem alloc] initWithTitle:@"全部"
+                                                      style:UIBarButtonItemStylePlain
+                                                     target:self
+                                                     action:@selector(toggleProcessFilter)];
+    self.navigationItem.rightBarButtonItems = @[
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self
-                                                      action:@selector(reloadProcesses)];
+                                                      action:@selector(reloadProcesses)],
+        self.filterItem,
+    ];
 
     [self buildPlaceholderView];
 
@@ -172,6 +184,8 @@ static const NSTimeInterval kInitTimeout = 240.0;
     } else if (self.searchController.searchBar.text.length > 0) {
         text = [NSString stringWithFormat:@"没有匹配「%@」的进程",
                 self.searchController.searchBar.text];
+    } else if (!self.showAllProcesses && [self uidProbeUsable]) {
+        text = @"当前没有正在运行的应用进程。\n点右上角「全部」可以看到系统守护进程。";
     } else {
         text = @"没有读取到进程";
     }
@@ -289,13 +303,34 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
 #pragma mark - 过滤与刷新
 
+// UID 探测失败时（所有项都是 UINT32_MAX）不要因为过滤把列表清空，
+// 这种情况直接退化成「显示全部」。
+- (BOOL)uidProbeUsable
+{
+    for (NSDictionary<NSString *, id> *row in self.allProcesses) {
+        if ([row[@"uid"] unsignedIntValue] != UINT32_MAX) return YES;
+    }
+    return NO;
+}
+
+- (void)toggleProcessFilter
+{
+    self.showAllProcesses = !self.showAllProcesses;
+    self.filterItem.title = self.showAllProcesses ? @"仅应用" : @"全部";
+    [self applyFilter];
+}
+
 - (void)applyFilter
 {
     NSString *query = self.searchController.searchBar.text ?: @"";
     query = [query stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
+    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+
     NSMutableArray<NSDictionary<NSString *, id> *> *filtered = [NSMutableArray array];
     for (NSDictionary<NSString *, id> *row in self.allProcesses) {
+        if (appsOnly && [row[@"uid"] unsignedIntValue] != 501) continue;
+
         if (query.length == 0) {
             [filtered addObject:row];
             continue;
@@ -325,18 +360,24 @@ static const NSTimeInterval kInitTimeout = 240.0;
 {
     if (self.visibleProcesses.count == 0) return nil;
 
-    NSUInteger appCount = 0;
-    for (NSDictionary<NSString *, id> *row in self.visibleProcesses) {
-        if ([row[@"uid"] unsignedIntValue] == 501) appCount++;
+    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+    if (appsOnly) {
+        return [NSString stringWithFormat:@"共 %lu 个应用进程",
+                (unsigned long)self.visibleProcesses.count];
     }
-    return [NSString stringWithFormat:@"共 %lu 个进程 · 其中应用进程 %lu 个",
-            (unsigned long)self.visibleProcesses.count, (unsigned long)appCount];
+    return [NSString stringWithFormat:@"共 %lu 个进程",
+            (unsigned long)self.visibleProcesses.count];
 }
 
 - (NSString *)tableView:(UITableView *)tableView titleForFooterInSection:(NSInteger)section
 {
     if (self.visibleProcesses.count == 0) return nil;
-    return @"UID 501 为移动用户（普通 App），其余多为系统守护进程。列表实时读取，不会缓存。";
+
+    BOOL appsOnly = !self.showAllProcesses && [self uidProbeUsable];
+    if (appsOnly) {
+        return @"默认只列出应用进程（UID 501）。点右上角「全部」可以看到系统守护进程。点任意一行查看该进程加载的模块与基址。";
+    }
+    return @"UID 501 为移动用户（普通 App），其余多为系统守护进程。点任意一行查看该进程加载的模块与基址。";
 }
 
 - (UITableViewCell *)tableView:(UITableView *)tableView cellForRowAtIndexPath:(NSIndexPath *)indexPath
@@ -345,7 +386,7 @@ static const NSTimeInterval kInitTimeout = 240.0;
     if (!cell) {
         cell = [[UITableViewCell alloc] initWithStyle:UITableViewCellStyleSubtitle
                                       reuseIdentifier:kProcessCellIdentifier];
-        cell.selectionStyle = UITableViewCellSelectionStyleNone;
+        cell.accessoryType = UITableViewCellAccessoryDisclosureIndicator;
         cell.detailTextLabel.textColor = [UIColor secondaryLabelColor];
         cell.detailTextLabel.font = [UIFont monospacedDigitSystemFontOfSize:12.0
                                                                      weight:UIFontWeightRegular];
@@ -359,6 +400,17 @@ static const NSTimeInterval kInitTimeout = 240.0;
     cell.detailTextLabel.text = [NSString stringWithFormat:@"PID %@ · UID %@",
                                  row[@"pid"], uidText];
     return cell;
+}
+
+- (void)tableView:(UITableView *)tableView didSelectRowAtIndexPath:(NSIndexPath *)indexPath
+{
+    [tableView deselectRowAtIndexPath:indexPath animated:YES];
+
+    NSDictionary<NSString *, id> *row = self.visibleProcesses[(NSUInteger)indexPath.row];
+    ProcessDetailViewController *detail =
+        [[ProcessDetailViewController alloc] initWithProcessName:row[@"name"]
+                                                             pid:[row[@"pid"] intValue]];
+    [self.navigationController pushViewController:detail animated:YES];
 }
 
 #pragma mark - UISearchResultsUpdating
