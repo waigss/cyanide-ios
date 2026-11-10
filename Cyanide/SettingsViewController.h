@@ -68,6 +68,9 @@ extern NSString * const kSettingsActionsDidCompleteMessageKey;
 // SpringBoard RemoteCall session goes away.
 BOOL settings_tweak_is_applied(NSString *key);
 
+// 供悬浮窗等模块使用：确保内核读写就绪（已就绪则立即返回 YES）。
+BOOL settings_ensure_kernel_ready(void);
+
 void settings_register_defaults(void);
 BOOL settings_device_supported(void);
 // Opens the Contact email composer (MFMailComposeViewController if Mail is
