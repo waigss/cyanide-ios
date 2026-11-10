@@ -25,6 +25,7 @@
 
 #import "../TaskRop/RemoteCall.h"
 #import "../kexploit/kexploit_opa334.h"
+#import "../kexploit/kutils.h"
 #import "../utils/sandbox.h"
 #import "CyanideLog.h"
 
