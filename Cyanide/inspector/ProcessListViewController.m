@@ -29,13 +29,13 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
 @property (nonatomic, strong) UIView *placeholderView;
 @property (nonatomic, strong) UILabel *placeholderLabel;
-@property (nonatomic, strong) UIButton *initButton;
+@property (nonatomic, strong) UIButton *kernelInitButton;
 @property (nonatomic, strong) UIActivityIndicatorView *spinner;
 
 @property (nonatomic, assign) BOOL loading;
 @property (nonatomic, assign) BOOL initializing;
 @property (nonatomic, assign) BOOL lastInitFailed;
-@property (nonatomic, assign) NSUInteger initToken;
+@property (nonatomic, assign) NSUInteger kernelInitToken;
 
 @end
 
@@ -112,15 +112,15 @@ static const NSTimeInterval kInitTimeout = 240.0;
     self.placeholderLabel.font = [UIFont preferredFontForTextStyle:UIFontTextStyleSubheadline];
     self.placeholderLabel.textColor = [UIColor secondaryLabelColor];
 
-    self.initButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    [self.initButton setTitle:@"初始化内核" forState:UIControlStateNormal];
-    self.initButton.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
-    [self.initButton addTarget:self
+    self.kernelInitButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [self.kernelInitButton setTitle:@"初始化内核" forState:UIControlStateNormal];
+    self.kernelInitButton.titleLabel.font = [UIFont systemFontOfSize:17.0 weight:UIFontWeightSemibold];
+    [self.kernelInitButton addTarget:self
                         action:@selector(startKernelInit)
               forControlEvents:UIControlEventTouchUpInside];
 
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        self.spinner, self.placeholderLabel, self.initButton
+        self.spinner, self.placeholderLabel, self.kernelInitButton
     ]];
     stack.axis = UILayoutConstraintAxisVertical;
     stack.alignment = UIStackViewAlignmentFill;
@@ -133,7 +133,7 @@ static const NSTimeInterval kInitTimeout = 240.0;
         [stack.centerYAnchor constraintEqualToAnchor:container.centerYAnchor],
         [stack.widthAnchor   constraintLessThanOrEqualToConstant:320.0],
         [stack.leadingAnchor constraintGreaterThanOrEqualToAnchor:container.leadingAnchor constant:16.0],
-        [self.initButton.heightAnchor constraintEqualToConstant:44.0],
+        [self.kernelInitButton.heightAnchor constraintEqualToConstant:44.0],
     ]];
 
     self.placeholderView = container;
@@ -177,8 +177,8 @@ static const NSTimeInterval kInitTimeout = 240.0;
     }
 
     self.placeholderLabel.text = text;
-    self.initButton.hidden = !showButton;
-    self.initButton.enabled = showButton;
+    self.kernelInitButton.hidden = !showButton;
+    self.kernelInitButton.enabled = showButton;
     if (spinning) {
         [self.spinner startAnimating];
     } else {
@@ -198,15 +198,15 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
     self.initializing = YES;
     self.lastInitFailed = NO;
-    self.initToken += 1;
-    NSUInteger token = self.initToken;
+    self.kernelInitToken += 1;
+    NSUInteger token = self.kernelInitToken;
     [self refreshPlaceholderState];
 
     __weak typeof(self) weakSelf = self;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kInitTimeout * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
         __strong typeof(weakSelf) self = weakSelf;
-        if (!self || !self.initializing || self.initToken != token) return;
+        if (!self || !self.initializing || self.kernelInitToken != token) return;
         self.initializing = NO;
         self.lastInitFailed = YES;
         [self refreshPlaceholderState];
