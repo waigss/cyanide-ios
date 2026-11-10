@@ -10,6 +10,7 @@
 
 #import "../kexploit/krw.h"
 #import "../kexploit/kutils.h"
+#import "../kexploit/kexploit_opa334.h"
 #import "../kexploit/offsets.h"
 
 #import <string.h>
