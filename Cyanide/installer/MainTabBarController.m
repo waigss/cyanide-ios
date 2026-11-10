@@ -7,6 +7,7 @@
 #import "QueuePopupBar.h"
 #import "QueueReviewViewController.h"
 #import "PackageQueue.h"
+#import "../inspector/ProcessListViewController.h"
 
 static const CGFloat kPopupHeight  = 56.0;
 static const CGFloat kPopupGap     = 8.0;
@@ -41,6 +42,33 @@ static const CGFloat kPopupPadding = 2.0;
                                                object:nil];
 }
 
+#pragma mark - 进程页
+
+// Adds the 「进程」 tab (kernel process list). Inserted right before the last
+// tab so 「设置」 keeps the last slot; a no-op once installed.
+- (void)installProcessTab
+{
+    if (self.viewControllers.count == 0) return;   // storyboard tabs not loaded yet
+
+    for (UIViewController *vc in self.viewControllers) {
+        if (![vc isKindOfClass:UINavigationController.class]) continue;
+        UINavigationController *nav = (UINavigationController *)vc;
+        if ([nav.viewControllers.firstObject isKindOfClass:ProcessListViewController.class]) return;
+    }
+
+    ProcessListViewController *list =
+        [[ProcessListViewController alloc] initWithStyle:UITableViewStyleInsetGrouped];
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:list];
+    nav.tabBarItem = [[UITabBarItem alloc] initWithTitle:@"进程"
+                                                 image:[UIImage systemImageNamed:@"list.bullet.rectangle"]
+                                                   tag:0];
+
+    NSMutableArray<UIViewController *> *tabs = [NSMutableArray arrayWithArray:self.viewControllers ?: @[]];
+    NSUInteger insertAt = tabs.count > 0 ? tabs.count - 1 : 0;
+    [tabs insertObject:nav atIndex:insertAt];
+    self.viewControllers = tabs;
+}
+
 - (void)dealloc
 {
     [[NSNotificationCenter defaultCenter] removeObserver:self];
@@ -49,6 +77,7 @@ static const CGFloat kPopupPadding = 2.0;
 - (void)viewWillAppear:(BOOL)animated
 {
     [super viewWillAppear:animated];
+    [self installProcessTab];
     [self.popupBar refreshFromQueueAnimated:NO];
     [self refreshChildInsetsAnimated:NO];
 }
