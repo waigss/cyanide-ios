@@ -14,6 +14,8 @@
 #import "ProcessListViewController.h"
 
 #import "ProcessDetailViewController.h"
+#import "CyanideLog.h"
+#import "LogViewerController.h"
 
 #import "../kexploit/kutils.h"
 #import "../kexploit/kexploit_opa334.h"
@@ -44,6 +46,12 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
 @implementation ProcessListViewController
 
+- (void)showLog
+{
+    LogViewerController *log = [[LogViewerController alloc] init];
+    [self.navigationController pushViewController:log animated:YES];
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -69,10 +77,15 @@ static const NSTimeInterval kInitTimeout = 240.0;
     self.searchController = search;
     self.definesPresentationContext = YES;
 
-    self.navigationItem.rightBarButtonItem =
+    self.navigationItem.rightBarButtonItems = @[
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self
-                                                      action:@selector(reloadProcesses)];
+                                                      action:@selector(reloadProcesses)],
+        [[UIBarButtonItem alloc] initWithTitle:@"日志"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(showLog)],
+    ];
 
     [self buildPlaceholderView];
 
@@ -203,6 +216,9 @@ static const NSTimeInterval kInitTimeout = 240.0;
 
     self.initializing = YES;
     self.lastInitFailed = NO;
+
+    clog(@"[内核] 开始初始化：krw_ready=%d", kexploit_krw_ready() ? 1 : 0);
+    CFAbsoluteTime initStart = CFAbsoluteTimeGetCurrent();
     self.kernelInitToken += 1;
     NSUInteger token = self.kernelInitToken;
     [self refreshPlaceholderState];
@@ -220,11 +236,14 @@ static const NSTimeInterval kInitTimeout = 240.0;
     // settings_run_actions() 内部自己起后台队列，这里只是触发；
     // 完成后会给 kSettingsActionsDidCompleteNotification。
     settings_run_actions();
+    clog(@"[内核] 已下发初始化请求（settings_run_actions）");
 }
 
 - (void)actionsDidComplete:(NSNotification *)note
 {
     BOOL ok = [note.userInfo[kSettingsActionsDidCompleteSuccessKey] boolValue];
+    clog(@"[内核] 初始化回调 成功=%d krw_ready=%d self_proc=0x%llx",
+         ok ? 1 : 0, kexploit_krw_ready() ? 1 : 0, proc_self());
     if (self.initializing) {
         self.initializing = NO;
         self.lastInitFailed = !ok;
@@ -267,7 +286,15 @@ static const NSTimeInterval kInitTimeout = 240.0;
     proc_entry_t *buffer = calloc((size_t)kProcessCapacity, sizeof(proc_entry_t));
     if (!buffer) return @[];
 
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+    uint64_t selfProc = proc_self();
     int count = proc_list_all(buffer, kProcessCapacity);
+    clog(@"[进程表] self_proc=0x%llx 读取到 %d 个进程 耗时=%.0fms",
+         selfProc, count, (CFAbsoluteTimeGetCurrent() - t0) * 1000.0);
+    if (count <= 0) {
+        clog(@"[进程表] 读取为空：krw_ready=%d self_proc=0x%llx（若 self_proc 为 0，说明内核会话没真正建立）",
+             kexploit_krw_ready() ? 1 : 0, selfProc);
+    }
 
     NSMutableArray<NSDictionary<NSString *, id> *> *rows =
         [NSMutableArray arrayWithCapacity:(NSUInteger)MAX(count, 0)];
