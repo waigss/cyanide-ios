@@ -82,19 +82,55 @@ static const NSTimeInterval kInitTimeout = 240.0;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         uint64_t selfProc = proc_self();
         uint64_t task = proc_task(selfProc);
-        uint64_t map = task ? kread64(task + off_task_map) : 0;
 
-        cyanide_log(@"[PMAP] ==== 开始只读探测 ====");
+        cyanide_log(@"[PMAP] ==== vm_map 结构扫描 ====");
         cyanide_log(@"[PMAP] off_task_map=0x%x off_vm_map_hdr=0x%x off_vm_map_header_nentries=0x%x",
                     off_task_map, off_vm_map_hdr, off_vm_map_header_nentries);
-        cyanide_log(@"[PMAP] self_proc=0x%llx task=0x%llx map=0x%llx",
-                    selfProc, task, map);
+        cyanide_log(@"[PMAP] self_proc=0x%llx task=0x%llx", selfProc, task);
 
-        [self dumpWordsAt:task length:0x400 label:@"task"];
-        [self dumpWordsAt:map length:0x300 label:@"map"];
+        if (!is_kaddr_valid(task)) {
+            cyanide_log(@"[PMAP] task 无效，停止");
+            return;
+        }
 
-        cyanide_log(@"[PMAP] ==== 探测结束 ====");
+        // 先验证偏移表给的 off_task_map，再全扫 task 结构。
+        uint64_t dictValue = kread64(task + off_task_map);
+        cyanide_log(@"[PMAP] 偏移表 task+0x%x = 0x%llx", off_task_map, dictValue);
+        [self validateVmMapCandidate:dictValue offset:off_task_map];
+
+        for (NSUInteger off = 0x18; off < 0x400; off += 8) {
+            if (off == off_task_map) continue;
+            uint64_t value = kread64(task + off);
+            if (!is_kaddr_valid(value)) continue;
+            [self validateVmMapCandidate:value offset:off];
+        }
+
+        cyanide_log(@"[PMAP] ==== 扫描结束 ====");
     });
+}
+
+// vm_map 的结构特征：hdr.links.prev / links.next 都是内核指针，
+// hdr.nentries 是一个合理的小正整数。
+- (BOOL)validateVmMapCandidate:(uint64_t)candidate offset:(NSUInteger)offset
+{
+    if (!is_kaddr_valid(candidate)) return NO;
+
+    uint64_t prev = kread64(candidate + off_vm_map_hdr);
+    uint64_t next = kread64(candidate + off_vm_map_hdr + 8);
+    uint32_t nentries = kread32(candidate + off_vm_map_header_nentries);
+
+    BOOL matched = is_kaddr_valid(prev) && is_kaddr_valid(next) &&
+                   nentries > 0 && nentries < 200000;
+
+    cyanide_log(@"[PMAP] task+0x%03lx -> 0x%llx prev=0x%llx next=0x%llx nentries=%u %@",
+                (unsigned long)offset, candidate, prev, next, nentries,
+                matched ? @"★ 疑似 vm_map" : @"");
+
+    if (matched) {
+        cyanide_log(@"[PMAP] ---- 疑似 vm_map 内容 0x%llx ----", candidate);
+        [self dumpWordsAt:candidate length:0x100 label:@"vmmap"];
+    }
+    return matched;
 }
 
 - (void)dumpWordsAt:(uint64_t)addr length:(NSUInteger)length label:(NSString *)label
