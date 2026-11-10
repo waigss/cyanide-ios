@@ -23,10 +23,27 @@
 
 #import "ProcessDetailViewController.h"
 
-#import "LibraryOverlayController.h"
-
 #import "../TaskRop/RemoteCall.h"
 #import "../kexploit/kexploit_opa334.h"
+#import "../utils/sandbox.h"
+
+// 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
+// 从而读得到别的 App 容器里的文件。
+extern int escape_sbx_demo2(void);
+
+// 拿到「能读 /private/var」的文件访问能力。已具备时直接返回，避免重复逃逸。
+static BOOL cyanide_ensure_file_access(void)
+{
+    if (check_sandbox_var_rw() == 0) return YES;
+
+    if (escape_sbx_demo2() == 0 && check_sandbox_var_rw() == 0) return YES;
+
+    if (patch_sandbox_ext() == 0 && check_sandbox_var_rw() == 0) return YES;
+
+    if (borrow_sandbox_ext("SpringBoard") == 0 && check_sandbox_var_rw() == 0) return YES;
+
+    return NO;
+}
 
 static NSString * const kModuleCellIdentifier = @"CyanideModuleCell";
 static const NSTimeInterval kModuleLoadDeadline = 30.0;
@@ -84,54 +101,8 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
 
-    self.navigationItem.rightBarButtonItem =
-        [[UIBarButtonItem alloc] initWithTitle:@"悬浮窗"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(toggleOverlay)];
-
     [self buildPlaceholderView];
     [self loadModules];
-}
-
-- (void)viewWillAppear:(BOOL)animated
-{
-    [super viewWillAppear:animated];
-    [self refreshOverlayButton];
-}
-
-#pragma mark - 悬浮窗
-
-- (void)refreshOverlayButton
-{
-    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
-    BOOL sameTarget = [[overlay activeProcessName] isEqualToString:self.processName];
-    self.navigationItem.rightBarButtonItem.title = sameTarget ? @"关闭悬浮窗" : @"悬浮窗";
-}
-
-- (void)toggleOverlay
-{
-    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
-    BOOL sameTarget = [[overlay activeProcessName] isEqualToString:self.processName];
-
-    if (sameTarget) {
-        [overlay stopByUser];
-        [self refreshOverlayButton];
-        [self presentAlertWithTitle:@"悬浮窗已关闭" message:nil];
-        return;
-    }
-
-    BOOL wasActive = [overlay isActive];
-    [overlay startForProcessName:self.processName pid:self.pid procAddr:self.procAddr];
-    [self refreshOverlayButton];
-
-    NSString *message = [NSString stringWithFormat:
-        @"已在 SpringBoard 里挂好悬浮窗。\n\n现在切到 %@，悬浮窗会自动显示它的库与基址。\n\n"
-        @"说明：读库要在本进程里附着目标，所以只有目标在前台时才能成功；"
-        @"已自动开启静音保活让 Cyanide 留在后台继续探测。关闭悬浮窗请回到本页再点一次按钮。",
-        self.processName];
-    [self presentAlertWithTitle:(wasActive ? @"已切换悬浮窗目标" : @"悬浮窗已开启")
-                        message:message];
 }
 
 - (void)presentAlertWithTitle:(NSString *)title message:(NSString *)message
@@ -518,14 +489,109 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     NSDictionary<NSString *, id> *row = [self itemAtIndexPath:indexPath];
     if (!row) return;
 
+    NSString *name = row[@"name"];
+    NSString *path = row[@"path"];
     uint64_t base = [row[@"base"] unsignedLongLongValue];
-    NSString *copy = [NSString stringWithFormat:@"%@ 0x%llx %@",
-                      row[@"name"], (unsigned long long)base, row[@"path"] ?: @""];
-    [UIPasteboard generalPasteboard].string = copy;
 
-    UIImpactFeedbackGenerator *feedback =
-        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    [feedback impactOccurred];
+    NSString *message = [NSString stringWithFormat:@"基址 0x%llx\n%@",
+                         (unsigned long long)base, path ?: @""];
+
+    UIAlertController *sheet =
+        [UIAlertController alertControllerWithTitle:name
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleActionSheet];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"复制基址与路径"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [UIPasteboard generalPasteboard].string =
+            [NSString stringWithFormat:@"%@ 0x%llx %@", name, (unsigned long long)base, path ?: @""];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Dump 这个模块到文件"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self dumpModuleAtPath:path displayName:name];
+    }]];
+
+    [sheet addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+
+    // iPad 上 action sheet 需要锚点，否则会崩。
+    sheet.popoverPresentationController.sourceView = tableView;
+    sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
+
+    [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - Dump 模块
+
+// 从磁盘把模块文件复制到 App 沙盒的 Documents/dumps/。
+// 不走目标进程内存：目标挂起、甚至已经退出，都能拿到完整文件。
+- (void)dumpModuleAtPath:(NSString *)sourcePath displayName:(NSString *)displayName
+{
+    if (sourcePath.length == 0) {
+        [self presentAlertWithTitle:@"无法 dump" message:@"这个模块没有可用的路径。"];
+        return;
+    }
+
+    [self presentBusyAlertWithTitle:@"正在 dump…" message:displayName];
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *resultTitle = nil;
+        NSString *resultMessage = nil;
+
+        if (!kexploit_krw_ready()) {
+            resultTitle = @"内核未就绪";
+            resultMessage = @"请先回到「进程」页初始化内核。";
+        } else if (!cyanide_ensure_file_access()) {
+            resultTitle = @"无法读取该路径";
+            resultMessage = @"沙盒逃逸失败，读不到目标 App 的文件。";
+        } else {
+            NSFileManager *fm = [NSFileManager defaultManager];
+            NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                      NSUserDomainMask, YES).firstObject;
+            NSString *dumpDir = [documents stringByAppendingPathComponent:@"dumps"];
+            [fm createDirectoryAtPath:dumpDir withIntermediateDirectories:YES attributes:nil error:NULL];
+
+            NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+            stamp.dateFormat = @"yyyyMMdd-HHmmss";
+            NSString *fileName = [NSString stringWithFormat:@"%@-%@-%@",
+                                  self.processName ?: @"proc",
+                                  displayName ?: @"module",
+                                  [stamp stringFromDate:[NSDate date]]];
+            fileName = [fileName stringByReplacingOccurrencesOfString:@"/" withString:@"_"];
+            NSString *destPath = [dumpDir stringByAppendingPathComponent:fileName];
+
+            NSError *error = nil;
+            BOOL copied = [fm copyItemAtPath:sourcePath toPath:destPath error:&error];
+
+            if (copied) {
+                NSDictionary *attrs = [fm attributesOfItemAtPath:destPath error:NULL];
+                unsigned long long size = [attrs fileSize];
+                resultTitle = @"Dump 完成";
+                resultMessage = [NSString stringWithFormat:@"%@\n\n%.2f MB\n\n%@",
+                                 fileName, (double)size / (1024.0 * 1024.0), destPath];
+            } else {
+                resultTitle = @"Dump 失败";
+                resultMessage = error.localizedDescription ?: @"未知错误";
+            }
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self dismissViewControllerAnimated:YES completion:^{
+                [self presentAlertWithTitle:resultTitle message:resultMessage];
+            }];
+        });
+    });
+}
+
+- (void)presentBusyAlertWithTitle:(NSString *)title message:(NSString *)message
+{
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:title
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:alert animated:YES completion:nil];
 }
 
 @end
