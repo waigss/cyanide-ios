@@ -69,6 +69,9 @@ static int dfPlausiblePtr(uint64_t p)
     if (p < 0x100000000ULL)   return 0;
     if (p >= 0x8000000000ULL) return 0;
     if (p & 7)                return 0;
+    // Reject pointers into the game module itself: those are vtables / const
+    // data / string literals, never heap objects (UWorld / ULevel / AActor).
+    if (g_dfSlide && p >= g_dfSlide && p < g_dfSlide + DF_MOD_SIZE) return 0;
     return 1;
 }
 
@@ -197,6 +200,17 @@ NSString *df_scan_collect(void)
     g_dfSlide = base;
     cyanide_log(@"[DF] base = 0x%llx", base);
     [out appendFormat:@"base   = 0x%llx\n", base];
+
+    // Sanity-check the Mach-O header we just located.
+    {
+        uint32_t mh[8] = {0};
+        if (kum_read(base, mh, sizeof(mh))) {
+            cyanide_log(@"[DF] macho magic=0x%08x cputype=0x%08x filetype=%u ncmds=%u",
+                        mh[0], mh[1], mh[3], mh[4]);
+            [out appendFormat:@"macho  magic=0x%08x cputype=0x%08x filetype=%u ncmds=%u\n",
+                              mh[0], mh[1], mh[3], mh[4]];
+        }
+    }
     [out appendFormat:@"bss    = 0x%llx\n", dfVa(DF_BSS_RVA)];
     [out appendFormat:@"common = 0x%llx\n\n", dfVa(DF_COM_RVA)];
 
@@ -210,29 +224,38 @@ NSString *df_scan_collect(void)
     memset(buf, 0, (size_t)total);
 
     CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-    const uint64_t CHUNK = 0x40000;
+    // __bss is zero-fill: untouched pages have no page-table entry, so a big
+    // read fails as soon as it crosses one. Read one page at a time and just
+    // leave zeros for unmapped pages.
+    const uint64_t PAGE = 0x4000;
     uint64_t off = 0;
-    int fails = 0;
+    int failPages = 0;
+    uint64_t okBytes = 0;
     uint64_t nextLog = 0x400000;
     while (off < total) {
         uint64_t chunk = total - off;
-        if (chunk > CHUNK) chunk = CHUNK;
+        if (chunk > PAGE) chunk = PAGE;
+        // keep page-aligned so we never straddle two mappings
         uint64_t rva = (off < DF_BSS_SIZE)
                      ? (DF_BSS_RVA + off)
                      : (DF_COM_RVA + (off - DF_BSS_SIZE));
-        if (!kum_read(dfVa(rva), buf + off, (size_t)chunk)) {
-            if (++fails > 32) break;
+        if (kum_read(dfVa(rva), buf + off, (size_t)chunk)) {
+            okBytes += chunk;
+        } else {
+            ++failPages;
         }
         off += chunk;
         if (off >= nextLog) {
-            cyanide_log(@"[DF] read %llu / %llu", off, total);
+            cyanide_log(@"[DF] read %llu / %llu (ok=%llu failpages=%d)",
+                        off, total, okBytes, failPages);
             nextLog += 0x400000;
         }
     }
     double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
-    cyanide_log(@"[DF] read done %llu/%llu fails=%d %.0fms", off, total, fails, ms);
-    [out appendFormat:@"read %llu/%llu bytes (fails=%d) in %.0f ms\n\n",
-                      off, total, fails, ms];
+    cyanide_log(@"[DF] read done %llu/%llu ok=%llu failPages=%d %.0fms",
+                off, total, okBytes, failPages, ms);
+    [out appendFormat:@"read %llu/%llu bytes (ok=%llu, unmapped pages=%d) in %.0f ms\n\n",
+                      off, total, okBytes, failPages, ms];
 
     // ---- collect plausible object pointers ----
     const size_t MAXC = 400000;
@@ -264,49 +287,63 @@ NSString *df_scan_collect(void)
     cyanide_log(@"[DF] unique candidates = %zu", nu);
     [out appendFormat:@"unique candidates = %zu\n\n", nu];
 
-    // ---- probe ----
-    int hits28 = 0, hits158 = 0;
+    // ---- probe: try every candidate against every TArray offset 0x08..0x300 ----
+    static int offHits[128];
+    memset(offHits, 0, sizeof(offHits));
     uint64_t bestWorld = 0, bestLevels = 0, bestOff = 0;
+    int chainHits = 0;
+    int arrHits = 0;
 
-    size_t probeLimit = nu < 12000 ? nu : 12000;
-    for (size_t i = 0; i < probeLimit; i++) {
-        uint64_t c = cands[i];
-        uint64_t data; uint32_t num;
+    size_t probeLimit = nu < 20000 ? nu : 20000;
+    CFAbsoluteTime tp = CFAbsoluteTimeGetCurrent();
+    bool timeUp = false;
 
-        if (dfLooksLikeTArray(c, 0x28, &data, &num)) {
-            hits28++;
-            uint64_t lv = dfRd64(data);
-            uint64_t act = 0; uint32_t an = 0;
-            int lvlOk = dfLooksLikeLevel(lv, &act, &an);
-            cyanide_log(@"[DF] HIT 0x28 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s",
-                        c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
-            [out appendFormat:@"WORLD@0x28 world=0x%llx levels=0x%llx n=%u level0=0x%llx "
-                              @"actors=0x%llx an=%u %s\n",
-                              c, data, num, lv, lvlOk ? act : 0ULL,
-                              lvlOk ? an : 0, lvlOk ? "LEVEL_OK" : ""];
-            if (lvlOk && !bestWorld) {
-                bestWorld = c; bestLevels = data; bestOff = 0x28;
-            }
+    for (size_t i = 0; i < probeLimit && !timeUp; i++) {
+        if ((i & 0x3FF) == 0 && (CFAbsoluteTimeGetCurrent() - tp) > 75.0) {
+            cyanide_log(@"[DF] probe budget reached at i=%zu", i);
+            timeUp = true;
+            break;
         }
-        if (dfLooksLikeTArray(c, 0x158, &data, &num)) {
-            hits158++;
+        uint64_t c = cands[i];
+
+        for (int off = 0x08; off <= 0x300; off += 8) {
+            uint64_t data; uint32_t num;
+            if (!dfLooksLikeTArray(c, (uint64_t)off, &data, &num)) continue;
+            ++arrHits;
+            offHits[(off - 0x08) / 8]++;
+
             uint64_t lv = dfRd64(data);
             uint64_t act = 0; uint32_t an = 0;
-            int lvlOk = dfLooksLikeLevel(lv, &act, &an);
-            cyanide_log(@"[DF] HIT 0x158 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s",
-                        c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
-            [out appendFormat:@"WORLD@0x158 world=0x%llx levels=0x%llx n=%u level0=0x%llx "
-                              @"actors=0x%llx an=%u %s\n",
-                              c, data, num, lv, lvlOk ? act : 0ULL,
-                              lvlOk ? an : 0, lvlOk ? "LEVEL_OK" : ""];
-            if (lvlOk && !bestWorld) {
-                bestWorld = c; bestLevels = data; bestOff = 0x158;
+            if (!dfLooksLikeLevel(lv, &act, &an)) continue;
+
+            ++chainHits;
+            cyanide_log(@"[DF] CHAIN world=0x%llx levelsOff=0x%x n=%u level0=0x%llx actors=0x%llx an=%u",
+                        c, off, num, lv, act, an);
+            [out appendFormat:@"CHAIN world=0x%llx levelsOff=0x%x n=%u "
+                              @"level0=0x%llx actors=0x%llx an=%u\n",
+                              c, off, num, lv, act, an];
+            if (!bestWorld) {
+                bestWorld = c; bestLevels = data;
+                bestOff = (uint64_t)off;
             }
         }
     }
 
-    cyanide_log(@"[DF] world hits: 0x28=%d 0x158=%d", hits28, hits158);
-    [out appendFormat:@"\nworld hits: +0x28=%d  +0x158=%d\n", hits28, hits158];
+    cyanide_log(@"[DF] tarray hits=%d chain hits=%d", arrHits, chainHits);
+    [out appendFormat:@"\ntarray matches=%d  full-chain matches=%d\n",
+                      arrHits, chainHits];
+
+    // offset histogram: the real UWorld::Levels offset will dominate
+    [out appendString:@"\noffset histogram (top 12):\n"];
+    for (int n2 = 0; n2 < 12; n2++) {
+        int bestIdx = -1, bestVal = 0;
+        for (int k = 0; k < 128; k++) {
+            if (offHits[k] > bestVal) { bestVal = offHits[k]; bestIdx = k; }
+        }
+        if (bestIdx < 0) break;
+        [out appendFormat:@"  +0x%03X  x%d\n", 0x08 + bestIdx * 8, bestVal];
+        offHits[bestIdx] = 0;
+    }
 
     // ---- find the global slot holding this UWorld (= GWorld) ----
     if (bestWorld) {
