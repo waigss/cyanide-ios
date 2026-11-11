@@ -278,6 +278,21 @@ NSString *df_scan_collect(void)
     [out appendFormat:@"read %llu/%llu bytes (ok=%llu, unmapped pages=%d) in %.0f ms\n\n",
                       off, total, okBytes, failPages, ms];
 
+    // ---- persist the raw region BEFORE probing ----
+    // Probing dereferences unknown pointers, which walks page tables in the
+    // kernel. If that ever panics the device, the dump is already on disk and
+    // the analysis can continue offline.
+    {
+        NSString *dumpPath = [NSHomeDirectory()
+                              stringByAppendingPathComponent:@"Documents/df_bss.bin"];
+        NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)off];
+        BOOL w = [d writeToFile:dumpPath atomically:YES];
+        cyanide_log_sync(@"[DF] dump %llu bytes -> %@ (%@)",
+                         off, dumpPath, w ? @"ok" : @"FAIL");
+        [out appendFormat:@"dump: Documents/df_bss.bin  %@  (%llu bytes)\n\n",
+                          w ? @"ok" : @"FAIL", off];
+    }
+
     // ---- collect plausible object pointers ----
     const size_t MAXC = 400000;
     uint64_t *cands = (uint64_t *)malloc(sizeof(uint64_t) * MAXC);
