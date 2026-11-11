@@ -40,6 +40,7 @@ static NSString * const kTypeTitles[] = {
 @property (nonatomic, assign) uint64_t procAddr;
 
 @property (nonatomic, strong) UITextField *addressField;
+@property (nonatomic, strong) UITextField *sizeField;
 @property (nonatomic, strong) UISegmentedControl *typeControl;
 @property (nonatomic, strong) UITextView *resultView;
 @property (nonatomic, strong) UILabel *chainLabel;
@@ -116,8 +117,24 @@ static NSString * const kTypeTitles[] = {
     self.resultView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
     self.resultView.text = @"输入地址后点「读取值」。\n\n读取走内核页表直读，不附加目标进程。";
 
+    UILabel *sizeTitle = [self labelWithText:@"要读取的字节数（十进制或 0x 十六进制，上限 64MB）" bold:YES];
+
+    self.sizeField = [[UITextField alloc] initWithFrame:CGRectZero];
+    self.sizeField.translatesAutoresizingMaskIntoConstraints = NO;
+    self.sizeField.borderStyle = UITextBorderStyleRoundedRect;
+    self.sizeField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    self.sizeField.autocorrectionType = UITextAutocorrectionTypeNo;
+    self.sizeField.keyboardType = UIKeyboardTypeASCIICapable;
+    self.sizeField.font = [UIFont monospacedSystemFontOfSize:15.0 weight:UIFontWeightRegular];
+    self.sizeField.placeholder = @"例如 0x1000 或 4096";
+
+    UIButton *exportButton = [self buttonWithTitle:@"读取原始字节 → 保存文件"
+                                           action:@selector(exportRawTapped)];
+
     UIStackView *stack = [[UIStackView alloc] initWithArrangedSubviews:@[
-        addressTitle, self.addressField, typeTitle, self.typeControl,
+        addressTitle, self.addressField,
+        sizeTitle, self.sizeField, exportButton,
+        typeTitle, self.typeControl,
         readButton, followButton, self.chainLabel, self.resultView
     ]];
     stack.translatesAutoresizingMaskIntoConstraints = NO;
@@ -138,6 +155,7 @@ static NSString * const kTypeTitles[] = {
         [stack.widthAnchor constraintEqualToAnchor:scroll.widthAnchor constant:-32.0],
 
         [self.addressField.heightAnchor constraintEqualToConstant:36.0],
+        [self.sizeField.heightAnchor constraintEqualToConstant:36.0],
         [self.resultView.heightAnchor constraintEqualToConstant:260.0],
     ]];
 
@@ -346,6 +364,135 @@ static NSString * const kTypeTitles[] = {
     cyanide_log(@"[读内存] 0x%llx type=%ld -> %@",
                 (unsigned long long)address, (long)type,
                 [text stringByReplacingOccurrencesOfString:@"\n" withString:@" | "]);
+}
+
+- (uint64_t)parseSize:(NSString *)text
+{
+    NSString *trimmed = [text stringByTrimmingCharactersInSet:
+                         [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0) return 0;
+
+    unsigned long long value = 0;
+    NSScanner *scanner = nil;
+
+    if ([trimmed hasPrefix:@"0x"] || [trimmed hasPrefix:@"0X"]) {
+        scanner = [NSScanner scannerWithString:[trimmed substringFromIndex:2]];
+        if (![scanner scanHexLongLong:&value]) return 0;
+    } else {
+        scanner = [NSScanner scannerWithString:trimmed];
+        if (![scanner scanUnsignedLongLong:&value]) return 0;
+    }
+    if (![scanner isAtEnd]) return 0;
+    return (uint64_t)value;
+}
+
+// 从指定地址读原始字节并保存成文件；遇到未映射就停在那，保留已读部分。
+- (void)exportRawTapped
+{
+    [self.addressField resignFirstResponder];
+    [self.sizeField resignFirstResponder];
+
+    uint64_t address = [self parseAddress:self.addressField.text];
+    uint64_t size = [self parseSize:self.sizeField.text];
+
+    if (address == 0 || size == 0) {
+        self.resultView.text = @"请填写有效的起始地址和字节数。";
+        return;
+    }
+
+    const uint64_t kMaxBytes = 64ULL * 1024ULL * 1024ULL;
+    if (size > kMaxBytes) {
+        self.resultView.text = [NSString stringWithFormat:
+            @"单次上限 64MB，你填的是 %.1f MB。", (double)size / (1024.0 * 1024.0)];
+        return;
+    }
+
+    if (!kexploit_krw_ready() || !kum_prepare(self.procAddr)) {
+        self.resultView.text = @"内核或页表上下文不可用。";
+        return;
+    }
+
+    self.resultView.text = [NSString stringWithFormat:
+        @"正在读取 0x%llx 起共 %llu 字节…", (unsigned long long)address, (unsigned long long)size];
+
+    NSString *processName = self.processName ?: @"proc";
+    int pid = self.pid;
+
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSMutableData *data = [NSMutableData dataWithCapacity:(NSUInteger)MIN(size, kMaxBytes)];
+        uint64_t done = 0;
+        const uint64_t kChunk = 0x10000;   // 64KB 一块
+        uint8_t *buffer = malloc((size_t)kChunk);
+        uint64_t failedAt = 0;
+
+        if (buffer) {
+            while (done < size) {
+                uint64_t want = MIN(kChunk, size - done);
+                if (kum_read(address + done, buffer, (size_t)want)) {
+                    [data appendBytes:buffer length:(NSUInteger)want];
+                    done += want;
+                    continue;
+                }
+
+                // 整块失败时按 16KB 页细分，尽量保住可读的前缀
+                const uint64_t kPage = 0x4000;
+                uint64_t sub = 0;
+                BOOL progressed = NO;
+                while (sub < want) {
+                    uint64_t pageWant = MIN(kPage, want - sub);
+                    if (!kum_read(address + done + sub, buffer, (size_t)pageWant)) break;
+                    [data appendBytes:buffer length:(NSUInteger)pageWant];
+                    sub += pageWant;
+                    progressed = YES;
+                }
+                done += sub;
+                if (!progressed) { failedAt = address + done; break; }
+            }
+            free(buffer);
+        }
+
+        NSString *documents = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
+                                                                  NSUserDomainMask, YES).firstObject;
+        NSString *dumpDir = [documents stringByAppendingPathComponent:@"dumps"];
+        [[NSFileManager defaultManager] createDirectoryAtPath:dumpDir
+                                 withIntermediateDirectories:YES
+                                                  attributes:nil
+                                                       error:NULL];
+
+        NSDateFormatter *stamp = [[NSDateFormatter alloc] init];
+        stamp.dateFormat = @"yyyyMMdd-HHmmss";
+        NSString *fileName = [NSString stringWithFormat:@"%@-0x%llx-0x%llx-%@.bin",
+                              processName,
+                              (unsigned long long)address,
+                              (unsigned long long)done,
+                              [stamp stringFromDate:[NSDate date]]];
+        NSString *path = [dumpDir stringByAppendingPathComponent:fileName];
+
+        NSError *error = nil;
+        BOOL wrote = data.length > 0 && [data writeToFile:path options:NSDataWritingAtomic error:&error];
+
+        cyanide_log(@"[导出] %@(PID %d) 0x%llx 起 %llu 字节 -> 写出 %lu 字节 结果=%d 失败点=0x%llx",
+                    processName, pid, (unsigned long long)address, (unsigned long long)size,
+                    (unsigned long)data.length, wrote ? 1 : 0, (unsigned long long)failedAt);
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            NSMutableString *text = [NSMutableString string];
+            if (wrote) {
+                [text appendFormat:@"已保存 %lu 字节（请求 %llu）\n\n%@",
+                 (unsigned long)data.length, (unsigned long long)size, path];
+                if (data.length < size) {
+                    [text appendFormat:@"\n\n注意：读到 0x%llx 后遇到未映射区域，已提前结束。",
+                     (unsigned long long)failedAt];
+                }
+            } else if (data.length == 0) {
+                [text appendFormat:@"一个字节都没读到。\n0x%llx 在目标进程里没有映射。",
+                 (unsigned long long)address];
+            } else {
+                [text appendFormat:@"写入文件失败：%@", error.localizedDescription ?: @"未知错误"];
+            }
+            self.resultView.text = text;
+        });
+    });
 }
 
 - (void)followPointerTapped
