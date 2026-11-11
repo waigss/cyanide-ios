@@ -397,6 +397,18 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
                                 (unsigned long)kumRows.count);
                 } else {
                     cyanide_log(@"[库] 内核直读也失败：%@", kumError ?: @"未知原因");
+
+                    // 最后保底：不依赖 dyld，直接从地址空间最低端找主程序基址。
+                    uint64_t mainBase = 0;
+                    if (kum_main_executable_base(&mainBase)) {
+                        [mainItems addObject:@{
+                            @"name": [NSString stringWithFormat:@"主程序 · %@", name],
+                            @"path": @"（由 vm_map 最低地址 + Mach-O 头校验得出）",
+                            @"base": @(mainBase),
+                        }];
+                        failure = nil;
+                        cyanide_log(@"[库] 退而取主程序基址：0x%llx（未附加）", mainBase);
+                    }
                 RemoteCallInitFailure reason = remote_call_last_init_failure();
                 const char *desc = (reason != RemoteCallInitFailureNone)
                     ? remote_call_init_failure_description(reason) : NULL;
