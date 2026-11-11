@@ -195,6 +195,29 @@ BOOL kum_read(uint64_t va, void *dst, size_t len)
     return kum_read_context(va, dst, len);
 }
 
+BOOL kum_main_executable_base(uint64_t *outBase)
+{
+    if (!gPrepared) return NO;
+
+    // 主程序 __TEXT 一般在地址空间最低端，按页向下扫一段，用 Mach-O 头校验。
+    uint64_t start = gMapMin & ~0xFFFULL;
+    uint64_t limit = start + 0x40000;   // 最多找 256KB，避免无效长扫
+
+    for (uint64_t va = start; va < limit; va += 0x1000) {
+        uint32_t magic = 0;
+        if (!kum_read_context(va, &magic, sizeof(magic))) continue;
+
+        if (magic == 0xFEEDFACF || magic == 0xFEEDFACE || magic == 0xCAFEBABE) {
+            if (outBase) *outBase = va;
+            cyanide_log(@"[KUM] 主程序基址 0x%llx（Mach-O 头 0x%08x 校验通过）", va, magic);
+            return YES;
+        }
+    }
+
+    cyanide_log(@"[KUM] 主程序基址未找到（搜索区间 0x%llx - 0x%llx）", start, limit);
+    return NO;
+}
+
 static BOOL kum_probe_all_image_infos(uint64_t va, uint32_t *outCount, uint64_t *outArray)
 {
     uint32_t version = 0;
