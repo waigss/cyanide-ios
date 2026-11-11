@@ -26,6 +26,10 @@ uint64_t kum_map_max(void);
 // 从目标进程的用户态地址读内存。地址未映射时返回 NO（不会崩溃）。
 BOOL kum_read(uint64_t va, void *dst, size_t len);
 
+// 不依赖 dyld 表，直接从地址空间最低端扫出主程序基址（校验 Mach-O 头）。
+// 只要主程序地址时用这个最省事，不需要附加。
+BOOL kum_main_executable_base(uint64_t * _Nullable outBase);
+
 // 读目标进程的 dyld 镜像列表：@[ @{name, path, base} ]。
 // 失败时返回 nil 并通过 errorOut 给出中文原因。
 NSArray<NSDictionary<NSString *, id> *> * _Nullable kum_read_dyld_images(NSString *_Nullable *_Nullable errorOut);
