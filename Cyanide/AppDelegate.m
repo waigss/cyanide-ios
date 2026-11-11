@@ -40,10 +40,19 @@
 //        TArray { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
 // ===========================================================================
 
+// Scan window: the whole writable tail of __DATA.
+//   __data    RVA 0x1550B0D0  size 0x087E768
+//   __bss     RVA 0x15D89B40  size 0x0A272F8
+//   __common  RVA 0x167B0E40  size 0x02B43D0
+// They are contiguous (gap of a few bytes), so one range covers all three.
+// GWorld is a zero-initialised pointer, but the toolchain may place it in
+// either __bss or __data, so we scan all of it.
+#define DF_SCAN_RVA   0x1550B0D0ULL
+#define DF_SCAN_END   (0x167B0E40ULL + 0x02B43D0ULL)
+#define DF_SCAN_SIZE  (DF_SCAN_END - DF_SCAN_RVA)
+
 #define DF_BSS_RVA   0x15D89B40ULL
-#define DF_BSS_SIZE  0x0A272F8ULL
 #define DF_COM_RVA   0x167B0E40ULL
-#define DF_COM_SIZE  0x02B43D0ULL
 #define DF_MOD_SIZE  0x16BFE1F0ULL
 
 static uint64_t g_dfSlide = 0;
@@ -225,11 +234,11 @@ NSString *df_scan_collect(void)
                               mh[0], mh[1], mh[3], mh[4]];
         }
     }
-    [out appendFormat:@"bss    = 0x%llx\n", dfVa(DF_BSS_RVA)];
-    [out appendFormat:@"common = 0x%llx\n\n", dfVa(DF_COM_RVA)];
+    [out appendFormat:@"scan   = [0x%llx .. 0x%llx]  (%llu bytes)\n\n",
+                      dfVa(DF_SCAN_RVA), dfVa(DF_SCAN_END), DF_SCAN_SIZE];
 
     // ---- read __bss + __common ----
-    uint64_t total = DF_BSS_SIZE + DF_COM_SIZE;
+    uint64_t total = DF_SCAN_SIZE;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) {
         [out appendString:@"malloc failed\n"];
@@ -250,9 +259,7 @@ NSString *df_scan_collect(void)
         uint64_t chunk = total - off;
         if (chunk > PAGE) chunk = PAGE;
         // keep page-aligned so we never straddle two mappings
-        uint64_t rva = (off < DF_BSS_SIZE)
-                     ? (DF_BSS_RVA + off)
-                     : (DF_COM_RVA + (off - DF_BSS_SIZE));
+        uint64_t rva = DF_SCAN_RVA + off;
         if (kum_read(dfVa(rva), buf + off, (size_t)chunk)) {
             okBytes += chunk;
         } else {
@@ -380,9 +387,7 @@ NSString *df_scan_collect(void)
             uint64_t v;
             memcpy(&v, buf + o, 8);
             if (v != bestWorld) continue;
-            uint64_t slotRva = (o < DF_BSS_SIZE)
-                             ? (DF_BSS_RVA + o)
-                             : (DF_COM_RVA + (o - DF_BSS_SIZE));
+            uint64_t slotRva = DF_SCAN_RVA + o;
             cyanide_log(@"[DF] >>> GWORLD SLOT base+0x%llx = 0x%llx", slotRva, v);
             [out appendFormat:@"GWORLD_SLOT = base + 0x%llx\n", slotRva];
         }
