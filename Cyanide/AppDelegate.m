@@ -84,23 +84,37 @@ static int dfCmpU64(const void *a, const void *b)
     return 0;
 }
 
-// Returns 1 when [addr + off] looks like a TArray whose elements are pointers.
-static int dfLooksLikeTArray(uint64_t addr, uint64_t off,
-                             uint64_t *outData, uint32_t *outNum)
+// Local (already-read) variant: parse a TArray out of an in-memory block.
+static int dfParseTArray(const uint8_t *blk, int off,
+                         uint64_t *outData, uint32_t *outNum)
 {
-    uint64_t data = dfRd64(addr + off);
-    uint32_t num  = dfRd32(addr + off + 8);
-    uint32_t max  = dfRd32(addr + off + 0xC);
-
+    uint64_t data;
+    uint32_t num, max;
+    memcpy(&data, blk + off, 8);
+    memcpy(&num,  blk + off + 8, 4);
+    memcpy(&max,  blk + off + 0xC, 4);
     if (!dfPlausiblePtr(data)) return 0;
     if (num < 1 || num > 200000) return 0;
     if (max < num || max > num * 2 + 1024) return 0;
-
-    uint64_t e0 = dfRd64(data);
-    if (!dfPlausiblePtr(e0)) return 0;
-
     *outData = data;
     *outNum  = num;
+    return 1;
+}
+
+// Local variant of the ULevel::Actors check.
+static int dfParseLevel(const uint8_t *blk,
+                        uint64_t *outActors, uint32_t *outNum)
+{
+    uint64_t act;
+    uint32_t num, max;
+    memcpy(&act, blk + 0x28, 8);
+    memcpy(&num, blk + 0x30, 4);
+    memcpy(&max, blk + 0x34, 4);
+    if (!dfPlausiblePtr(act)) return 0;
+    if (num < 1 || num > 200000) return 0;
+    if (max < num || max > num * 2 + 1024) return 0;
+    *outActors = act;
+    *outNum    = num;
     return 1;
 }
 
@@ -287,44 +301,57 @@ NSString *df_scan_collect(void)
     cyanide_log(@"[DF] unique candidates = %zu", nu);
     [out appendFormat:@"unique candidates = %zu\n\n", nu];
 
-    // ---- probe: try every candidate against every TArray offset 0x08..0x300 ----
+    // ---- probe ----
+    // One kum_read per candidate covers the whole 0x08..0x300 window, so the
+    // expensive page-table walk happens once instead of ~400 times.
     static int offHits[128];
     memset(offHits, 0, sizeof(offHits));
     uint64_t bestWorld = 0, bestLevels = 0, bestOff = 0;
-    int chainHits = 0;
-    int arrHits = 0;
+    int chainHits = 0, arrHits = 0;
 
-    size_t probeLimit = nu < 20000 ? nu : 20000;
+    static uint8_t wbuf[0x320];
+    static uint8_t lbuf[0x60];
+
+    size_t probeLimit = nu < 40000 ? nu : 40000;
     CFAbsoluteTime tp = CFAbsoluteTimeGetCurrent();
-    bool timeUp = false;
 
-    for (size_t i = 0; i < probeLimit && !timeUp; i++) {
-        if ((i & 0x3FF) == 0 && (CFAbsoluteTimeGetCurrent() - tp) > 75.0) {
+    for (size_t i = 0; i < probeLimit; i++) {
+        if ((i & 0x1FF) == 0 && (CFAbsoluteTimeGetCurrent() - tp) > 70.0) {
             cyanide_log(@"[DF] probe budget reached at i=%zu", i);
-            timeUp = true;
             break;
         }
         uint64_t c = cands[i];
+        if (!kum_read(c, wbuf, sizeof(wbuf))) continue;
 
         for (int off = 0x08; off <= 0x300; off += 8) {
             uint64_t data; uint32_t num;
-            if (!dfLooksLikeTArray(c, (uint64_t)off, &data, &num)) continue;
+            if (!dfParseTArray(wbuf, off, &data, &num)) continue;
             ++arrHits;
             offHits[(off - 0x08) / 8]++;
 
-            uint64_t lv = dfRd64(data);
-            uint64_t act = 0; uint32_t an = 0;
-            if (!dfLooksLikeLevel(lv, &act, &an)) continue;
+            // first element should be a ULevel*
+            uint64_t lv = 0;
+            if (!kum_read(data, &lv, 8)) continue;
+            if (!dfPlausiblePtr(lv)) continue;
+
+            if (!kum_read(lv, lbuf, sizeof(lbuf))) continue;
+            uint64_t act; uint32_t an;
+            if (!dfParseLevel(lbuf, &act, &an)) continue;
+
+            // Actors[0] must itself be a pointer
+            uint64_t a0 = 0;
+            if (!kum_read(act, &a0, 8)) continue;
+            if (!dfPlausiblePtr(a0)) continue;
 
             ++chainHits;
-            cyanide_log(@"[DF] CHAIN world=0x%llx levelsOff=0x%x n=%u level0=0x%llx actors=0x%llx an=%u",
-                        c, off, num, lv, act, an);
+            cyanide_log(@"[DF] CHAIN world=0x%llx levelsOff=0x%x n=%u "
+                        @"level0=0x%llx actors=0x%llx an=%u a0=0x%llx",
+                        c, off, num, lv, act, an, a0);
             [out appendFormat:@"CHAIN world=0x%llx levelsOff=0x%x n=%u "
-                              @"level0=0x%llx actors=0x%llx an=%u\n",
-                              c, off, num, lv, act, an];
+                              @"level0=0x%llx actors=0x%llx an=%u a0=0x%llx\n",
+                              c, off, num, lv, act, an, a0];
             if (!bestWorld) {
-                bestWorld = c; bestLevels = data;
-                bestOff = (uint64_t)off;
+                bestWorld = c; bestLevels = data; bestOff = (uint64_t)off;
             }
         }
     }
