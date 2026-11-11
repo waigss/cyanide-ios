@@ -20,129 +20,82 @@
 #include <string.h>
 
 // ===========================================================================
-//  Delta Force (UE4.22, iOS ARM64) - SAFE RAW DUMP
+//  Delta Force (UE4.22, iOS ARM64) - HEAP SIGNATURE SCAN
 //
-//  Rules followed by this build:
-//    * Uses KernelUserMemory (kum_read): kernel page-table translation.
-//      NO process attach, NO remote thread, NO exception port.
-//    * NEVER dereferences a value read out of memory. Every address touched
-//      is computed from the module base plus a fixed RVA, or is a fixed
-//      page-aligned probe inside [map_min, map_min + 64 MB].
+//  Uses kum_read (kernel page-table translation): no attach, no remote thread.
 //
-//  Why the previous builds died: they treated values found in __bss as
-//  pointers and read through them. Bogus values walk bogus page-table chains
-//  and the kernel panics. This build does none of that.
+//  SAFETY RULES:
+//    * Every address read is FIXED and page-aligned. Nothing is derived from a
+//      value found in memory.
+//    * The signature test only inspects values inside the page already read.
+//      It never dereferences them.
 //
-//  Output (Documents/):
-//    df_a.bin    __bss      first 8 MB   (RVA 0x15D89B40)
-//    df_b.bin    __common   2.8 MB       (RVA 0x167B0E40)
-//    df_info.txt
+//  Signature (ULevel::Actors):
+//      [A + 0x28]  heap pointer   (Data)
+//      [A + 0x30]  int32 count    (ArrayNum)  200..200000
+//      [A + 0x34]  int32 max      (ArrayMax)  >= count
+//
+//  A live level during a match has hundreds..thousands of actors, so
+//  requiring count >= 200 removes almost every false positive.
+//
+//  Heap band comes from offline analysis of the __bss dump: every real object
+//  pointer landed in 0x140000000..0x160000000.
 // ===========================================================================
 
-#define SEG_A_RVA   0x15D89B40ULL
-#define SEG_A_SIZE  0x00800000ULL
+#define MOD_SIZE        0x16BFE1F0ULL
+#define HEAP_LO         0x140000000ULL
+#define HEAP_HI         0x160000000ULL
+#define SCAN_PAGE       0x4000ULL
+#define MIN_ACTORS      200
+#define MAX_ACTORS      200000
+#define MAX_CANDIDATES  4000
 
-#define SEG_B_RVA   0x167B0E40ULL
-#define SEG_B_SIZE  0x002B43D0ULL
+#define DF_MH_MAGIC_64  0xFEEDFACFu
+#define DF_CPU_ARM64    0x0100000Cu
+#define DF_MH_EXECUTE   2u
 
-#define DF_MH_MAGIC_64   0xFEEDFACFu
-#define DF_CPU_ARM64     0x0100000Cu
-#define DF_MH_EXECUTE    2u
+static uint64_t g_dfBase = 0;
+static uint64_t g_dfModHi = 0;
 
-static uint64_t g_dfSlide = 0;
+static int dfPlausible(uint64_t v)
+{
+    if (v < g_dfModHi) return 0;
+    if (v >= HEAP_HI + 0x40000000ULL) return 0;
+    if (v & 7) return 0;
+    return 1;
+}
 
-// Locate the main executable by scanning page-aligned addresses upward from
-// map_min and looking for a Mach-O header with filetype == MH_EXECUTE.
-// Dylibs/frameworks are MH_DYLIB (6), so they are skipped automatically.
-// Every read here is at a fixed computed address; nothing is dereferenced.
 static uint64_t dfFindMainExec(uint64_t mapMin, uint64_t mapMax,
                                NSMutableString *out)
 {
-    const uint64_t STEP   = 0x4000;
-    const uint64_t WINDOW = 0x4000000ULL;   // scan at most 64 MB upward
-
+    const uint64_t STEP = 0x4000;
+    const uint64_t WINDOW = 0x4000000ULL;
     uint64_t start = mapMin & ~(STEP - 1);
     uint64_t limit = start + WINDOW;
     if (limit > mapMax) limit = mapMax;
 
     uint32_t mh[8];
-    uint64_t tried = 0;
-
     for (uint64_t va = start; va < limit; va += STEP) {
-        ++tried;
         if (!kum_read(va, mh, sizeof(mh))) continue;
         if (mh[0] != DF_MH_MAGIC_64) continue;
         if (mh[1] != DF_CPU_ARM64) continue;
-        if (mh[3] != DF_MH_EXECUTE) {
-            // a dylib / bundle header: remember it in the log, keep going
-            [out appendFormat:@"  skip 0x%llx filetype=%u (not MH_EXECUTE)\n",
-                              va, mh[3]];
-            continue;
-        }
-        [out appendFormat:@"  FOUND 0x%llx magic=0x%08x cputype=0x%08x "
-                          @"filetype=%u ncmds=%u\n",
-                          va, mh[0], mh[1], mh[3], mh[4]];
-        cyanide_log_sync(@"[DF] main exec 0x%llx ncmds=%u", va, mh[4]);
+        if (mh[3] != DF_MH_EXECUTE) continue;
+        [out appendFormat:@"base 0x%llx ncmds=%u\n", va, mh[4]];
+        cyanide_log_sync(@"[DF] base 0x%llx ncmds=%u", va, mh[4]);
         return va;
     }
-
-    [out appendFormat:@"  scanned %llu pages, no MH_EXECUTE header\n", tried];
     return 0;
-}
-
-static uint64_t dfDumpSegment(NSString *name, uint64_t rva, uint64_t size,
-                              NSMutableString *out)
-{
-    const uint64_t PAGE = 0x4000;
-    uint8_t *buf = (uint8_t *)malloc((size_t)size);
-    if (!buf) {
-        [out appendFormat:@"%@: malloc failed\n", name];
-        return 0;
-    }
-    memset(buf, 0, (size_t)size);
-
-    uint64_t off = 0;
-    int failPages = 0;
-    uint64_t okBytes = 0;
-
-    while (off < size) {
-        uint64_t chunk = size - off;
-        if (chunk > PAGE) chunk = PAGE;
-        if (kum_read(g_dfSlide + rva + off, buf + off, (size_t)chunk)) {
-            okBytes += chunk;
-        } else {
-            ++failPages;
-        }
-        off += chunk;
-    }
-
-    NSString *path = [NSHomeDirectory()
-                      stringByAppendingPathComponent:
-                      [NSString stringWithFormat:@"Documents/%@.bin", name]];
-    NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)size];
-    BOOL w = [d writeToFile:path atomically:YES];
-    free(buf);
-
-    cyanide_log_sync(@"[DF] %@ written=%d ok=%llu/%llu failpages=%d",
-                     name, w ? 1 : 0, okBytes, size, failPages);
-    [out appendFormat:@"%@: %@  ok=%llu/%llu  unmapped_pages=%d / %llu\n",
-                      name, w ? @"ok" : @"FAIL",
-                      okBytes, size, failPages, size / PAGE];
-    return okBytes;
 }
 
 NSString *df_scan_collect(void)
 {
-    NSMutableString *out = [NSMutableString stringWithCapacity:8192];
-    cyanide_log_sync(@"[DF] ===== safe dump begin =====");
+    NSMutableString *out = [NSMutableString stringWithCapacity:16384];
+    cyanide_log_sync(@"[DF] ===== heap signature scan =====");
 
-    if (!settings_ensure_kernel_ready()) {
-        return @"kernel r/w not ready";
-    }
+    if (!settings_ensure_kernel_ready()) return @"kernel r/w not ready";
 
     static proc_entry_t ents[512];
     int n = proc_list_all(ents, 512);
-    [out appendFormat:@"proc_count = %d\n", n];
     if (n <= 0) return @"cannot read proc list";
 
     uint64_t targetProc = 0;
@@ -165,51 +118,77 @@ NSString *df_scan_collect(void)
             strncpy(targetName, nm, PROC_NAME_MAX - 1);
         }
     }
-    if (!targetProc) {
-        [out appendString:@"DeltaForceClient not running\n"];
-        return out;
-    }
+    if (!targetProc) return @"DeltaForceClient not running";
+    [out appendFormat:@"target = %s pid=%d\n", targetName, targetPid];
 
-    cyanide_log_sync(@"[DF] target %s pid=%d", targetName, targetPid);
-    [out appendFormat:@"target = %s  pid=%d\n", targetName, targetPid];
+    if (!kum_prepare(targetProc)) return @"kum_prepare FAILED";
 
-    if (!kum_prepare(targetProc)) {
-        [out appendString:@"kum_prepare FAILED\n"];
-        return out;
-    }
-
-    uint64_t mapMin = kum_map_min();
-    uint64_t mapMax = kum_map_max();
-    [out appendFormat:@"map    = [0x%llx, 0x%llx]\n\n", mapMin, mapMax];
-
-    // ---- locate the main executable (fixed-address probes only) ----
-    uint64_t base = dfFindMainExec(mapMin, mapMax, out);
+    uint64_t base = dfFindMainExec(kum_map_min(), kum_map_max(), out);
     if (!base) {
-        [out appendString:@"\nmain executable not found -> nothing read\n"];
+        [out appendString:@"main exec not found\n"];
         return out;
     }
+    g_dfBase = base;
+    g_dfModHi = base + MOD_SIZE;
 
-    g_dfSlide = base;
-    [out appendFormat:@"\nchosen base = 0x%llx\n", base];
-    [out appendFormat:@"A = 0x%llx  %llu bytes\n", base + SEG_A_RVA, SEG_A_SIZE];
-    [out appendFormat:@"B = 0x%llx  %llu bytes\n\n", base + SEG_B_RVA, SEG_B_SIZE];
+    [out appendFormat:@"heap band = [0x%llx, 0x%llx)\n\n", HEAP_LO, HEAP_HI];
 
-    uint64_t a = dfDumpSegment(@"df_a", SEG_A_RVA, SEG_A_SIZE, out);
-    uint64_t b = dfDumpSegment(@"df_b", SEG_B_RVA, SEG_B_SIZE, out);
+    static uint8_t page[SCAN_PAGE];
+    static uint64_t cand[MAX_CANDIDATES];
+    int ncand = 0;
 
-    NSString *info = [NSString stringWithFormat:
-        @"base=0x%llx\nmap_min=0x%llx\nmap_max=0x%llx\n"
-        @"A_rva=0x%llx\nA_size=%llu\nA_ok=%llu\n"
-        @"B_rva=0x%llx\nB_size=%llu\nB_ok=%llu\n",
-        base, mapMin, mapMax,
-        SEG_A_RVA, SEG_A_SIZE, a,
-        SEG_B_RVA, SEG_B_SIZE, b];
-    [[info dataUsingEncoding:NSUTF8StringEncoding]
-        writeToFile:[NSHomeDirectory()
-                     stringByAppendingPathComponent:@"Documents/df_info.txt"]
-         atomically:YES];
+    uint64_t pages = (HEAP_HI - HEAP_LO) / SCAN_PAGE;
+    uint64_t readable = 0;
 
-    cyanide_log_sync(@"[DF] ===== done =====");
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
+
+    for (uint64_t i = 0; i < pages; i++) {
+        uint64_t va = HEAP_LO + i * SCAN_PAGE;
+
+        if ((i % 2048) == 0) {
+            cyanide_log_sync(@"[DF] page %llu/%llu readable=%llu cand=%d",
+                             i, pages, readable, ncand);
+        }
+
+        if (!kum_read(va, page, SCAN_PAGE)) continue;
+        ++readable;
+
+        const uint64_t last = SCAN_PAGE - 0x40;
+        for (uint64_t off = 0; off <= last; off += 8) {
+            uint64_t data;
+            int32_t num, mx;
+            memcpy(&data, page + off + 0x28, 8);
+            memcpy(&num,  page + off + 0x30, 4);
+            memcpy(&mx,   page + off + 0x34, 4);
+
+            if (num < MIN_ACTORS || num > MAX_ACTORS) continue;
+            if (mx < num || mx > num * 2 + 1024) continue;
+            if (!dfPlausible(data)) continue;
+
+            if (ncand < MAX_CANDIDATES) cand[ncand++] = va + off;
+        }
+    }
+
+    double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    cyanide_log_sync(@"[DF] scan done pages=%llu readable=%llu cand=%d %.0fms",
+                     pages, readable, ncand, ms);
+    [out appendFormat:@"pages=%llu readable=%llu candidates=%d  %.0f ms\n\n",
+                      pages, readable, ncand, ms];
+
+    int shown = 0;
+    for (int i = 0; i < ncand && shown < 40; i++) {
+        uint64_t a = cand[i];
+        uint64_t data = 0;
+        int32_t num = 0, mx = 0;
+        if (!kum_read(a + 0x28, &data, 8)) continue;
+        if (!kum_read(a + 0x30, &num, 4)) continue;
+        if (!kum_read(a + 0x34, &mx, 4)) continue;
+        [out appendFormat:@"  ULevel? 0x%llx  actors=0x%llx  n=%d max=%d\n",
+                          a, data, num, mx];
+        shown++;
+    }
+    if (ncand == 0) [out appendString:@"  (none)\n"];
+
     return out;
 }
 
