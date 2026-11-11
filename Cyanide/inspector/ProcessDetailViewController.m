@@ -31,6 +31,7 @@
 #import "CyanideLog.h"
 #import "KernelUserMemory.h"
 #import "MemoryReaderViewController.h"
+#import "ProbeListViewController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -133,6 +134,10 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(showMemoryReader)],
+        [[UIBarButtonItem alloc] initWithTitle:@"探针"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(showProbeList)],
         [[UIBarButtonItem alloc] initWithTitle:@"后台监听"
                                          style:UIBarButtonItemStylePlain
                                         target:self
@@ -641,6 +646,23 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
 
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - 探针表
+
+- (void)showProbeList
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    ProbeListViewController *probes =
+        [[ProbeListViewController alloc] initWithProcessName:self.processName
+                                                         pid:self.pid
+                                                    procAddr:self.procAddr];
+    [self.navigationController pushViewController:probes animated:YES];
 }
 
 #pragma mark - 读内存
