@@ -20,46 +20,36 @@
 #include <string.h>
 
 // ===========================================================================
-//  Delta Force (UE4.22, iOS ARM64) - SAFE DUMP ONLY
+//  Delta Force (UE4.22, iOS ARM64) - DIAGNOSE + SAFE DUMP
 //
-//  This build does NOT probe or dereference any unknown pointer. Earlier
-//  builds did, and dereferencing bogus addresses walks bogus page-table
-//  chains inside the kernel, which panics the device.
+//  Step 1: read the target's dyld image list. That gives the real main
+//          executable base instead of guessing by scanning for a Mach-O magic
+//          (the previous guess landed on some dylib, so every RVA was off and
+//          almost every read hit an unmapped page).
+//  Step 2: validate the Mach-O header at that base.
+//  Step 3: only if validation passes, dump two known regions to Documents/.
 //
-//  It only copies two known-readable regions to Documents/ and stops:
-//
-//    A) __bss first 8 MB    RVA 0x15D89B40  size 0x00800000
-//       (this exact range completed successfully in an earlier run)
-//    B) __common            RVA 0x167B0E40  size 0x002B43D0
-//
-//  The tail of __bss (0x800000..0xA272F8) is skipped on purpose: that is
-//  where the previous build crashed.
-//
-//  Output:
-//    Documents/df_a.bin   (~8 MB)
-//    Documents/df_b.bin   (~2.8 MB)
-//    Documents/df_info.txt
+//  No pointer is ever dereferenced.
 // ===========================================================================
 
-#define SEG_A_RVA   0x15D89B40ULL
-#define SEG_A_SIZE  0x00800000ULL
+#define SEG_A_RVA   0x15D89B40ULL   // __bss start
+#define SEG_A_SIZE  0x00800000ULL   // first 8 MB only
 
-#define SEG_B_RVA   0x167B0E40ULL
+#define SEG_B_RVA   0x167B0E40ULL   // __common
 #define SEG_B_SIZE  0x002B43D0ULL
 
 #define DF_MOD_SIZE 0x16BFE1F0ULL
 
 static uint64_t g_dfSlide = 0;
 
-// Read one segment page-by-page and write it out. Returns bytes written.
-static uint64_t dfDumpSegment(const char *name, uint64_t rva, uint64_t size,
+static uint64_t dfDumpSegment(NSString *name, uint64_t rva, uint64_t size,
                               NSMutableString *out)
 {
     const uint64_t PAGE = 0x4000;
     uint8_t *buf = (uint8_t *)malloc((size_t)size);
     if (!buf) {
-        cyanide_log_sync(@"[DF] %s malloc failed", name);
-        [out appendFormat:@"%s: malloc failed\n", name];
+        cyanide_log_sync(@"[DF] %@ malloc failed", name);
+        [out appendFormat:@"%@: malloc failed\n", name];
         return 0;
     }
     memset(buf, 0, (size_t)size);
@@ -77,30 +67,26 @@ static uint64_t dfDumpSegment(const char *name, uint64_t rva, uint64_t size,
             ++failPages;
         }
         off += chunk;
-        if ((off % 0x200000) == 0) {
-            cyanide_log_sync(@"[DF] %s read %llu/%llu ok=%llu fail=%d",
-                             name, off, size, okBytes, failPages);
-        }
     }
 
     NSString *path = [NSHomeDirectory()
                       stringByAppendingPathComponent:
-                      [NSString stringWithFormat:@"Documents/%s.bin", name]];
+                      [NSString stringWithFormat:@"Documents/%@.bin", name]];
     NSData *d = [NSData dataWithBytes:buf length:(NSUInteger)size];
     BOOL w = [d writeToFile:path atomically:YES];
     free(buf);
 
-    cyanide_log_sync(@"[DF] %s written=%d ok=%llu/%llu failpages=%d",
+    cyanide_log_sync(@"[DF] %@ written=%d ok=%llu/%llu failpages=%d",
                      name, w ? 1 : 0, okBytes, size, failPages);
-    [out appendFormat:@"%s: %s  ok=%llu/%llu  unmapped_pages=%d\n",
+    [out appendFormat:@"%@: %@  ok=%llu/%llu  unmapped_pages=%d\n",
                       name, w ? @"ok" : @"FAIL", okBytes, size, failPages];
     return okBytes;
 }
 
 NSString *df_scan_collect(void)
 {
-    NSMutableString *out = [NSMutableString stringWithCapacity:4096];
-    cyanide_log_sync(@"[DF] ===== dump-only begin =====");
+    NSMutableString *out = [NSMutableString stringWithCapacity:8192];
+    cyanide_log_sync(@"[DF] ===== diagnose begin =====");
 
     if (!settings_ensure_kernel_ready()) {
         return @"kernel r/w not ready";
@@ -131,47 +117,110 @@ NSString *df_scan_collect(void)
             strncpy(targetName, nm, PROC_NAME_MAX - 1);
         }
     }
-    if (!targetProc) return @"DeltaForceClient not running";
+    if (!targetProc) {
+        [out appendString:@"DeltaForceClient not running\n"];
+        return out;
+    }
 
     cyanide_log_sync(@"[DF] target %s pid=%d", targetName, targetPid);
     [out appendFormat:@"target = %s  pid=%d\n", targetName, targetPid];
 
     if (!kum_prepare(targetProc)) {
-        return @"kum_prepare failed";
+        [out appendString:@"kum_prepare FAILED\n"];
+        return out;
     }
 
+    [out appendFormat:@"map    = [0x%llx, 0x%llx]\n",
+                      kum_map_min(), kum_map_max()];
+
+    // ---- 1) real module list from dyld ----
+    NSString *err = nil;
+    NSArray<NSDictionary<NSString *, id> *> *imgs = kum_read_dyld_images(&err);
+    if (!imgs) {
+        [out appendFormat:@"dyld images FAILED: %@\n", err ?: @"?"];
+        return out;
+    }
+
+    [out appendFormat:@"dyld images = %lu\n", (unsigned long)imgs.count];
+    for (NSUInteger i = 0; i < imgs.count && i < 40; i++) {
+        NSDictionary *d = imgs[i];
+        [out appendFormat:@"  [%lu] %@  0x%llx  %@\n",
+                          (unsigned long)i,
+                          d[@"name"] ?: @"?",
+                          [d[@"base"] unsignedLongLongValue],
+                          d[@"path"] ?: @""];
+    }
+
+    // ---- 2) pick the main executable ----
     uint64_t base = 0;
-    if (!kum_main_executable_base(&base) || base < 0x100000000ULL) {
-        return @"cannot locate main executable";
+    NSString *baseName = nil;
+    for (NSDictionary *d in imgs) {
+        NSString *nm = d[@"name"] ?: @"";
+        NSString *pth = d[@"path"] ?: @"";
+        // The app binary lives inside Foo.app/ and is named like the bundle.
+        if ([pth containsString:@"DeltaForceClient.app"] &&
+            [pth containsString:@".app/"]) {
+            base = [d[@"base"] unsignedLongLongValue];
+            baseName = nm;
+            break;
+        }
     }
+    if (!base) {
+        // fall back to image 0
+        base = [imgs.firstObject[@"base"] unsignedLongLongValue];
+        baseName = imgs.firstObject[@"name"];
+    }
+    if (base < 0x100000000ULL) {
+        [out appendString:@"no usable base\n"];
+        return out;
+    }
+
     g_dfSlide = base;
+    [out appendFormat:@"\nchosen base = 0x%llx  (%@)\n", base, baseName ?: @"?"];
+    cyanide_log_sync(@"[DF] base=0x%llx name=%@", base, baseName);
 
-    cyanide_log_sync(@"[DF] base = 0x%llx", base);
-    [out appendFormat:@"base   = 0x%llx\n", base];
-    [out appendFormat:@"A      = 0x%llx  %llu bytes\n",
-                      base + SEG_A_RVA, SEG_A_SIZE];
-    [out appendFormat:@"B      = 0x%llx  %llu bytes\n\n",
-                      base + SEG_B_RVA, SEG_B_SIZE];
+    // ---- 3) validate the Mach-O header ----
+    uint32_t mh[8] = {0};
+    BOOL mhOk = kum_read(base, mh, sizeof(mh));
+    if (!mhOk) {
+        [out appendString:@"macho header unreadable\n"];
+        return out;
+    }
+    [out appendFormat:@"macho magic=0x%08x cputype=0x%08x filetype=%u ncmds=%u sizeofcmds=0x%x\n",
+                      mh[0], mh[1], mh[3], mh[4], mh[5]];
 
-    // Segment A: proven-safe first 8 MB of __bss.
-    uint64_t a = dfDumpSegment("df_a", SEG_A_RVA, SEG_A_SIZE, out);
+    BOOL plausible = (mh[0] == 0xFEEDFACF) && (mh[1] == 0x0100000C) &&
+                     (mh[3] == 2) && (mh[4] > 16 && mh[4] < 4096);
+    if (!plausible) {
+        [out appendString:@"\nMach-O header NOT plausible -> skipping dump\n"];
+        cyanide_log_sync(@"[DF] base rejected");
+        return out;
+    }
 
-    // Segment B: __common. Kept separate so that if it ever fails we still
-    // have df_a.bin on disk.
-    uint64_t b = dfDumpSegment("df_b", SEG_B_RVA, SEG_B_SIZE, out);
+    [out appendFormat:@"\nA = 0x%llx  %llu bytes\n", base + SEG_A_RVA, SEG_A_SIZE];
+    [out appendFormat:@"B = 0x%llx  %llu bytes\n\n", base + SEG_B_RVA, SEG_B_SIZE];
 
-    // Info file
+    // ---- 4) dump ----
+    uint64_t a = dfDumpSegment(@"df_a", SEG_A_RVA, SEG_A_SIZE, out);
+    uint64_t b = dfDumpSegment(@"df_b", SEG_B_RVA, SEG_B_SIZE, out);
+
     NSString *info = [NSString stringWithFormat:
-        @"base=0x%llx\nA_rva=0x%llx\nA_size=%llu\nA_ok=%llu\n"
+        @"base=0x%llx\nbase_name=%@\n"
+        @"map_min=0x%llx\nmap_max=0x%llx\n"
+        @"macho_magic=0x%08x\nmacho_cputype=0x%08x\nmacho_filetype=%u\nmacho_ncmds=%u\n"
+        @"A_rva=0x%llx\nA_size=%llu\nA_ok=%llu\n"
         @"B_rva=0x%llx\nB_size=%llu\nB_ok=%llu\n",
-        base, SEG_A_RVA, SEG_A_SIZE, a,
+        base, baseName ?: @"?",
+        kum_map_min(), kum_map_max(),
+        mh[0], mh[1], mh[3], mh[4],
+        SEG_A_RVA, SEG_A_SIZE, a,
         SEG_B_RVA, SEG_B_SIZE, b];
     [[info dataUsingEncoding:NSUTF8StringEncoding]
         writeToFile:[NSHomeDirectory()
                      stringByAppendingPathComponent:@"Documents/df_info.txt"]
          atomically:YES];
 
-    cyanide_log_sync(@"[DF] ===== dump-only done =====");
+    cyanide_log_sync(@"[DF] ===== done =====");
     return out;
 }
 
