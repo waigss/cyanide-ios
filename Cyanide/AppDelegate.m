@@ -152,21 +152,36 @@ NSString *df_scan_collect(void)
     }
 
     // ---- 2) pick the main executable ----
+    // Order of preference:
+    //   a) path ends with "/<process name>"   (the app binary itself)
+    //   b) inside Foo.app/ but not Frameworks/
+    //   c) image 0
+    NSString *procName = [NSString stringWithUTF8String:targetName];
+    NSString *suffix = [NSString stringWithFormat:@"/%@", procName];
+
     uint64_t base = 0;
     NSString *baseName = nil;
+
     for (NSDictionary *d in imgs) {
-        NSString *nm = d[@"name"] ?: @"";
         NSString *pth = d[@"path"] ?: @"";
-        // The app binary lives inside Foo.app/ and is named like the bundle.
-        if ([pth containsString:@"DeltaForceClient.app"] &&
-            [pth containsString:@".app/"]) {
+        if ([pth hasSuffix:suffix]) {
             base = [d[@"base"] unsignedLongLongValue];
-            baseName = nm;
+            baseName = d[@"name"];
             break;
         }
     }
     if (!base) {
-        // fall back to image 0
+        for (NSDictionary *d in imgs) {
+            NSString *pth = d[@"path"] ?: @"";
+            if ([pth containsString:@".app/"] &&
+                ![pth containsString:@"/Frameworks/"]) {
+                base = [d[@"base"] unsignedLongLongValue];
+                baseName = d[@"name"];
+                break;
+            }
+        }
+    }
+    if (!base) {
         base = [imgs.firstObject[@"base"] unsignedLongLongValue];
         baseName = imgs.firstObject[@"name"];
     }
