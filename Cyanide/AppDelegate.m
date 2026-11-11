@@ -11,6 +11,8 @@
 #import "LogTextView.h"
 #import "TaskRop/RemoteCall.h"
 #import "inspector/CyanideLog.h"
+#import "kexploit/kutils.h"
+#import "kexploit/krw.h"
 #import <signal.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -120,6 +122,7 @@ static int dfLooksLikeLevel(uint64_t level,
 // Blocking. Returns the report text, or nil on hard failure.
 NSString *df_scan_collect(void)
 {
+    NSMutableString *out = [NSMutableString stringWithCapacity:16384];
     cyanide_log(@"[DF] ===== scan begin =====");
 
     if (!settings_ensure_kernel_ready()) {
@@ -128,22 +131,69 @@ NSString *df_scan_collect(void)
     }
     cyanide_log(@"[DF] kernel ready");
 
-    if (init_remote_call("DeltaForceClient", false) != 0) {
-        static const char *names[] = {
-            "DeltaForce", "DeltaForceClient-DeltaForceClient",
-            "deltaforce", "DeltaForceMobile", "DeltaForceClientIos"
-        };
-        int attached = 0;
-        for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
-            cyanide_log(@"[DF] try attach %s", names[i]);
-            if (init_remote_call(names[i], false) == 0) { attached = 1; break; }
+    // ---- enumerate the kernel proc list and pick the game ----
+    static proc_entry_t ents[512];
+    int n = proc_list_all(ents, 512);
+    cyanide_log(@"[DF] proc_list_all -> %d", n);
+    [out appendFormat:@"proc_list_all = %d\n", n];
+
+    if (n <= 0) {
+        [out appendString:@"cannot read kernel proc list\n"];
+        return out;
+    }
+
+    uint64_t targetProc = 0;
+    int targetPid = 0;
+    char targetName[PROC_NAME_MAX];
+    memset(targetName, 0, sizeof(targetName));
+
+    for (int i = 0; i < n; i++) {
+        const char *nm = ents[i].name;
+        [out appendFormat:@"  pid=%-6u %-22s proc=0x%llx\n",
+                          ents[i].pid, nm, ents[i].proc];
+
+        char low[PROC_NAME_MAX];
+        int j = 0;
+        for (; nm[j] && j < PROC_NAME_MAX - 1; j++) {
+            char c = nm[j];
+            low[j] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
         }
-        if (!attached) {
-            cyanide_log(@"[DF] attach failed for all names");
-            return @"attach DeltaForceClient failed\n(process not running?)";
+        low[j] = 0;
+
+        if (!targetProc &&
+            (strstr(low, "delta") || strstr(low, "dfm") ||
+             strstr(low, "tmgp") || strstr(low, "game"))) {
+            targetProc = ents[i].proc;
+            targetPid  = (int)ents[i].pid;
+            strncpy(targetName, nm, PROC_NAME_MAX - 1);
         }
     }
+
+    if (!targetProc) {
+        cyanide_log(@"[DF] no Delta-like process found");
+        [out appendString:@"\nNO DELTA PROCESS FOUND\n"];
+        return out;
+    }
+
+    cyanide_log(@"[DF] target %s pid=%d proc=0x%llx", targetName, targetPid, targetProc);
+    [out appendFormat:@"\ntarget = %s  pid=%d  proc=0x%llx\n\n",
+                      targetName, targetPid, targetProc];
+
+    // ---- attach by exact kernel proc address (bypasses name lookup) ----
+    g_RC_targetProcOverride = targetProc;
+    int rc = init_remote_call_with_first_exception_timeout(targetName, false, 45000);
+    g_RC_targetProcOverride = 0;
+
+    if (rc != 0) {
+        RemoteCallInitFailure f = remote_call_last_init_failure();
+        const char *desc = remote_call_init_failure_description(f);
+        cyanide_log(@"[DF] attach failed rc=%d failure=%d %s", rc, (int)f, desc);
+        [out appendFormat:@"attach FAILED  rc=%d  failure=%d  (%s)\n",
+                          rc, (int)f, desc];
+        return out;
+    }
     cyanide_log(@"[DF] attached");
+    [out appendString:@"attached OK\n"];
 
     uint64_t hdr = do_remote_call_stable(10, "_dyld_get_image_header",
                                          0, 0, 0, 0, 0, 0, 0, 0);
@@ -155,7 +205,6 @@ NSString *df_scan_collect(void)
     }
     g_dfSlide = hdr;
 
-    NSMutableString *out = [NSMutableString stringWithCapacity:8192];
     [out appendFormat:@"base   = 0x%llx\n", hdr];
     [out appendFormat:@"bss    = 0x%llx\n", dfVa(DF_BSS_RVA)];
     [out appendFormat:@"common = 0x%llx\n\n", dfVa(DF_COM_RVA)];
@@ -175,15 +224,15 @@ NSString *df_scan_collect(void)
     int fails = 0;
     uint64_t nextLog = 0x400000;
     while (off < total) {
-        uint64_t n = total - off;
-        if (n > CHUNK) n = CHUNK;
+        uint64_t chunk = total - off;
+        if (chunk > CHUNK) chunk = CHUNK;
         uint64_t rva = (off < DF_BSS_SIZE)
                      ? (DF_BSS_RVA + off)
                      : (DF_COM_RVA + (off - DF_BSS_SIZE));
-        if (!remote_read(dfVa(rva), buf + off, n)) {
+        if (!remote_read(dfVa(rva), buf + off, chunk)) {
             if (++fails > 32) break;
         }
-        off += n;
+        off += chunk;
         if (off >= nextLog) {
             cyanide_log(@"[DF] read %llu / %llu", off, total);
             nextLog += 0x400000;
