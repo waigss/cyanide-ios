@@ -9,8 +9,8 @@
 #import "SettingsViewController.h"
 #import "DSKeepAlive.h"
 #import "LogTextView.h"
-#import "TaskRop/RemoteCall.h"
 #import "inspector/CyanideLog.h"
+#import "inspector/KernelUserMemory.h"
 #import "kexploit/kutils.h"
 #import "kexploit/krw.h"
 #import <signal.h>
@@ -22,9 +22,11 @@
 // ===========================================================================
 //  Delta Force (UE4.22, iOS ARM64) memory scan
 //
-//  RVAs come from static analysis of the Mach-O binary. All addresses are
-//  relative to the __TEXT start, which equals the value returned by
-//  _dyld_get_image_header(0) (vmaddr 0x100000000).
+//  Uses KernelUserMemory (kernel page-table translation) instead of
+//  RemoteCall: no attach, no remote threads, no exception ports.
+//
+//  RVAs come from static analysis of the Mach-O binary and are relative to
+//  the __TEXT start (vmaddr 0x100000000), i.e. kum_main_executable_base().
 //
 //    __bss       RVA 0x15D89B40   size 0x0A272F8
 //    __common    RVA 0x167B0E40   size 0x02B43D0
@@ -51,14 +53,14 @@ static inline uint64_t dfVa(uint64_t rva) { return g_dfSlide + rva; }
 static uint64_t dfRd64(uint64_t a)
 {
     uint64_t v = 0;
-    if (!remote_read(a, &v, 8)) return 0;
+    if (!kum_read(a, &v, 8)) return 0;
     return v;
 }
 
 static uint32_t dfRd32(uint64_t a)
 {
     uint32_t v = 0;
-    if (!remote_read(a, &v, 4)) return 0;
+    if (!kum_read(a, &v, 4)) return 0;
     return v;
 }
 
@@ -119,7 +121,7 @@ static int dfLooksLikeLevel(uint64_t level,
     return 1;
 }
 
-// Blocking. Returns the report text, or nil on hard failure.
+// Blocking. Returns the report text.
 NSString *df_scan_collect(void)
 {
     NSMutableString *out = [NSMutableString stringWithCapacity:16384];
@@ -131,12 +133,11 @@ NSString *df_scan_collect(void)
     }
     cyanide_log(@"[DF] kernel ready");
 
-    // ---- enumerate the kernel proc list and pick the game ----
+    // ---- enumerate the kernel proc list ----
     static proc_entry_t ents[512];
     int n = proc_list_all(ents, 512);
     cyanide_log(@"[DF] proc_list_all -> %d", n);
     [out appendFormat:@"proc_list_all = %d\n", n];
-
     if (n <= 0) {
         [out appendString:@"cannot read kernel proc list\n"];
         return out;
@@ -161,8 +162,7 @@ NSString *df_scan_collect(void)
         low[j] = 0;
 
         if (!targetProc &&
-            (strstr(low, "delta") || strstr(low, "dfm") ||
-             strstr(low, "tmgp") || strstr(low, "game"))) {
+            (strstr(low, "delta") || strstr(low, "dfm") || strstr(low, "tmgp"))) {
             targetProc = ents[i].proc;
             targetPid  = (int)ents[i].pid;
             strncpy(targetName, nm, PROC_NAME_MAX - 1);
@@ -176,36 +176,27 @@ NSString *df_scan_collect(void)
     }
 
     cyanide_log(@"[DF] target %s pid=%d proc=0x%llx", targetName, targetPid, targetProc);
-    [out appendFormat:@"\ntarget = %s  pid=%d  proc=0x%llx\n\n",
-                      targetName, targetPid, targetProc];
+    [out appendFormat:@"\ntarget = %s  pid=%d  proc=0x%llx\n", targetName, targetPid, targetProc];
 
-    // ---- attach by exact kernel proc address (bypasses name lookup) ----
-    g_RC_targetProcOverride = targetProc;
-    int rc = init_remote_call_with_first_exception_timeout(targetName, false, 45000);
-    g_RC_targetProcOverride = 0;
-
-    if (rc != 0) {
-        RemoteCallInitFailure f = remote_call_last_init_failure();
-        const char *desc = remote_call_init_failure_description(f);
-        cyanide_log(@"[DF] attach failed rc=%d failure=%d %s", rc, (int)f, desc);
-        [out appendFormat:@"attach FAILED  rc=%d  failure=%d  (%s)\n",
-                          rc, (int)f, desc];
+    // ---- prepare kernel page-table context for that process ----
+    if (!kum_prepare(targetProc)) {
+        cyanide_log(@"[DF] kum_prepare failed");
+        [out appendString:@"kum_prepare FAILED\n"];
         return out;
     }
-    cyanide_log(@"[DF] attached");
-    [out appendString:@"attached OK\n"];
+    cyanide_log(@"[DF] kum_prepare ok  map=[0x%llx,0x%llx]",
+                kum_map_min(), kum_map_max());
+    [out appendFormat:@"map = [0x%llx, 0x%llx]\n", kum_map_min(), kum_map_max()];
 
-    uint64_t hdr = do_remote_call_stable(10, "_dyld_get_image_header",
-                                         0, 0, 0, 0, 0, 0, 0, 0);
-    cyanide_log(@"[DF] _dyld_get_image_header(0) = 0x%llx", hdr);
-    if (hdr < 0x100000000ULL) {
-        cyanide_log(@"[DF] invalid image header");
-        destroy_remote_call();
-        return @"invalid _dyld_get_image_header";
+    uint64_t base = 0;
+    if (!kum_main_executable_base(&base) || base < 0x100000000ULL) {
+        cyanide_log(@"[DF] cannot locate main executable");
+        [out appendString:@"cannot locate main executable\n"];
+        return out;
     }
-    g_dfSlide = hdr;
-
-    [out appendFormat:@"base   = 0x%llx\n", hdr];
+    g_dfSlide = base;
+    cyanide_log(@"[DF] base = 0x%llx", base);
+    [out appendFormat:@"base   = 0x%llx\n", base];
     [out appendFormat:@"bss    = 0x%llx\n", dfVa(DF_BSS_RVA)];
     [out appendFormat:@"common = 0x%llx\n\n", dfVa(DF_COM_RVA)];
 
@@ -213,12 +204,12 @@ NSString *df_scan_collect(void)
     uint64_t total = DF_BSS_SIZE + DF_COM_SIZE;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) {
-        cyanide_log(@"[DF] malloc failed");
-        destroy_remote_call();
-        return @"malloc failed";
+        [out appendString:@"malloc failed\n"];
+        return out;
     }
     memset(buf, 0, (size_t)total);
 
+    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
     const uint64_t CHUNK = 0x40000;
     uint64_t off = 0;
     int fails = 0;
@@ -229,7 +220,7 @@ NSString *df_scan_collect(void)
         uint64_t rva = (off < DF_BSS_SIZE)
                      ? (DF_BSS_RVA + off)
                      : (DF_COM_RVA + (off - DF_BSS_SIZE));
-        if (!remote_read(dfVa(rva), buf + off, chunk)) {
+        if (!kum_read(dfVa(rva), buf + off, (size_t)chunk)) {
             if (++fails > 32) break;
         }
         off += chunk;
@@ -238,16 +229,18 @@ NSString *df_scan_collect(void)
             nextLog += 0x400000;
         }
     }
-    cyanide_log(@"[DF] read done %llu/%llu fails=%d", off, total, fails);
-    [out appendFormat:@"read %llu/%llu bytes (fails=%d)\n", off, total, fails];
+    double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    cyanide_log(@"[DF] read done %llu/%llu fails=%d %.0fms", off, total, fails, ms);
+    [out appendFormat:@"read %llu/%llu bytes (fails=%d) in %.0f ms\n\n",
+                      off, total, fails, ms];
 
     // ---- collect plausible object pointers ----
-    const size_t MAXC = 300000;
+    const size_t MAXC = 400000;
     uint64_t *cands = (uint64_t *)malloc(sizeof(uint64_t) * MAXC);
     if (!cands) {
         free(buf);
-        destroy_remote_call();
-        return @"cand alloc failed";
+        [out appendString:@"cand alloc failed\n"];
+        return out;
     }
     size_t nc = 0;
     uint64_t modLo = g_dfSlide;
@@ -275,7 +268,7 @@ NSString *df_scan_collect(void)
     int hits28 = 0, hits158 = 0;
     uint64_t bestWorld = 0, bestLevels = 0, bestOff = 0;
 
-    size_t probeLimit = nu < 8000 ? nu : 8000;
+    size_t probeLimit = nu < 12000 ? nu : 12000;
     for (size_t i = 0; i < probeLimit; i++) {
         uint64_t c = cands[i];
         uint64_t data; uint32_t num;
@@ -343,7 +336,7 @@ NSString *df_scan_collect(void)
             }
 
             uint8_t lvbuf[0x200];
-            if (remote_read(lv, lvbuf, sizeof(lvbuf))) {
+            if (kum_read(lv, lvbuf, sizeof(lvbuf))) {
                 [out appendString:@"\nULevel raw 0x200:\n"];
                 for (int row = 0; row < 0x200; row += 16) {
                     [out appendFormat:@"%03X ", row];
@@ -359,7 +352,6 @@ NSString *df_scan_collect(void)
 
     free(cands);
     free(buf);
-    destroy_remote_call();
     cyanide_log(@"[DF] ===== scan done =====");
     return out;
 }
