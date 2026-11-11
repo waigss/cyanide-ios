@@ -10,6 +10,7 @@
 #import "DSKeepAlive.h"
 #import "LogTextView.h"
 #import "TaskRop/RemoteCall.h"
+#import "inspector/CyanideLog.h"
 #import <signal.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -19,19 +20,20 @@
 // ===========================================================================
 //  Delta Force (UE4.22, iOS ARM64) memory scan
 //
-//  RVAs obtained from static analysis of the Mach-O binary.
-//  All addresses are relative to the __TEXT start, which equals the value
-//  returned by _dyld_get_image_header(0) (vmaddr 0x100000000).
+//  RVAs come from static analysis of the Mach-O binary. All addresses are
+//  relative to the __TEXT start, which equals the value returned by
+//  _dyld_get_image_header(0) (vmaddr 0x100000000).
 //
 //    __bss       RVA 0x15D89B40   size 0x0A272F8
 //    __common    RVA 0x167B0E40   size 0x02B43D0
 //
-//  Goal: recover the GWorld -> UWorld -> Levels -> ULevel -> Actors chain.
+//  Chain we try to recover:
+//    GWorld -> UWorld -> Levels -> ULevel -> Actors -> AActor[]
 //
 //    UWorld::Levels candidate offsets: +0x28 or +0x158
-//        TArray<ULevel*> { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
+//        TArray { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
 //    ULevel::Actors  offset +0x28
-//        TArray<AActor*> { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
+//        TArray { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
 // ===========================================================================
 
 #define DF_BSS_RVA   0x15D89B40ULL
@@ -76,8 +78,8 @@ static int dfCmpU64(const void *a, const void *b)
 }
 
 // Returns 1 when [addr + off] looks like a TArray whose elements are pointers.
-static int dfLooksLikeWorldTArray(uint64_t addr, uint64_t off,
-                                 uint64_t *outData, uint32_t *outNum)
+static int dfLooksLikeTArray(uint64_t addr, uint64_t off,
+                             uint64_t *outData, uint32_t *outNum)
 {
     uint64_t data = dfRd64(addr + off);
     uint32_t num  = dfRd32(addr + off + 8);
@@ -115,15 +117,16 @@ static int dfLooksLikeLevel(uint64_t level,
     return 1;
 }
 
-void df_scan_run(void)
+// Blocking. Returns the report text, or nil on hard failure.
+NSString *df_scan_collect(void)
 {
-    printf("\n[DF] ===== Delta Force scan begin =====\n");
+    cyanide_log(@"[DF] ===== scan begin =====");
 
     if (!settings_ensure_kernel_ready()) {
-        printf("[DF] kernel r/w not ready\n");
-        return;
+        cyanide_log(@"[DF] kernel r/w not ready");
+        return @"kernel r/w not ready";
     }
-    printf("[DF] kernel ready\n");
+    cyanide_log(@"[DF] kernel ready");
 
     if (init_remote_call("DeltaForceClient", false) != 0) {
         static const char *names[] = {
@@ -132,43 +135,45 @@ void df_scan_run(void)
         };
         int attached = 0;
         for (int i = 0; i < (int)(sizeof(names) / sizeof(names[0])); i++) {
-            printf("[DF] try attach %s ...\n", names[i]);
+            cyanide_log(@"[DF] try attach %s", names[i]);
             if (init_remote_call(names[i], false) == 0) { attached = 1; break; }
         }
         if (!attached) {
-            printf("[DF] attach failed for all names\n");
-            return;
+            cyanide_log(@"[DF] attach failed for all names");
+            return @"attach DeltaForceClient failed\n(process not running?)";
         }
     }
-    printf("[DF] attached\n");
+    cyanide_log(@"[DF] attached");
 
     uint64_t hdr = do_remote_call_stable(10, "_dyld_get_image_header",
                                          0, 0, 0, 0, 0, 0, 0, 0);
-    printf("[DF] _dyld_get_image_header(0) = 0x%llx\n", hdr);
+    cyanide_log(@"[DF] _dyld_get_image_header(0) = 0x%llx", hdr);
     if (hdr < 0x100000000ULL) {
-        printf("[DF] invalid image header\n");
+        cyanide_log(@"[DF] invalid image header");
         destroy_remote_call();
-        return;
+        return @"invalid _dyld_get_image_header";
     }
     g_dfSlide = hdr;
-    printf("[DF] base   = 0x%llx\n", g_dfSlide);
-    printf("[DF] bss    = 0x%llx\n", dfVa(DF_BSS_RVA));
-    printf("[DF] common = 0x%llx\n", dfVa(DF_COM_RVA));
+
+    NSMutableString *out = [NSMutableString stringWithCapacity:8192];
+    [out appendFormat:@"base   = 0x%llx\n", hdr];
+    [out appendFormat:@"bss    = 0x%llx\n", dfVa(DF_BSS_RVA)];
+    [out appendFormat:@"common = 0x%llx\n\n", dfVa(DF_COM_RVA)];
 
     // ---- read __bss + __common ----
     uint64_t total = DF_BSS_SIZE + DF_COM_SIZE;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
     if (!buf) {
-        printf("[DF] malloc %llu failed\n", total);
+        cyanide_log(@"[DF] malloc failed");
         destroy_remote_call();
-        return;
+        return @"malloc failed";
     }
     memset(buf, 0, (size_t)total);
 
     const uint64_t CHUNK = 0x40000;
     uint64_t off = 0;
     int fails = 0;
-    uint64_t nextLog = 0x200000;
+    uint64_t nextLog = 0x400000;
     while (off < total) {
         uint64_t n = total - off;
         if (n > CHUNK) n = CHUNK;
@@ -176,24 +181,24 @@ void df_scan_run(void)
                      ? (DF_BSS_RVA + off)
                      : (DF_COM_RVA + (off - DF_BSS_SIZE));
         if (!remote_read(dfVa(rva), buf + off, n)) {
-            if (++fails > 16) break;
+            if (++fails > 32) break;
         }
         off += n;
         if (off >= nextLog) {
-            printf("[DF] read %llu / %llu\n", off, total);
-            nextLog += 0x200000;
+            cyanide_log(@"[DF] read %llu / %llu", off, total);
+            nextLog += 0x400000;
         }
     }
-    printf("[DF] read done %llu/%llu fails=%d\n", off, total, fails);
+    cyanide_log(@"[DF] read done %llu/%llu fails=%d", off, total, fails);
+    [out appendFormat:@"read %llu/%llu bytes (fails=%d)\n", off, total, fails];
 
     // ---- collect plausible object pointers ----
-    const size_t MAXC = 200000;
+    const size_t MAXC = 300000;
     uint64_t *cands = (uint64_t *)malloc(sizeof(uint64_t) * MAXC);
     if (!cands) {
-        printf("[DF] cand alloc failed\n");
         free(buf);
         destroy_remote_call();
-        return;
+        return @"cand alloc failed";
     }
     size_t nc = 0;
     uint64_t modLo = g_dfSlide;
@@ -207,73 +212,64 @@ void df_scan_run(void)
         if (v & 7) continue;
         if (nc < MAXC) cands[nc++] = v;
     }
-    printf("[DF] raw candidates = %zu\n", nc);
+    cyanide_log(@"[DF] raw candidates = %zu", nc);
 
     qsort(cands, nc, sizeof(uint64_t), dfCmpU64);
     size_t nu = 0;
     for (size_t i = 0; i < nc; i++) {
         if (i == 0 || cands[i] != cands[i - 1]) cands[nu++] = cands[i];
     }
-    printf("[DF] unique candidates = %zu\n", nu);
+    cyanide_log(@"[DF] unique candidates = %zu", nu);
+    [out appendFormat:@"unique candidates = %zu\n\n", nu];
 
-    // ---- probe candidates ----
-    static char report[1 << 17];
-    size_t rl = 0;
-    memset(report, 0, sizeof(report));
-    rl += snprintf(report + rl, sizeof(report) - rl,
-                   "base=0x%llx\n", hdr);
-    rl += snprintf(report + rl, sizeof(report) - rl,
-                   "bss=0x%llx common=0x%llx\n",
-                   dfVa(DF_BSS_RVA), dfVa(DF_COM_RVA));
-
+    // ---- probe ----
     int hits28 = 0, hits158 = 0;
     uint64_t bestWorld = 0, bestLevels = 0, bestOff = 0;
-    uint32_t bestNum = 0;
 
-    size_t probeLimit = nu < 6000 ? nu : 6000;
+    size_t probeLimit = nu < 8000 ? nu : 8000;
     for (size_t i = 0; i < probeLimit; i++) {
         uint64_t c = cands[i];
         uint64_t data; uint32_t num;
 
-        if (dfLooksLikeWorldTArray(c, 0x28, &data, &num)) {
+        if (dfLooksLikeTArray(c, 0x28, &data, &num)) {
             hits28++;
             uint64_t lv = dfRd64(data);
             uint64_t act = 0; uint32_t an = 0;
             int lvlOk = dfLooksLikeLevel(lv, &act, &an);
-            printf("[DF] HIT 0x28 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s\n",
-                   c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
-            if (rl < sizeof(report) - 256) {
-                rl += snprintf(report + rl, sizeof(report) - rl,
-                               "WORLD28 world=0x%llx levels=0x%llx n=%u level0=0x%llx act=0x%llx an=%u\n",
-                               c, data, num, lv, lvlOk ? act : 0ULL, lvlOk ? an : 0);
-            }
+            cyanide_log(@"[DF] HIT 0x28 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s",
+                        c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
+            [out appendFormat:@"WORLD@0x28 world=0x%llx levels=0x%llx n=%u level0=0x%llx "
+                              @"actors=0x%llx an=%u %s\n",
+                              c, data, num, lv, lvlOk ? act : 0ULL,
+                              lvlOk ? an : 0, lvlOk ? "LEVEL_OK" : ""];
             if (lvlOk && !bestWorld) {
-                bestWorld = c; bestLevels = data; bestNum = num; bestOff = 0x28;
+                bestWorld = c; bestLevels = data; bestOff = 0x28;
             }
         }
-        if (dfLooksLikeWorldTArray(c, 0x158, &data, &num)) {
+        if (dfLooksLikeTArray(c, 0x158, &data, &num)) {
             hits158++;
             uint64_t lv = dfRd64(data);
             uint64_t act = 0; uint32_t an = 0;
             int lvlOk = dfLooksLikeLevel(lv, &act, &an);
-            printf("[DF] HIT 0x158 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s\n",
-                   c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
-            if (rl < sizeof(report) - 256) {
-                rl += snprintf(report + rl, sizeof(report) - rl,
-                               "WORLD158 world=0x%llx levels=0x%llx n=%u level0=0x%llx act=0x%llx an=%u\n",
-                               c, data, num, lv, lvlOk ? act : 0ULL, lvlOk ? an : 0);
-            }
+            cyanide_log(@"[DF] HIT 0x158 world=0x%llx levels=0x%llx n=%u level0=0x%llx %s",
+                        c, data, num, lv, lvlOk ? "LEVEL_OK" : "");
+            [out appendFormat:@"WORLD@0x158 world=0x%llx levels=0x%llx n=%u level0=0x%llx "
+                              @"actors=0x%llx an=%u %s\n",
+                              c, data, num, lv, lvlOk ? act : 0ULL,
+                              lvlOk ? an : 0, lvlOk ? "LEVEL_OK" : ""];
             if (lvlOk && !bestWorld) {
-                bestWorld = c; bestLevels = data; bestNum = num; bestOff = 0x158;
+                bestWorld = c; bestLevels = data; bestOff = 0x158;
             }
         }
     }
 
-    printf("[DF] world hits: +0x28=%d +0x158=%d\n", hits28, hits158);
-    printf("[DF] best world=0x%llx levels_off=0x%llx\n", bestWorld, bestOff);
+    cyanide_log(@"[DF] world hits: 0x28=%d 0x158=%d", hits28, hits158);
+    [out appendFormat:@"\nworld hits: +0x28=%d  +0x158=%d\n", hits28, hits158];
 
-    // ---- locate the global slot that holds this UWorld (= GWorld) ----
+    // ---- find the global slot holding this UWorld (= GWorld) ----
     if (bestWorld) {
+        [out appendFormat:@"best world = 0x%llx (levels at +0x%llx)\n",
+                          bestWorld, bestOff];
         for (uint64_t o = 0; o + 8 <= off; o += 8) {
             uint64_t v;
             memcpy(&v, buf + o, 8);
@@ -281,66 +277,55 @@ void df_scan_run(void)
             uint64_t slotRva = (o < DF_BSS_SIZE)
                              ? (DF_BSS_RVA + o)
                              : (DF_COM_RVA + (o - DF_BSS_SIZE));
-            printf("[DF] >>> GWORLD SLOT base+0x%llx = 0x%llx\n", slotRva, v);
-            if (rl < sizeof(report) - 256) {
-                rl += snprintf(report + rl, sizeof(report) - rl,
-                               "GWORLD_SLOT rva=0x%llx world=0x%llx\n",
-                               slotRva, v);
-            }
+            cyanide_log(@"[DF] >>> GWORLD SLOT base+0x%llx = 0x%llx", slotRva, v);
+            [out appendFormat:@"GWORLD_SLOT = base + 0x%llx\n", slotRva];
         }
 
         uint64_t lv = dfRd64(bestLevels);
         uint64_t act = 0; uint32_t an = 0;
         if (dfLooksLikeLevel(lv, &act, &an)) {
-            printf("[DF] LEVEL0=0x%llx actors=0x%llx n=%u\n", lv, act, an);
-            if (rl < sizeof(report) - 256) {
-                rl += snprintf(report + rl, sizeof(report) - rl,
-                               "LEVEL0 level=0x%llx actors=0x%llx n=%u\n",
-                               lv, act, an);
-            }
-            for (uint32_t k = 0; k < an && k < 8; k++) {
+            cyanide_log(@"[DF] LEVEL0=0x%llx actors=0x%llx n=%u", lv, act, an);
+            [out appendFormat:@"\nULevel = 0x%llx\nActors = 0x%llx  count = %u\n",
+                              lv, act, an];
+            for (uint32_t k = 0; k < an && k < 12; k++) {
                 uint64_t a = dfRd64(act + (uint64_t)k * 8);
-                printf("[DF]   actor[%u]=0x%llx\n", k, a);
-                if (rl < sizeof(report) - 128) {
-                    rl += snprintf(report + rl, sizeof(report) - rl,
-                                   "ACTOR %u = 0x%llx\n", k, a);
-                }
+                cyanide_log(@"[DF]   actor[%u]=0x%llx", k, a);
+                [out appendFormat:@"  actor[%u] = 0x%llx\n", k, a];
             }
 
             uint8_t lvbuf[0x200];
             if (remote_read(lv, lvbuf, sizeof(lvbuf))) {
-                for (int row = 0; row < 0x200; row += 32) {
-                    if (rl > sizeof(report) - 256) break;
-                    rl += snprintf(report + rl, sizeof(report) - rl,
-                                   "LV%03X ", row);
-                    for (int j = 0; j < 32; j++) {
-                        rl += snprintf(report + rl, sizeof(report) - rl,
-                                       "%02X", lvbuf[row + j]);
-                    }
-                    rl += snprintf(report + rl, sizeof(report) - rl, "\n");
+                [out appendString:@"\nULevel raw 0x200:\n"];
+                for (int row = 0; row < 0x200; row += 16) {
+                    [out appendFormat:@"%03X ", row];
+                    for (int j = 0; j < 16; j++)
+                        [out appendFormat:@"%02X", lvbuf[row + j]];
+                    [out appendString:@"\n"];
                 }
             }
         }
+    } else {
+        [out appendString:@"\nNO WORLD CANDIDATE FOUND\n"];
     }
-
-    // ---- write report ----
-    NSString *path = [NSHomeDirectory()
-                      stringByAppendingPathComponent:@"Documents/df_result.txt"];
-    NSString *txt = [[NSString alloc] initWithBytes:report
-                                             length:rl
-                                           encoding:NSUTF8StringEncoding];
-    NSError *err = nil;
-    BOOL ok = [txt writeToFile:path
-                    atomically:YES
-                      encoding:NSUTF8StringEncoding
-                         error:&err];
-    printf("[DF] report -> %s (%s)\n", path.UTF8String, ok ? "ok" : "FAIL");
-    if (err) printf("[DF] write error: %s\n", err.localizedDescription.UTF8String);
 
     free(cands);
     free(buf);
     destroy_remote_call();
-    printf("[DF] ===== scan done =====\n");
+    cyanide_log(@"[DF] ===== scan done =====");
+    return out;
+}
+
+// Blocking wrapper: also writes Documents/df_result.txt.
+void df_scan_run(void)
+{
+    NSString *r = df_scan_collect();
+    if (!r) return;
+    NSString *path = [NSHomeDirectory()
+                      stringByAppendingPathComponent:@"Documents/df_result.txt"];
+    NSError *err = nil;
+    BOOL ok = [r writeToFile:path atomically:YES
+                    encoding:NSUTF8StringEncoding error:&err];
+    cyanide_log(@"[DF] report -> %@ (%@)", path, ok ? @"ok" : @"FAIL");
 }
 
 @interface AppDelegate ()
@@ -359,13 +344,6 @@ static dispatch_source_t g_sigterm_source;
     ds_keepalive_apply_enabled([[NSUserDefaults standardUserDefaults] boolForKey:kSettingsKeepAlive]);
     [self installTerminationHandlers];
     [self installBarAppearances];
-
-    // Delay the Delta Force scan a few seconds so kernel r/w can come up.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8 * NSEC_PER_SEC)),
-                   dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        df_scan_run();
-    });
-
     return YES;
 }
 
