@@ -40,14 +40,14 @@
 //        TArray { Data @ +0x00, Num @ +0x08, Max @ +0x0C }
 // ===========================================================================
 
-// Scan window: the whole writable tail of __DATA.
-//   __data    RVA 0x1550B0D0  size 0x087E768
+// Scan window: __bss + __common only.
 //   __bss     RVA 0x15D89B40  size 0x0A272F8
 //   __common  RVA 0x167B0E40  size 0x02B43D0
-// They are contiguous (gap of a few bytes), so one range covers all three.
-// GWorld is a zero-initialised pointer, but the toolchain may place it in
-// either __bss or __data, so we scan all of it.
-#define DF_SCAN_RVA   0x1550B0D0ULL
+//
+// __data is deliberately excluded: it holds megabytes of float/int constants
+// that pass a naive "looks like a pointer" test, and dereferencing those bogus
+// addresses walks bogus page-table chains, which panics the kernel.
+#define DF_SCAN_RVA   0x15D89B40ULL
 #define DF_SCAN_END   (0x167B0E40ULL + 0x02B43D0ULL)
 #define DF_SCAN_SIZE  (DF_SCAN_END - DF_SCAN_RVA)
 
@@ -267,8 +267,8 @@ NSString *df_scan_collect(void)
         }
         off += chunk;
         if (off >= nextLog) {
-            cyanide_log(@"[DF] read %llu / %llu (ok=%llu failpages=%d)",
-                        off, total, okBytes, failPages);
+            cyanide_log_sync(@"[DF] read %llu / %llu (ok=%llu failpages=%d)",
+                             off, total, okBytes, failPages);
             nextLog += 0x400000;
         }
     }
@@ -301,36 +301,45 @@ NSString *df_scan_collect(void)
     cyanide_log(@"[DF] raw candidates = %zu", nc);
 
     qsort(cands, nc, sizeof(uint64_t), dfCmpU64);
+
+    // Keep only values referenced from >= 2 different slots. Real object
+    // pointers show up repeatedly; float/int constants that merely look like
+    // pointers usually appear once. Every dereference walks page tables inside
+    // the kernel, so cutting the candidate count also cuts panic surface.
     size_t nu = 0;
-    for (size_t i = 0; i < nc; i++) {
-        if (i == 0 || cands[i] != cands[i - 1]) cands[nu++] = cands[i];
+    for (size_t i = 0; i < nc; ) {
+        size_t j = i;
+        while (j < nc && cands[j] == cands[i]) j++;
+        if ((j - i) >= 2 && nu < MAXC) cands[nu++] = cands[i];
+        i = j;
     }
-    cyanide_log(@"[DF] unique candidates = %zu", nu);
-    [out appendFormat:@"unique candidates = %zu\n\n", nu];
+    cyanide_log_sync(@"[DF] candidates with >=2 refs = %zu (raw %zu)", nu, nc);
+    [out appendFormat:@"candidates (>=2 refs) = %zu  (raw %zu)\n\n", nu, nc];
 
     // ---- probe ----
-    // One kum_read per candidate covers the whole 0x08..0x300 window, so the
-    // expensive page-table walk happens once instead of ~400 times.
-    static int offHits[128];
+    // One kum_read per candidate covers offsets 0x08..0x180 (enough for both
+    // the +0x28 and the +0x158 Levels candidates), so the expensive page-table
+    // walk runs once instead of ~100 times.
+    static int offHits[64];
     memset(offHits, 0, sizeof(offHits));
     uint64_t bestWorld = 0, bestLevels = 0, bestOff = 0;
     int chainHits = 0, arrHits = 0;
 
-    static uint8_t wbuf[0x320];
+    static uint8_t wbuf[0x190];
     static uint8_t lbuf[0x60];
 
-    size_t probeLimit = nu < 40000 ? nu : 40000;
-    CFAbsoluteTime tp = CFAbsoluteTimeGetCurrent();
+    const int OFF_START = 0x08;
+    const int OFF_END   = 0x180;
+    size_t probeLimit = nu < 1500 ? nu : 1500;
 
     for (size_t i = 0; i < probeLimit; i++) {
-        if ((i & 0x1FF) == 0 && (CFAbsoluteTimeGetCurrent() - tp) > 70.0) {
-            cyanide_log(@"[DF] probe budget reached at i=%zu", i);
-            break;
-        }
+        if ((i % 100) == 0)
+            cyanide_log_sync(@"[DF] probe %zu / %zu  cur=0x%llx",
+                             i, probeLimit, cands[i]);
         uint64_t c = cands[i];
         if (!kum_read(c, wbuf, sizeof(wbuf))) continue;
 
-        for (int off = 0x08; off <= 0x300; off += 8) {
+        for (int off = OFF_START; off <= OFF_END; off += 8) {
             uint64_t data; uint32_t num;
             if (!dfParseTArray(wbuf, off, &data, &num)) continue;
             ++arrHits;
@@ -371,11 +380,11 @@ NSString *df_scan_collect(void)
     [out appendString:@"\noffset histogram (top 12):\n"];
     for (int n2 = 0; n2 < 12; n2++) {
         int bestIdx = -1, bestVal = 0;
-        for (int k = 0; k < 128; k++) {
+        for (int k = 0; k < 64; k++) {
             if (offHits[k] > bestVal) { bestVal = offHits[k]; bestIdx = k; }
         }
         if (bestIdx < 0) break;
-        [out appendFormat:@"  +0x%03X  x%d\n", 0x08 + bestIdx * 8, bestVal];
+        [out appendFormat:@"  +0x%03X  x%d\n", OFF_START + bestIdx * 8, bestVal];
         offHits[bestIdx] = 0;
     }
 
