@@ -26,6 +26,9 @@
 #import "../kexploit/kexploit_opa334.h"
 #import "../SettingsViewController.h"
 
+// Implemented in AppDelegate.m. Blocking; call from a background queue.
+extern NSString *df_scan_collect(void);
+
 static NSString * const kProcessCellIdentifier = @"CyanideProcessCell";
 static const int kProcessCapacity = 1024;
 static const NSTimeInterval kInitTimeout = 240.0;
@@ -46,6 +49,9 @@ static const NSTimeInterval kInitTimeout = 240.0;
 @property (nonatomic, assign) BOOL lastInitFailed;
 @property (nonatomic, assign) NSUInteger kernelInitToken;
 
+@property (nonatomic, copy) NSString *dfReportText;
+@property (nonatomic, strong) UIViewController *dfReportPresented;
+@property (nonatomic, assign) BOOL dfScanning;
 
 @end
 
@@ -220,6 +226,98 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
     [self.navigationController pushViewController:log animated:YES];
 }
 
+#pragma mark - Delta Force 扫描
+
+- (void)confirmDFScan
+{
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"扫描 Delta Force"
+                                            message:@"将附加到 DeltaForceClient，"
+                                                    @"读取 __bss + __common（约 13 MB），"
+                                                    @"查找 GWorld → UWorld → Levels → Actors 链路。\n\n"
+                                                    @"请先让游戏进入对局，再点开始。"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"取消"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"开始"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [weakSelf runDFScan];
+    }]];
+    [self presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)runDFScan
+{
+    if (self.dfScanning) return;
+    self.dfScanning = YES;
+    cyanide_log(@"[DF] 用户触发扫描");
+
+    UIAlertController *busy =
+        [UIAlertController alertControllerWithTitle:@"扫描中"
+                                            message:@"正在读取内存，请稍候…"
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [self presentViewController:busy animated:YES completion:nil];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *report = df_scan_collect();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(weakSelf) self = weakSelf;
+            if (!self) return;
+            self.dfScanning = NO;
+            [busy dismissViewControllerAnimated:YES completion:^{
+                [self showDFReport:(report.length ? report : @"扫描失败，请查看「日志」")];
+            }];
+        });
+    });
+}
+
+- (void)showDFReport:(NSString *)text
+{
+    UIViewController *vc = [[UIViewController alloc] init];
+    vc.title = @"扫描结果";
+
+    UITextView *tv = [[UITextView alloc] initWithFrame:vc.view.bounds];
+    tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    tv.editable = NO;
+    tv.alwaysBounceVertical = YES;
+    tv.font = [UIFont monospacedSystemFontOfSize:11.0 weight:UIFontWeightRegular];
+    tv.text = text;
+    [vc.view addSubview:tv];
+
+    vc.navigationItem.leftBarButtonItem =
+        [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemDone
+                                                      target:self
+                                                      action:@selector(dismissDFReport)];
+    vc.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithTitle:@"复制"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(copyDFReport)];
+
+    self.dfReportText = text;
+    self.dfReportPresented = vc;
+
+    UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:vc];
+    nav.modalPresentationStyle = UIModalPresentationPageSheet;
+    [self presentViewController:nav animated:YES completion:nil];
+}
+
+- (void)dismissDFReport
+{
+    [self.dfReportPresented dismissViewControllerAnimated:YES completion:nil];
+    self.dfReportPresented = nil;
+}
+
+- (void)copyDFReport
+{
+    [UIPasteboard generalPasteboard].string = self.dfReportText ?: @"";
+    cyanide_log(@"[DF] 结果已复制到剪贴板");
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -246,6 +344,10 @@ static const char kPmapSelfTest[] = "CYANIDE_PMAP_SELFTEST_0123456789";
     self.definesPresentationContext = YES;
 
     self.navigationItem.rightBarButtonItems = @[
+        [[UIBarButtonItem alloc] initWithTitle:@"扫描"
+                                         style:UIBarButtonItemStyleDone
+                                        target:self
+                                        action:@selector(confirmDFScan)],
         [[UIBarButtonItem alloc] initWithBarButtonSystemItem:UIBarButtonSystemItemRefresh
                                                       target:self
                                                       action:@selector(reloadProcesses)],
