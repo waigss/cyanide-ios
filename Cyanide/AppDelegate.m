@@ -45,9 +45,9 @@
 #define SEG_B_RVA   0x167B0E40ULL
 #define SEG_B_SIZE  0x002B43D0ULL
 
-#define MH_MAGIC_64   0xFEEDFACFu
-#define CPU_TYPE_ARM64 0x0100000Cu
-#define MH_EXECUTE     2u
+#define DF_MH_MAGIC_64   0xFEEDFACFu
+#define DF_CPU_ARM64     0x0100000Cu
+#define DF_MH_EXECUTE    2u
 
 static uint64_t g_dfSlide = 0;
 
@@ -71,9 +71,9 @@ static uint64_t dfFindMainExec(uint64_t mapMin, uint64_t mapMax,
     for (uint64_t va = start; va < limit; va += STEP) {
         ++tried;
         if (!kum_read(va, mh, sizeof(mh))) continue;
-        if (mh[0] != MH_MAGIC_64) continue;
-        if (mh[1] != CPU_TYPE_ARM64) continue;
-        if (mh[3] != MH_EXECUTE) {
+        if (mh[0] != DF_MH_MAGIC_64) continue;
+        if (mh[1] != DF_CPU_ARM64) continue;
+        if (mh[3] != DF_MH_EXECUTE) {
             // a dylib / bundle header: remember it in the log, keep going
             [out appendFormat:@"  skip 0x%llx filetype=%u (not MH_EXECUTE)\n",
                               va, mh[3]];
@@ -86,7 +86,7 @@ static uint64_t dfFindMainExec(uint64_t mapMin, uint64_t mapMax,
         return va;
     }
 
-    [out appendFormat:@"  scanned %llu pages, no MH_EXECUTE header\n", tried);
+    [out appendFormat:@"  scanned %llu pages, no MH_EXECUTE header\n", tried];
     return 0;
 }
 
