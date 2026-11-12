@@ -13,7 +13,7 @@
 #import "inspector/KernelUserMemory.h"
 #import "kexploit/kutils.h"
 #import "kexploit/krw.h"
-#import "TaskRop/RemoteCall.h"
+#import "kexploit/offsets.h"
 #import <signal.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -21,27 +21,22 @@
 #include <string.h>
 
 // ===========================================================================
-//  Delta Force (UE4.22, iOS ARM64) - GWorld hunt, bounded and safe
+//  Delta Force (UE4.22, iOS ARM64) - vm_map guarded read
 //
-//  Attach strategy is copied verbatim from ProcessDetailViewController
-//  (the screen you get after tapping a process):
+//  WHY:
+//    kum_read() panics the kernel when a page-table entry is present but
+//    bogus, which is what happened while scanning the heap blindly. The fix is
+//    to never hand kum_read() an address that is not inside a region the
+//    target's own vm_map reports as mapped:
 //
-//      // 只做一次短超时尝试（4s）：这个目标历史上附加从未成功，
-//      // 失败后立刻走内核直读，不让用户白等三个策略共 40 多秒。
-//      session = [[RemoteCallSession alloc] initWithProcess:name
-//                                       useMigFilterBypass:NO
-//                                  firstExceptionTimeoutMS:4000];
+//        proc -> task -> vm_map -> vm_map_entry list
 //
-//  A long timeout leaves the target hijacked on the exception port and the
-//  game dies. 4 s and then fall back to kum_* is the app's own behaviour.
+//    VM.m already implements that walk (vm_map_iterate_entries). We collect
+//    every [start,end) pair once, then guard every single read against it.
+//    Out-of-region addresses are skipped, so an invalid PTE can never be
+//    reached.
 //
-//  Budget (all bounded, no big scans):
-//      __bss first 8 MB + __common 2.8 MB   page reads   (~1000 pages, proven)
-//      then at most 150 candidate probes    (8 bytes each)
-//
-//  UObject test: a UE object's first qword is its vtable, which lives in the
-//  module's __const. So *(cand) inside [base+0x10B1F1C0, base+0x15427A10]
-//  means cand really is an object.
+//  No RemoteCall / attach anywhere: that is what was killing the game.
 // ===========================================================================
 
 #define SEG_A_RVA   0x15D89B40ULL
@@ -53,48 +48,97 @@
 #define VT_LO_RVA   0x10B1F1C0ULL
 #define VT_HI_RVA   0x15427A10ULL
 
-#define MAX_PROBES  150
+#define MAX_REGIONS 8192
+#define MAX_CAND    400
 
 #define DF_MH_MAGIC_64  0xFEEDFACFu
 #define DF_CPU_ARM64    0x0100000Cu
 #define DF_MH_EXECUTE   2u
 
-static uint64_t g_base = 0;
-static uint64_t g_modHi = 0;
+// implemented in TaskRop/VM.m
+extern void vm_map_iterate_entries(uint64_t vm_map_ptr,
+    void (^itBlock)(uint64_t start, uint64_t end, uint64_t entry, BOOL *stop));
 
-static int dfIsPtr(uint64_t v)
+static uint64_t g_regStart[MAX_REGIONS];
+static uint64_t g_regEnd[MAX_REGIONS];
+static int      g_nReg = 0;
+
+static uint64_t g_base = 0, g_modHi = 0, g_vtLo = 0, g_vtHi = 0;
+
+// binary search over the sorted region list
+static BOOL inRegion(uint64_t a, uint64_t len)
 {
-    if (v < g_modHi) return 0;
-    if (v >= 0x1A0000000ULL) return 0;
-    if (v & 7) return 0;
-    return 1;
+    if (!len) len = 1;
+    if (a + len < a) return NO;
+    int lo = 0, hi = g_nReg - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        if (a < g_regStart[mid]) hi = mid - 1;
+        else if (a >= g_regEnd[mid]) lo = mid + 1;
+        else return (a + len <= g_regEnd[mid]);
+    }
+    return NO;
 }
 
-static int dfCmp(const void *a, const void *b)
+// Every read goes through here.
+static BOOL srd(uint64_t addr, void *dst, size_t len)
 {
-    uint64_t x = *(const uint64_t *)a;
-    uint64_t y = *(const uint64_t *)b;
-    if (x < y) return -1;
-    if (x > y) return 1;
-    return 0;
+    if (!inRegion(addr, len)) return NO;
+    return kum_read(addr, dst, len);
 }
 
-static uint64_t dfFindBase(uint64_t mapMin, uint64_t mapMax,
-                           NSMutableString *out)
+static uint64_t srd64(uint64_t a)
 {
-    const uint64_t STEP = 0x4000, WINDOW = 0x4000000ULL;
-    uint64_t start = mapMin & ~(STEP - 1);
-    uint64_t limit = start + WINDOW;
-    if (limit > mapMax) limit = mapMax;
+    uint64_t v = 0;
+    if (!srd(a, &v, 8)) return 0;
+    return v;
+}
 
+static BOOL isHeapPtr(uint64_t v)
+{
+    if (v < g_modHi) return NO;
+    if (v >= 0x8000000000ULL) return NO;
+    if (v & 7) return NO;
+    return YES;
+}
+
+static BOOL isObject(uint64_t addr)
+{
+    uint64_t vt = srd64(addr);
+    if (!vt) return NO;
+    return (vt >= g_vtLo && vt <= g_vtHi);
+}
+
+// TArray { Data, Num, Max } at [addr + off], read from an already-loaded block
+static BOOL parseTArray(const uint8_t *blk, size_t blkLen, size_t off,
+                        uint64_t *data, uint32_t *num, uint32_t *max)
+{
+    if (off + 0x10 > blkLen) return NO;
+    uint64_t d; uint32_t n, m;
+    memcpy(&d, blk + off, 8);
+    memcpy(&n, blk + off + 8, 4);
+    memcpy(&m, blk + off + 0xC, 4);
+    if (!isHeapPtr(d)) return NO;
+    if (n < 1 || n > 2000000) return NO;
+    if (m < n || m > n * 2 + 4096) return NO;
+    *data = d; *num = n; *max = m;
+    return YES;
+}
+
+static uint64_t findBase(void)
+{
     uint32_t mh[8];
-    for (uint64_t va = start; va < limit; va += STEP) {
-        if (!kum_read(va, mh, sizeof(mh))) continue;
-        if (mh[0] != DF_MH_MAGIC_64) continue;
-        if (mh[1] != DF_CPU_ARM64) continue;
-        if (mh[3] != DF_MH_EXECUTE) continue;
-        [out appendFormat:@"base 0x%llx ncmds=%u\n", va, mh[4]];
-        return va;
+    for (int i = 0; i < g_nReg; i++) {
+        uint64_t s = g_regStart[i];
+        uint64_t lim = s + 0x40000;
+        if (lim > g_regEnd[i]) lim = g_regEnd[i];
+        for (uint64_t va = s; va + 32 <= lim; va += 0x4000) {
+            if (!srd(va, mh, sizeof(mh))) continue;
+            if (mh[0] != DF_MH_MAGIC_64) continue;
+            if (mh[1] != DF_CPU_ARM64) continue;
+            if (mh[3] != DF_MH_EXECUTE) continue;
+            return va;
+        }
     }
     return 0;
 }
@@ -102,155 +146,193 @@ static uint64_t dfFindBase(uint64_t mapMin, uint64_t mapMax,
 NSString *df_scan_collect(void)
 {
     NSMutableString *out = [NSMutableString stringWithCapacity:16384];
-    cyanide_log_sync(@"[DF] ===== gworld hunt =====");
+    cyanide_log_sync(@"[DF] ===== vm_map guarded scan =====");
 
     if (!settings_ensure_kernel_ready()) return @"kernel r/w not ready";
 
-    // ---- 1) find the process in the kernel proc list ----
     static proc_entry_t ents[512];
     int n = proc_list_all(ents, 512);
     if (n <= 0) return @"cannot read proc list";
 
     uint64_t procAddr = 0;
     int pid = 0;
-    char name[PROC_NAME_MAX];
-    memset(name, 0, sizeof(name));
-
+    char nm[PROC_NAME_MAX];
+    memset(nm, 0, sizeof(nm));
     for (int i = 0; i < n; i++) {
         char low[PROC_NAME_MAX];
         int j = 0;
-        const char *nm = ents[i].name;
-        for (; nm[j] && j < PROC_NAME_MAX - 1; j++) {
-            char c = nm[j];
+        const char *s = ents[i].name;
+        for (; s[j] && j < PROC_NAME_MAX - 1; j++) {
+            char c = s[j];
             low[j] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : c;
         }
         low[j] = 0;
         if (!procAddr && (strstr(low, "delta") || strstr(low, "dfm"))) {
             procAddr = ents[i].proc;
             pid = (int)ents[i].pid;
-            strncpy(name, nm, PROC_NAME_MAX - 1);
+            strncpy(nm, s, PROC_NAME_MAX - 1);
         }
     }
     if (!procAddr) return @"DeltaForceClient not running";
+    [out appendFormat:@"target = %s pid=%d proc=0x%llx\n", nm, pid, procAddr];
 
-    NSString *procName = [NSString stringWithUTF8String:name];
-    [out appendFormat:@"target = %s  pid=%d  proc=0x%llx\n", name, pid, procAddr];
+    if (!kum_prepare(procAddr)) return @"kum_prepare FAILED";
 
-    // ---- 2) attach: 4 s, NO bypass, exact proc (same as the app) ----
-    g_RC_targetProcOverride = procAddr;
-    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-    RemoteCallSession *session =
-        [[RemoteCallSession alloc] initWithProcess:procName
-                               useMigFilterBypass:NO
-                          firstExceptionTimeoutMS:4000];
-    g_RC_targetProcOverride = 0;
-    double attachMS = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+    // ---- enumerate the target's real mapped regions ----
+    uint64_t task = proc_task(procAddr);
+    uint64_t vmMap = task ? task_get_vm_map(task) : 0;
+    [out appendFormat:@"task=0x%llx vm_map=0x%llx\n", task, vmMap];
+    if (!vmMap) return @"no vm_map";
 
-    if (session) {
-        cyanide_log_sync(@"[DF] attach OK %.0fms", attachMS);
-        [out appendFormat:@"attach: OK  %.0f ms\n", attachMS];
-    } else {
-        RemoteCallInitFailure f = remote_call_last_init_failure();
-        const char *d = remote_call_init_failure_description(f);
-        cyanide_log_sync(@"[DF] attach failed %.0fms reason=%d %s", attachMS, (int)f, d);
-        [out appendFormat:@"attach: failed %.0f ms  reason=%d (%s)\n",
-                          attachMS, (int)f, d];
+    g_nReg = 0;
+    vm_map_iterate_entries(vmMap, ^(uint64_t s, uint64_t e, uint64_t entry, BOOL *stop) {
+        if (e <= s) return;
+        if (g_nReg < MAX_REGIONS) {
+            g_regStart[g_nReg] = s;
+            g_regEnd[g_nReg] = e;
+            g_nReg++;
+        }
+    });
+
+    uint64_t mapped = 0;
+    for (int i = 0; i < g_nReg; i++) mapped += (g_regEnd[i] - g_regStart[i]);
+    [out appendFormat:@"regions=%d  mapped=%.1f MB\n", g_nReg, mapped / 1048576.0];
+    cyanide_log_sync(@"[DF] regions=%d mapped=%.1fMB", g_nReg, mapped / 1048576.0);
+
+    // show the biggest ones for context
+    for (int i = 0; i < g_nReg && i < 6; i++) {
+        [out appendFormat:@"  [0x%llx, 0x%llx)  %.1f MB\n",
+                          g_regStart[i], g_regEnd[i],
+                          (g_regEnd[i] - g_regStart[i]) / 1048576.0];
     }
+    [out appendString:@"\n"];
 
-    // ---- 3) kernel page-table read (works whether attach succeeded or not) ----
-    if (!kum_prepare(procAddr)) {
-        [out appendString:@"kum_prepare FAILED\n"];
-        if (session) [session destroyRemoteCall];
-        return out;
-    }
+    if (g_nReg < 4) return @"vm_map walk produced too few regions";
 
-    uint64_t base = dfFindBase(kum_map_min(), kum_map_max(), out);
-    if (!base) {
-        [out appendString:@"main exec not found\n"];
-        if (session) [session destroyRemoteCall];
-        return out;
-    }
-    g_base = base;
-    g_modHi = base + MOD_SIZE;
-    uint64_t vtLo = base + VT_LO_RVA;
-    uint64_t vtHi = base + VT_HI_RVA;
-    [out appendFormat:@"vtable range = [0x%llx, 0x%llx]\n", vtLo, vtHi];
+    // ---- base ----
+    g_base = findBase();
+    if (!g_base) { [out appendString:@"main exec not found\n"]; return out; }
+    g_modHi = g_base + MOD_SIZE;
+    g_vtLo = g_base + VT_LO_RVA;
+    g_vtHi = g_base + VT_HI_RVA;
+    [out appendFormat:@"base 0x%llx\nvtable [0x%llx, 0x%llx]\n",
+                      g_base, g_vtLo, g_vtHi];
 
-    // ---- 4) read __bss + __common (page granular; unmapped pages skipped) ----
+    // ---- read __bss + __common (guarded) ----
     uint64_t total = SEG_A_SIZE + SEG_B_SIZE;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
-    if (!buf) {
-        if (session) [session destroyRemoteCall];
-        return @"malloc failed";
-    }
+    if (!buf) return @"oom";
     memset(buf, 0, (size_t)total);
 
-    CFAbsoluteTime tr = CFAbsoluteTimeGetCurrent();
     const uint64_t PAGE = 0x4000;
-    uint64_t off = 0;
-    uint64_t ok = 0;
-    int failPages = 0;
+    uint64_t off = 0, ok = 0;
+    int skipped = 0;
     while (off < total) {
-        uint64_t chunk = total - off;
-        if (chunk > PAGE) chunk = PAGE;
+        uint64_t len = total - off;
+        if (len > PAGE) len = PAGE;
         uint64_t rva = (off < SEG_A_SIZE) ? (SEG_A_RVA + off)
                                           : (SEG_B_RVA + (off - SEG_A_SIZE));
-        if (kum_read(base + rva, buf + off, (size_t)chunk)) ok += chunk;
-        else ++failPages;
-        off += chunk;
+        if (srd(g_base + rva, buf + off, (size_t)len)) ok += len;
+        else ++skipped;
+        off += len;
     }
-    double readMS = (CFAbsoluteTimeGetCurrent() - tr) * 1000.0;
-    [out appendFormat:@"read %llu/%llu ok=%llu failpages=%d  %.0f ms\n\n",
-                      off, total, ok, failPages, readMS];
-    cyanide_log_sync(@"[DF] read ok=%llu failpages=%d %.0fms", ok, failPages, readMS);
+    [out appendFormat:@"read ok=%llu/%llu skipped_pages=%d\n\n", ok, total, skipped];
+    cyanide_log_sync(@"[DF] read ok=%llu skipped=%d", ok, skipped);
 
-    // ---- 5) candidate slots: heap pointers referenced >= 2 times ----
-    size_t count = (size_t)(off / 8);
-    uint64_t *vals = (uint64_t *)malloc(count * 8);
-    if (!vals) { free(buf); if (session) [session destroyRemoteCall]; return @"oom"; }
-    size_t nv = 0;
-    for (size_t i = 0; i < count; i++) {
+    // ---- collect heap pointers from the dump ----
+    size_t nslots = (size_t)(off / 8);
+    uint64_t *slots = (uint64_t *)malloc(nslots * 8);
+    if (!slots) { free(buf); return @"oom2"; }
+    size_t ns = 0;
+    for (size_t i = 0; i < nslots; i++) {
         uint64_t v;
         memcpy(&v, buf + i * 8, 8);
-        if (dfIsPtr(v)) vals[nv++] = v;
+        if (isHeapPtr(v)) slots[ns++] = v;
     }
-    qsort(vals, nv, 8, dfCmp);
+    [out appendFormat:@"heap-pointer slots = %zu\n", ns];
 
-    static uint64_t uniq[400000];
-    static uint32_t refs[400000];
-    size_t nu = 0;
-    for (size_t i = 0; i < nv; ) {
-        size_t j = i;
-        while (j < nv && vals[j] == vals[i]) j++;
-        if (nu < 400000) { uniq[nu] = vals[i]; refs[nu] = (uint32_t)(j - i); nu++; }
-        i = j;
+    // ---- verify objects (guarded, capped) ----
+    uint64_t *objs = (uint64_t *)malloc(sizeof(uint64_t) * MAX_CAND * 4);
+    size_t no = 0;
+    size_t limit = ns < 3000 ? ns : 3000;
+    for (size_t i = 0; i < limit && no < MAX_CAND * 4; i++) {
+        uint64_t c = slots[i];
+        if (!isObject(c)) continue;
+        BOOL dup = NO;
+        for (size_t k = 0; k < no; k++) if (objs[k] == c) { dup = YES; break; }
+        if (!dup) objs[no++] = c;
     }
-    free(vals);
-    [out appendFormat:@"heap pointers=%zu  unique=%zu\n\n", nv, nu];
+    [out appendFormat:@"verified UObjects = %zu\n", no];
 
-    // ---- 6) vtable check on candidates referenced >= 2 times ----
-    int probed = 0, objects = 0;
-    for (size_t i = 0; i < nu && probed < MAX_PROBES; i++) {
-        if (refs[i] < 2) continue;
+    // ---- find UWorld: object with a TArray whose first element is an object
+    //      that has an Actors TArray at +0x28 ----
+    uint64_t world = 0, levelsData = 0;
+    static uint8_t blk[0x400];
 
-        uint64_t cand = uniq[i];
-        uint64_t first = 0;
-        ++probed;
-        if (!kum_read(cand, &first, 8)) continue;
-        if (first < vtLo || first > vtHi) continue;
+    for (size_t i = 0; i < no && !world; i++) {
+        uint64_t cand = objs[i];
+        if (!srd(cand, blk, 0x320)) continue;
 
-        ++objects;
-        if (objects <= 40) {
-            [out appendFormat:@"  OBJECT 0x%llx  vtable=0x%llx  refs=%u\n",
-                              cand, first, refs[i]];
+        for (size_t o = 0x08; o <= 0x300; o += 8) {
+            uint64_t d; uint32_t nn, mm;
+            if (!parseTArray(blk, 0x320, o, &d, &nn, &mm)) continue;
+            if (nn > 100000) continue;
+
+            uint64_t lv = srd64(d);
+            if (!isHeapPtr(lv)) continue;
+            if (lv < g_base + 0x1000) continue;
+            if (!isObject(lv)) continue;
+
+            uint8_t lb[0x40];
+            if (!srd(lv, lb, sizeof(lb))) continue;
+            uint64_t data; uint32_t num, mx;
+            if (!parseTArray(lb, sizeof(lb), 0x28, &data, &num, &mx)) continue;
+
+            uint64_t a0 = srd64(data);
+            if (!isHeapPtr(a0)) continue;
+
+            world = cand; levelsData = d;
+            [out appendFormat:@"WORLD 0x%llx levels@+0x%llx n=%u level0=0x%llx "
+                              @"actors=0x%llx an=%u\n",
+                              world, (unsigned long)o, nn, lv, data, num];
+            break;
         }
     }
 
-    [out appendFormat:@"\nprobed=%d  objects=%d\n", probed, objects];
+    if (!world) {
+        [out appendFormat:@"\nNO UWorld among %zu objects\n", no];
+        free(objs); free(slots); free(buf);
+        return out;
+    }
 
-    free(buf);
-    if (session) [session destroyRemoteCall];
-    cyanide_log_sync(@"[DF] ===== done probed=%d objects=%d =====", probed, objects);
+    // ---- GWorld slot ----
+    for (size_t i = 0; i < nslots; i++) {
+        uint64_t v;
+        memcpy(&v, buf + i * 8, 8);
+        if (v != world) continue;
+        uint64_t rva = (i * 8 < SEG_A_SIZE) ? (SEG_A_RVA + i * 8)
+                                            : (SEG_B_RVA + (i * 8 - SEG_A_SIZE));
+        [out appendFormat:@"GWORLD_SLOT = base + 0x%llx\n", rva];
+        cyanide_log_sync(@"[DF] GWORLD slot rva=0x%llx", rva);
+    }
+
+    // ---- level + actors ----
+    {
+        uint64_t lv = srd64(levelsData);
+        uint8_t lb[0x40];
+        if (srd(lv, lb, sizeof(lb))) {
+            uint64_t data; uint32_t num, mx;
+            if (parseTArray(lb, sizeof(lb), 0x28, &data, &num, &mx)) {
+                [out appendFormat:@"ULevel 0x%llx Actors 0x%llx n=%u\n", lv, data, num];
+                uint32_t shown = num < 10 ? num : 10;
+                for (uint32_t k = 0; k < shown; k++)
+                    [out appendFormat:@"  actor[%u]=0x%llx\n",
+                                      k, srd64(data + (uint64_t)k * 8)];
+            }
+        }
+    }
+
+    free(objs); free(slots); free(buf);
     return out;
 }
 
