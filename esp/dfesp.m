@@ -14,12 +14,20 @@
 
 #import <Foundation/Foundation.h>
 #import <mach/mach.h>
-#import <mach/mach_vm.h>
+#import <mach/mach_types.h>
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+// <mach/mach_vm.h> is marked unsupported in the iOS SDK, so declare the
+// (stable, exported) symbol directly.
+extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
+                                            mach_vm_address_t address,
+                                            mach_vm_size_t size,
+                                            mach_vm_address_t data,
+                                            mach_vm_size_t *outsize);
 
 #define OUT_PATH        "/var/mobile/df_result.txt"
 #define MOD_SIZE        0x16BFE1F0ULL
