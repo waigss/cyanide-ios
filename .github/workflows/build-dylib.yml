@@ -1,0 +1,76 @@
+name: Build dfesp dylib
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: Attach the built dylib to a GitHub Release
+        type: boolean
+        default: true
+  push:
+    paths:
+      - "esp/**"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build dfesp.dylib
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install ldid
+        run: |
+          set -euo pipefail
+          if ! command -v ldid >/dev/null 2>&1; then
+            brew install ldid || {
+              git clone --depth 1 https://github.com/ProcursusTeam/ldid.git /tmp/ldid
+              make -C /tmp/ldid -j"$(sysctl -n hw.ncpu)"
+              sudo install -m 0755 /tmp/ldid/ldid /usr/local/bin/ldid
+            }
+          fi
+          command -v ldid
+
+      - name: Build
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-version
+          make -C esp
+
+      - name: Verify
+        id: verify
+        run: |
+          set -euo pipefail
+          lib=esp/output/dfesp.dylib
+          test -f "$lib"
+          file "$lib"
+          xcrun --sdk iphoneos dwarfdump --uuid "$lib" || true
+          echo "sha256=$(shasum -a 256 "$lib" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          du -h "$lib"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dfesp-dylib
+          path: esp/output/dfesp.dylib
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: github.event.inputs.publish_release == 'true'
+        run: |
+          set -euo pipefail
+          lib=esp/output/dfesp.dylib
+          tag="dfesp-${GITHUB_RUN_NUMBER}"
+          shasum -a 256 "$lib" > "$lib.sha256"
+          gh release create "$tag" "$lib" "$lib.sha256" \
+            --title "dfesp.dylib ${tag}" \
+            --notes "Injected dylib for Delta Force (UE4.22, iOS ARM64). Inject with TrollFools."
