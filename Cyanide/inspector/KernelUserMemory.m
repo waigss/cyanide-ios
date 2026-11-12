@@ -26,7 +26,6 @@
 #import <string.h>
 #import <stdlib.h>
 #import <mach-o/dyld.h>
-#import <sys/sysctl.h>
 
 static const uint64_t kPageSize      = 0x4000ULL;
 static const uint64_t kPageMask      = 0x3FFFULL;
@@ -49,9 +48,6 @@ static uint64_t gMapMax = 0;
 static uint64_t gTask = 0;
 static uint64_t gInfoOffset = 0;      // task 里 all_image_info_addr 的偏移
 static BOOL gPrepared = NO;
-
-// 物理地址上限：直接映射窗口的边界，kum_prepare 时用 hw.memsize 填真实值
-static uint64_t gPaLimit = 0x100000000ULL;      // 4 GB fallback
 
 // ---------------------------------------------------------------------------
 // 上下文准备
@@ -89,52 +85,11 @@ static BOOL kum_prepare_context(uint64_t proc)
     gWindowOffset = tte - ttep;
     gMapMin = kread64(map + 0x20);
     gMapMax = kread64(map + 0x28);
-
-    // 物理地址上限 = 真实物理内存大小（直接映射窗口的边界）
-    uint64_t memSize = 0;
-    size_t memLen = sizeof(memSize);
-    if (sysctlbyname("hw.memsize", &memSize, &memLen, NULL, 0) == 0 && memSize > 0) {
-        gPaLimit = memSize;
-    }
-    cyanide_log(@"[KUM] 物理地址上限 = 0x%llx（hw.memsize）",
-                (unsigned long long)gPaLimit);
-
     gPrepared = YES;
     return YES;
 }
 
 // 当前上下文里把一段用户地址读到本地；地址未映射返回 NO。
-// ---------------------------------------------------------------------------
-// 物理地址校验
-//
-//  panic 根因：某一级页表项的「有效位」是 1，但物理地址字段是垃圾。旧代码
-//  直接把 (entry & kPaMask) + gWindowOffset 当内核地址去 kread64，一旦这个
-//  换算结果落在未映射的内核空间，内核立刻 panic。
-//
-//  内核直接映射：kva = pa + gWindowOffset。
-//
-//  注意 iOS 的物理地址不是从 0 起算（gPhysBase 通常在 0x800000000 一带），
-//  所以不能用 pa < hw.memsize 判断——那样会把全部合法地址都拒绝掉。
-//
-//  真正要保证的安全性质只有一条：kread64 的目标必须落在内核地址空间内。
-//  垃圾物理地址加上窗口偏移后通常会落到内核空间之外（过小或过大），据此拒绝。
-// ---------------------------------------------------------------------------
-
-static BOOL kum_pa_ok(uint64_t pa, uint64_t extraOff, uint64_t len)
-{
-    if (pa == 0) return NO;
-    if ((pa & kPageMask) != 0) return NO;       // 必须 16KB 页对齐
-
-    uint64_t kva = pa + gWindowOffset;
-    if (kva < VM_MIN_KERNEL_ADDRESS) return NO;
-
-    uint64_t sum = kva + extraOff;
-    if (sum < kva) return NO;                   // 溢出
-    if (sum + len < sum) return NO;             // 溢出
-    if (sum + len > VM_MAX_KERNEL_ADDRESS) return NO;
-    return YES;
-}
-
 static BOOL kum_read_context(uint64_t va, void *dst, size_t len)
 {
     if (!gPrepared || !dst || len == 0) return NO;
@@ -147,26 +102,23 @@ static BOOL kum_read_context(uint64_t va, void *dst, size_t len)
     while (remaining > 0) {
         uint64_t l0Index = (cursor >> kL0Shift) & kL0IndexMask;
         uint64_t e0 = kread64(gRootTable + l0Index * 8);
-        if ((e0 & 3) != 3) return NO;           // 必须是表描述符
+        if ((e0 & 1) == 0) return NO;
 
-        uint64_t l1Index = (cursor >> kL1Shift) & kL1IndexMask;
-        if (!kum_pa_ok(e0 & kPaMask, l1Index * 8, 8)) return NO;
         uint64_t l1Kva = (e0 & kPaMask) + gWindowOffset;
+        uint64_t l1Index = (cursor >> kL1Shift) & kL1IndexMask;
         uint64_t e1 = kread64(l1Kva + l1Index * 8);
-        if ((e1 & 3) != 3) return NO;
+        if ((e1 & 1) == 0 || (e1 & 2) == 0) return NO;
 
-        uint64_t l2Index = (cursor >> kL2Shift) & kL2IndexMask;
-        if (!kum_pa_ok(e1 & kPaMask, l2Index * 8, 8)) return NO;
         uint64_t l2Kva = (e1 & kPaMask) + gWindowOffset;
+        uint64_t l2Index = (cursor >> kL2Shift) & kL2IndexMask;
         uint64_t e2 = kread64(l2Kva + l2Index * 8);
-        if ((e2 & 3) != 3) return NO;
+        if ((e2 & 1) == 0 || (e2 & 2) == 0) return NO;
 
+        uint64_t pageKva = (e2 & kPaMask) + gWindowOffset;
         uint64_t inPage = cursor & kPageMask;
         uint64_t avail = kPageSize - inPage;
         size_t chunk = (size_t)((remaining < avail) ? remaining : avail);
 
-        if (!kum_pa_ok(e2 & kPaMask, inPage, chunk)) return NO;
-        uint64_t pageKva = (e2 & kPaMask) + gWindowOffset;
         kreadbuf(pageKva + inPage, out, (uint64_t)chunk);
 
         out += chunk;
