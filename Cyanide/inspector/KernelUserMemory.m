@@ -50,6 +50,9 @@ static uint64_t gTask = 0;
 static uint64_t gInfoOffset = 0;      // task 里 all_image_info_addr 的偏移
 static BOOL gPrepared = NO;
 
+// 物理地址上限：直接映射窗口的边界，kum_prepare 时用 hw.memsize 填真实值
+static uint64_t gPaLimit = 0x100000000ULL;      // 4 GB fallback
+
 // ---------------------------------------------------------------------------
 // 上下文准备
 // ---------------------------------------------------------------------------
@@ -112,8 +115,6 @@ static BOOL kum_prepare_context(uint64_t proc)
 //  pa + gWindowOffset 就一定是一个有效的内核地址。上限用 hw.memsize 取真实值，
 //  拿不到时退回 4 GB（保守，宁可多拒绝也不要读越界）。
 // ---------------------------------------------------------------------------
-
-static uint64_t gPaLimit = 0x100000000ULL;      // 4 GB fallback
 
 static BOOL kum_pa_ok(uint64_t pa, uint64_t extraOff, uint64_t len)
 {
