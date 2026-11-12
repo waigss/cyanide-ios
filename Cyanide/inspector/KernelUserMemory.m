@@ -111,18 +111,27 @@ static BOOL kum_prepare_context(uint64_t proc)
 //  直接把 (entry & kPaMask) + gWindowOffset 当内核地址去 kread64，一旦这个
 //  换算结果落在未映射的内核空间，内核立刻 panic。
 //
-//  内核直接映射覆盖全部物理内存，所以只要物理地址小于「真实物理内存大小」，
-//  pa + gWindowOffset 就一定是一个有效的内核地址。上限用 hw.memsize 取真实值，
-//  拿不到时退回 4 GB（保守，宁可多拒绝也不要读越界）。
+//  内核直接映射：kva = pa + gWindowOffset。
+//
+//  注意 iOS 的物理地址不是从 0 起算（gPhysBase 通常在 0x800000000 一带），
+//  所以不能用 pa < hw.memsize 判断——那样会把全部合法地址都拒绝掉。
+//
+//  真正要保证的安全性质只有一条：kread64 的目标必须落在内核地址空间内。
+//  垃圾物理地址加上窗口偏移后通常会落到内核空间之外（过小或过大），据此拒绝。
 // ---------------------------------------------------------------------------
 
 static BOOL kum_pa_ok(uint64_t pa, uint64_t extraOff, uint64_t len)
 {
     if (pa == 0) return NO;
-    uint64_t sum = pa + extraOff;
-    if (sum < pa) return NO;                    // 溢出
+    if ((pa & kPageMask) != 0) return NO;       // 必须 16KB 页对齐
+
+    uint64_t kva = pa + gWindowOffset;
+    if (kva < VM_MIN_KERNEL_ADDRESS) return NO;
+
+    uint64_t sum = kva + extraOff;
+    if (sum < kva) return NO;                   // 溢出
     if (sum + len < sum) return NO;             // 溢出
-    if (sum + len > gPaLimit) return NO;
+    if (sum + len > VM_MAX_KERNEL_ADDRESS) return NO;
     return YES;
 }
 
