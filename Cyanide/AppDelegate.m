@@ -10,9 +10,8 @@
 #import "DSKeepAlive.h"
 #import "LogTextView.h"
 #import "inspector/CyanideLog.h"
-#import "inspector/KernelUserMemory.h"
 #import "kexploit/kutils.h"
-#import "kexploit/krw.h"
+#import "TaskRop/RemoteCall.h"
 #import <signal.h>
 #import <sys/stat.h>
 #import <unistd.h>
@@ -20,77 +19,30 @@
 #include <string.h>
 
 // ===========================================================================
-//  Delta Force (UE4.22, iOS ARM64) - HEAP SIGNATURE SCAN
+//  Delta Force - RemoteCall attach probe
 //
-//  Uses kum_read (kernel page-table translation): no attach, no remote thread.
+//  Cyanide has no dylib injection (by design: "No SpringBoard dylibs, no
+//  Substrate hooks"). Its supported cross-process bridge is RemoteCall.
 //
-//  SAFETY RULES:
-//    * Every address read is FIXED and page-aligned. Nothing is derived from a
-//      value found in memory.
-//    * The signature test only inspects values inside the page already read.
-//      It never dereferences them.
+//  Earlier attempts passed useMigFilterBypass = false, which made
+//  init_remote_call time out after ~2 minutes: iOS 17+ filters exception-port
+//  registration through a MIG filter, so the bypass thread is required.
 //
-//  Signature (ULevel::Actors):
-//      [A + 0x28]  heap pointer   (Data)
-//      [A + 0x30]  int32 count    (ArrayNum)  200..200000
-//      [A + 0x34]  int32 max      (ArrayMax)  >= count
+//  This build only proves the channel:
+//    1. find DeltaForceClient in the kernel proc list
+//    2. attach with g_RC_targetProcOverride (exact proc, no name lookup)
+//       and useMigFilterBypass = true
+//    3. read the module header and a few slots to prove remote_read works
 //
-//  A live level during a match has hundreds..thousands of actors, so
-//  requiring count >= 200 removes almost every false positive.
-//
-//  Heap band comes from offline analysis of the __bss dump: every real object
-//  pointer landed in 0x140000000..0x160000000.
+//  No heap scanning, no page-table walking.
 // ===========================================================================
 
-#define MOD_SIZE        0x16BFE1F0ULL
-#define HEAP_LO         0x140000000ULL
-#define HEAP_HI         0x160000000ULL
-#define SCAN_PAGE       0x4000ULL
-#define MIN_ACTORS      200
-#define MAX_ACTORS      200000
-#define MAX_CANDIDATES  4000
-
-#define DF_MH_MAGIC_64  0xFEEDFACFu
-#define DF_CPU_ARM64    0x0100000Cu
-#define DF_MH_EXECUTE   2u
-
 static uint64_t g_dfBase = 0;
-static uint64_t g_dfModHi = 0;
-
-static int dfPlausible(uint64_t v)
-{
-    if (v < g_dfModHi) return 0;
-    if (v >= HEAP_HI + 0x40000000ULL) return 0;
-    if (v & 7) return 0;
-    return 1;
-}
-
-static uint64_t dfFindMainExec(uint64_t mapMin, uint64_t mapMax,
-                               NSMutableString *out)
-{
-    const uint64_t STEP = 0x4000;
-    const uint64_t WINDOW = 0x4000000ULL;
-    uint64_t start = mapMin & ~(STEP - 1);
-    uint64_t limit = start + WINDOW;
-    if (limit > mapMax) limit = mapMax;
-
-    uint32_t mh[8];
-    for (uint64_t va = start; va < limit; va += STEP) {
-        if (!kum_read(va, mh, sizeof(mh))) continue;
-        if (mh[0] != DF_MH_MAGIC_64) continue;
-        if (mh[1] != DF_CPU_ARM64) continue;
-        if (mh[3] != DF_MH_EXECUTE) continue;
-        [out appendFormat:@"base 0x%llx ncmds=%u\n", va, mh[4]];
-        cyanide_log_sync(@"[DF] base 0x%llx ncmds=%u", va, mh[4]);
-        return va;
-    }
-    return 0;
-}
 
 NSString *df_scan_collect(void)
 {
-    NSMutableString *out = [NSMutableString stringWithCapacity:16384];
-    cyanide_log_sync(@"[DF] ===== heap signature scan =====");
+    NSMutableString *out = [NSMutableString stringWithCapacity:8192];
+    cyanide_log_sync(@"[DF] ===== remote-call probe =====");
 
     if (!settings_ensure_kernel_ready()) return @"kernel r/w not ready";
 
@@ -119,76 +71,64 @@ NSString *df_scan_collect(void)
         }
     }
     if (!targetProc) return @"DeltaForceClient not running";
-    [out appendFormat:@"target = %s pid=%d\n", targetName, targetPid];
+    [out appendFormat:@"target = %s  pid=%d  proc=0x%llx\n\n",
+                      targetName, targetPid, targetProc];
 
-    if (!kum_prepare(targetProc)) return @"kum_prepare FAILED";
+    // ---- attach with MIG-filter bypass + exact proc address ----
+    cyanide_log_sync(@"[DF] attach with bypass=true ...");
+    g_RC_targetProcOverride = targetProc;
+    int rc = init_remote_call_with_first_exception_timeout(targetName, true, 60000);
+    g_RC_targetProcOverride = 0;
 
-    uint64_t base = dfFindMainExec(kum_map_min(), kum_map_max(), out);
-    if (!base) {
-        [out appendString:@"main exec not found\n"];
+    [out appendFormat:@"init_remote_call(bypass=YES) rc=%d\n", rc];
+
+    if (rc != 0) {
+        RemoteCallInitFailure f = remote_call_last_init_failure();
+        const char *desc = remote_call_init_failure_description(f);
+        uint32_t fp = remote_call_last_init_failure_pid();
+        cyanide_log_sync(@"[DF] attach FAILED rc=%d failure=%d pid=%u %s",
+                         rc, (int)f, fp, desc);
+        [out appendFormat:@"  failure=%d  pid=%u\n  reason=%s\n",
+                          (int)f, fp, desc];
         return out;
     }
-    g_dfBase = base;
-    g_dfModHi = base + MOD_SIZE;
 
-    [out appendFormat:@"heap band = [0x%llx, 0x%llx)\n\n", HEAP_LO, HEAP_HI];
+    cyanide_log_sync(@"[DF] attached");
+    [out appendString:@"ATTACHED\n\n"];
 
-    static uint8_t page[SCAN_PAGE];
-    static uint64_t cand[MAX_CANDIDATES];
-    int ncand = 0;
+    // ---- prove reads ----
+    uint64_t hdr = do_remote_call_stable(10, "_dyld_get_image_header",
+                                         0, 0, 0, 0, 0, 0, 0, 0);
+    [out appendFormat:@"_dyld_get_image_header(0) = 0x%llx\n", hdr];
 
-    uint64_t pages = (HEAP_HI - HEAP_LO) / SCAN_PAGE;
-    uint64_t readable = 0;
-
-    CFAbsoluteTime t0 = CFAbsoluteTimeGetCurrent();
-
-    for (uint64_t i = 0; i < pages; i++) {
-        uint64_t va = HEAP_LO + i * SCAN_PAGE;
-
-        if ((i % 2048) == 0) {
-            cyanide_log_sync(@"[DF] page %llu/%llu readable=%llu cand=%d",
-                             i, pages, readable, ncand);
+    if (hdr >= 0x100000000ULL) {
+        g_dfBase = hdr;
+        uint32_t mh[8] = {0};
+        if (remote_read(hdr, mh, sizeof(mh))) {
+            [out appendFormat:@"macho magic=0x%08x cputype=0x%08x filetype=%u ncmds=%u\n",
+                              mh[0], mh[1], mh[3], mh[4]];
+        } else {
+            [out appendString:@"remote_read(header) FAILED\n"];
         }
 
-        if (!kum_read(va, page, SCAN_PAGE)) continue;
-        ++readable;
-
-        const uint64_t last = SCAN_PAGE - 0x40;
-        for (uint64_t off = 0; off <= last; off += 8) {
-            uint64_t data;
-            int32_t num, mx;
-            memcpy(&data, page + off + 0x28, 8);
-            memcpy(&num,  page + off + 0x30, 4);
-            memcpy(&mx,   page + off + 0x34, 4);
-
-            if (num < MIN_ACTORS || num > MAX_ACTORS) continue;
-            if (mx < num || mx > num * 2 + 1024) continue;
-            if (!dfPlausible(data)) continue;
-
-            if (ncand < MAX_CANDIDATES) cand[ncand++] = va + off;
+        // read a few globals to prove the channel end-to-end
+        const uint64_t slots[] = {
+            0x15D89B40ULL,   // __bss start
+            0x167B0E40ULL,   // __common start
+        };
+        for (int i = 0; i < 2; i++) {
+            uint64_t v = 0;
+            if (remote_read(hdr + slots[i], &v, 8)) {
+                [out appendFormat:@"  slot base+0x%llx = 0x%llx\n", slots[i], v];
+            } else {
+                [out appendFormat:@"  slot base+0x%llx READ FAIL\n", slots[i]];
+            }
         }
     }
 
-    double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
-    cyanide_log_sync(@"[DF] scan done pages=%llu readable=%llu cand=%d %.0fms",
-                     pages, readable, ncand, ms);
-    [out appendFormat:@"pages=%llu readable=%llu candidates=%d  %.0f ms\n\n",
-                      pages, readable, ncand, ms];
-
-    int shown = 0;
-    for (int i = 0; i < ncand && shown < 40; i++) {
-        uint64_t a = cand[i];
-        uint64_t data = 0;
-        int32_t num = 0, mx = 0;
-        if (!kum_read(a + 0x28, &data, 8)) continue;
-        if (!kum_read(a + 0x30, &num, 4)) continue;
-        if (!kum_read(a + 0x34, &mx, 4)) continue;
-        [out appendFormat:@"  ULevel? 0x%llx  actors=0x%llx  n=%d max=%d\n",
-                          a, data, num, mx];
-        shown++;
-    }
-    if (ncand == 0) [out appendString:@"  (none)\n"];
-
+    destroy_remote_call();
+    [out appendString:@"\nDONE\n"];
+    cyanide_log_sync(@"[DF] ===== probe done =====");
     return out;
 }
 
