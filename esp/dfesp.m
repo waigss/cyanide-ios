@@ -6,22 +6,23 @@
 //  in-process dereference: no kernel R/W, no exception port hijack,
 //  therefore no kernel panic and no risk of killing the game.
 //
-//  Build:  xcrun --sdk iphoneos clang -arch arm64e -dynamiclib ...
-//  Install: inject with TrollFools (or repackage the IPA)
+//  Build:   make -C esp          (xcrun iphoneos clang -dynamiclib)
+//  Install: Sideloadly "Inject dylib", or TrollFools
 //
-//  Output: /var/mobile/df_result.txt  + NSLog
+//  Output: the result is shown in an alert inside the game and copied to the
+//  pasteboard, because a sideloaded (sandboxed) app cannot write /var/mobile.
 //
 
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
 #import <mach/mach.h>
 #import <mach/mach_types.h>
 #import <mach-o/dyld.h>
-#import <mach-o/loader.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
-// <mach/mach_vm.h> is marked unsupported in the iOS SDK, so declare the
+// <mach/mach_vm.h> is marked unsupported in the iOS SDK; declare the
 // (stable, exported) symbol directly.
 extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
                                             mach_vm_address_t address,
@@ -29,7 +30,6 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
                                             mach_vm_address_t data,
                                             mach_vm_size_t *outsize);
 
-#define OUT_PATH        "/var/mobile/df_result.txt"
 #define MOD_SIZE        0x16BFE1F0ULL
 #define BSS_RVA         0x15D89B40ULL
 #define BSS_SIZE        0x00A272F8ULL
@@ -37,7 +37,7 @@ extern kern_return_t mach_vm_read_overwrite(vm_map_t target_task,
 #define COM_SIZE        0x002B43D0ULL
 #define VT_LO_RVA       0x10B1F1C0ULL
 #define VT_HI_RVA       0x15427A10ULL
-#define MAX_OBJ         200000
+#define MAX_OBJ         300000
 
 static uint64_t gBase = 0, gModHi = 0, gVtLo = 0, gVtHi = 0;
 static NSMutableString *gOut = nil;
@@ -71,13 +71,13 @@ static uint32_t rd32(uint64_t a)
 
 static BOOL isHeapPtr(uint64_t v)
 {
-    if (v < gModHi) return NO;           // must be above the module
+    if (v < gModHi) return NO;
     if (v >= 0x8000000000ULL) return NO;
     if (v & 7) return NO;
     return YES;
 }
 
-// A UE object starts with a vtable pointer that lives in the module's __const.
+// A UE object starts with a vtable pointer living in the module's __const.
 static BOOL isObject(uint64_t addr)
 {
     uint64_t vt = rd64(addr);
@@ -99,17 +99,7 @@ static BOOL readTArray(uint64_t addr, uint64_t off,
     return YES;
 }
 
-static uint64_t findBase(void)
-{
-    uint64_t h = (uint64_t)(uintptr_t)_dyld_get_image_header(0);
-    if (!h) return 0;
-    uint32_t mh[8] = {0};
-    if (!rd(h, mh, sizeof(mh))) return 0;
-    if (mh[0] != 0xFEEDFACF) return 0;
-    return h;
-}
-
-static void logf_(NSString *fmt, ...)
+static void say(NSString *fmt, ...)
 {
     va_list ap;
     va_start(ap, fmt);
@@ -122,24 +112,26 @@ static void logf_(NSString *fmt, ...)
 
 static void run(void)
 {
-    gOut = [NSMutableString stringWithCapacity:65536];
+    gOut = [NSMutableString stringWithCapacity:16384];
 
-    gBase = findBase();
-    if (!gBase) {
-        logf_(@"no base");
-        goto done;
-    }
-    gModHi = gBase + MOD_SIZE;
-    gVtLo  = gBase + VT_LO_RVA;
-    gVtHi  = gBase + VT_HI_RVA;
+    uint64_t hdr = (uint64_t)(uintptr_t)_dyld_get_image_header(0);
+    if (!hdr) { say(@"no image header"); return; }
 
-    logf_(@"base   = 0x%llx", gBase);
-    logf_(@"vtable = [0x%llx, 0x%llx]", gVtLo, gVtHi);
+    uint32_t mh[8] = {0};
+    if (!rd(hdr, mh, sizeof(mh))) { say(@"cannot read header"); return; }
+
+    gBase  = hdr;
+    gModHi = hdr + MOD_SIZE;
+    gVtLo  = hdr + VT_LO_RVA;
+    gVtHi  = hdr + VT_HI_RVA;
+
+    say(@"base   0x%llx  magic=0x%08x ncmds=%u", hdr, mh[0], mh[4]);
+    say(@"vtable [0x%llx, 0x%llx]", gVtLo, gVtHi);
 
     // ---- read __bss + __common ----
     uint64_t total = BSS_SIZE + COM_SIZE;
     uint8_t *buf = (uint8_t *)malloc((size_t)total);
-    if (!buf) { logf_(@"oom"); goto done; }
+    if (!buf) { say(@"oom"); return; }
     memset(buf, 0, (size_t)total);
 
     const uint64_t PAGE = 0x4000;
@@ -154,114 +146,124 @@ static void run(void)
         else ++fail;
         off += n;
     }
-    logf_(@"read %llu/%llu ok=%llu failpages=%d", off, total, ok, fail);
+    say(@"read ok=%llu/%llu failpages=%d", ok, total, fail);
 
-    // ---- collect global slots holding heap pointers ----
     size_t nslots = (size_t)(off / 8);
     uint64_t *slots = (uint64_t *)malloc(nslots * 8);
+    if (!slots) { say(@"oom2"); free(buf); return; }
     size_t ns = 0;
     for (size_t i = 0; i < nslots; i++) {
         uint64_t v;
         memcpy(&v, buf + i * 8, 8);
         if (isHeapPtr(v)) slots[ns++] = v;
     }
-    logf_(@"heap-pointer slots = %zu", ns);
+    say(@"heap slots = %zu", ns);
 
-    // ---- vtable-verify each slot's target; keep real objects ----
+    // ---- verified UObjects ----
     uint64_t *objs = (uint64_t *)malloc(MAX_OBJ * 8);
     size_t no = 0;
-    size_t limit = ns < 40000 ? ns : 40000;
+    size_t limit = ns < 60000 ? ns : 60000;
     for (size_t i = 0; i < limit && no < MAX_OBJ; i++) {
         uint64_t c = slots[i];
         if (!isObject(c)) continue;
-        // dedupe cheaply
         BOOL dup = NO;
         for (size_t k = 0; k < no; k++) if (objs[k] == c) { dup = YES; break; }
         if (!dup) objs[no++] = c;
     }
-    logf_(@"verified UObjects = %zu", no);
+    say(@"UObjects = %zu", no);
 
-    // ---- find UWorld: some offset holds a TArray of objects,
-    //      and the first element has an Actors TArray at +0x28 ----
-    uint64_t world = 0, levelsData = 0, levelsOff = 0;
-    uint32_t levelsNum = 0;
-
+    // ---- find UWorld ----
+    uint64_t world = 0, levelsData = 0;
     for (size_t i = 0; i < no && !world; i++) {
         uint64_t cand = objs[i];
         for (uint64_t o = 0x08; o <= 0x300; o += 8) {
             uint64_t d; uint32_t n, m;
             if (!readTArray(cand, o, &d, &n, &m)) continue;
             if (n > 100000) continue;
-
             uint64_t lv = rd64(d);
-            if (!isHeapPtr(lv)) continue;
-            if (!isObject(lv)) continue;
-
+            if (!isHeapPtr(lv) || !isObject(lv)) continue;
             uint64_t act; uint32_t an, am;
             if (!readTArray(lv, 0x28, &act, &an, &am)) continue;
-            if (an > 200000) continue;
-
             uint64_t a0 = rd64(act);
             if (!isHeapPtr(a0)) continue;
 
-            world = cand; levelsData = d; levelsOff = o; levelsNum = n;
-            logf_(@"WORLD 0x%llx  levels@+0x%llx n=%u  level0=0x%llx actors=0x%llx an=%u",
-                  world, o, n, lv, act, an);
+            world = cand; levelsData = d;
+            say(@"WORLD 0x%llx levels@+0x%llx n=%u level0=0x%llx actors=0x%llx an=%u",
+                world, o, n, lv, act, an);
             break;
         }
     }
 
     if (!world) {
-        logf_(@"no UWorld found among %zu objects", no);
-        goto done;
+        say(@"NO UWorld among %zu objects", no);
+        free(objs); free(slots); free(buf);
+        return;
     }
 
-    // ---- locate the global slot that holds this UWorld = GWorld ----
+    // ---- global slot holding this UWorld = GWorld ----
     for (size_t i = 0; i < nslots; i++) {
         uint64_t v;
         memcpy(&v, buf + i * 8, 8);
         if (v != world) continue;
         uint64_t rva = (i * 8 < BSS_SIZE) ? (BSS_RVA + i * 8)
                                           : (COM_RVA + (i * 8 - BSS_SIZE));
-        logf_(@"GWORLD_SLOT = base + 0x%llx", rva);
+        say(@"GWORLD_SLOT = base + 0x%llx", rva);
     }
 
-    // ---- dump the level and its actors ----
+    // ---- level + actors ----
     {
         uint64_t lv = rd64(levelsData);
         uint64_t act; uint32_t an, am;
         if (readTArray(lv, 0x28, &act, &an, &am)) {
-            logf_(@"ULevel 0x%llx  Actors 0x%llx  count=%u", lv, act, an);
-            uint32_t k, shown = an < 16 ? an : 16;
-            for (k = 0; k < shown; k++) {
-                uint64_t a = rd64(act + (uint64_t)k * 8);
-                logf_(@"  actor[%u] = 0x%llx", k, a);
-            }
-        }
-
-        uint8_t lvbuf[0x200];
-        if (rd(lv, lvbuf, sizeof(lvbuf))) {
-            logf_(@"ULevel raw 0x200:");
-            for (int r = 0; r < 0x200; r += 16) {
-                NSMutableString *line = [NSMutableString stringWithFormat:@"%03X ", r];
-                for (int j = 0; j < 16; j++)
-                    [line appendFormat:@"%02X", lvbuf[r + j]];
-                logf_(@"%@", line);
-            }
+            say(@"ULevel 0x%llx Actors 0x%llx n=%u", lv, act, an);
+            uint32_t shown = an < 12 ? an : 12;
+            for (uint32_t k = 0; k < shown; k++)
+                say(@"  actor[%u]=0x%llx", k, rd64(act + (uint64_t)k * 8));
+        } else {
+            say(@"level actors unreadable");
         }
     }
 
-done:
-    [gOut writeToFile:@OUT_PATH atomically:YES encoding:NSUTF8StringEncoding error:nil];
-    NSLog(@"[DFESP] done -> %s", OUT_PATH);
+    free(objs); free(slots); free(buf);
+}
+
+static void present(void)
+{
+    // Sandboxed app -> cannot write /var/mobile. Show it in-app instead.
+    NSString *docs = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents"];
+    [gOut writeToFile:[docs stringByAppendingPathComponent:@"df_result.txt"]
+           atomically:YES encoding:NSUTF8StringEncoding error:nil];
+
+    [UIPasteboard generalPasteboard].string = gOut;
+
+    UIWindow *key = nil;
+    for (UIWindow *w in [UIApplication sharedApplication].windows)
+        if (w.isKeyWindow) { key = w; break; }
+    if (!key) key = [UIApplication sharedApplication].windows.firstObject;
+
+    UIViewController *root = key.rootViewController;
+    while (root.presentedViewController) root = root.presentedViewController;
+    if (!root) return;
+
+    UIAlertController *a =
+        [UIAlertController alertControllerWithTitle:@"DFESP result"
+                                            message:gOut
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [a addAction:[UIAlertAction actionWithTitle:@"OK"
+                                          style:UIAlertActionStyleDefault
+                                        handler:nil]];
+    [root presentViewController:a animated:YES completion:nil];
 }
 
 __attribute__((constructor))
 static void dfesp_boot(void)
 {
-    // Wait for the engine and the first level to finish loading.
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(20 * NSEC_PER_SEC)),
+    // Let the engine boot and load the first level.
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(25 * NSEC_PER_SEC)),
                    dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         run();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            present();
+        });
     });
 }
