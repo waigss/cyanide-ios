@@ -123,6 +123,12 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     return self;
 }
 
+- (void)viewWillAppear:(BOOL)animated
+{
+    [super viewWillAppear:animated];
+    [self rebuildToolsMenu];
+}
+
 - (void)viewDidLoad
 {
     [super viewDidLoad];
@@ -130,23 +136,53 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     self.title = self.processName.length > 0 ? self.processName : @"库";
     self.tableView.rowHeight = 62.0;
 
-    self.navigationItem.rightBarButtonItems = @[
-        [[UIBarButtonItem alloc] initWithTitle:@"链"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(showPointerChain)],
-        [[UIBarButtonItem alloc] initWithTitle:@"读内存"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(showMemoryReader)],
-        [[UIBarButtonItem alloc] initWithTitle:@"探针"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(showProbeList)],
-    ];
+    [self rebuildToolsMenu];
 
     [self buildPlaceholderView];
     [self loadModules];
+}
+
+#pragma mark - 工具菜单
+
+- (void)rebuildToolsMenu
+{
+    __weak typeof(self) weakSelf = self;
+
+    NSMutableArray<UIMenuElement *> *items = [NSMutableArray array];
+
+    [items addObject:[UIAction actionWithTitle:@"指针链"
+                                         image:[UIImage systemImageNamed:@"link"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showPointerChain];
+    }]];
+
+    [items addObject:[UIAction actionWithTitle:@"读内存"
+                                         image:[UIImage systemImageNamed:@"memorychip"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showMemoryReader];
+    }]];
+
+    [items addObject:[UIAction actionWithTitle:@"探针表"
+                                         image:[UIImage systemImageNamed:@"smallcircle.filled.circle"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showProbeList];
+    }]];
+
+    NSString *watchTitle = self.watching ? @"停止后台监听" : @"后台监听";
+    UIImage *watchIcon = [UIImage systemImageNamed:self.watching ? @"stop.circle" : @"antenna.radiowaves.left.and.right"];
+    [items addObject:[UIAction actionWithTitle:watchTitle
+                                         image:watchIcon
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf toggleBackgroundWatch];
+    }]];
+
+    self.navigationItem.rightBarButtonItem =
+        [[UIBarButtonItem alloc] initWithImage:[UIImage systemImageNamed:@"wrench.and.screwdriver"]
+                                        menu:[UIMenu menuWithTitle:@"工具" children:items]];
 }
 
 - (void)presentAlertWithTitle:(NSString *)title message:(NSString *)message
@@ -727,7 +763,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
 
     self.watching = YES;
     self.watchAttempt = 0;
-    self.navigationItem.rightBarButtonItem.title = @"停止监听";
+    [self rebuildToolsMenu];
 
     // 切到目标 App 后本进程要活着才能继续重试。
     ds_keepalive_apply_enabled(YES);
@@ -762,7 +798,7 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
 - (void)stopBackgroundWatch
 {
     self.watching = NO;
-    self.navigationItem.rightBarButtonItem.title = @"后台监听";
+    [self rebuildToolsMenu];
 
     if (self.watchTimer) {
         dispatch_source_cancel(self.watchTimer);
