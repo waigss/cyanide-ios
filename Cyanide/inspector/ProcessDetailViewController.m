@@ -33,6 +33,7 @@
 #import "MemoryReaderViewController.h"
 #import "ProbeListViewController.h"
 #import "PointerChainViewController.h"
+#import "SymbolListViewController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -162,6 +163,13 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                     identifier:nil
                                        handler:^(UIAction *a) {
         [weakSelf showMemoryReader];
+    }]];
+
+    [items addObject:[UIAction actionWithTitle:@"主程序符号"
+                                         image:[UIImage systemImageNamed:@"textformat.abc"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showMainExecutableSymbols];
     }]];
 
     [items addObject:[UIAction actionWithTitle:@"探针表"
@@ -670,6 +678,12 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
         [self dumpModuleAtPath:path displayName:name];
     }]];
 
+    [sheet addAction:[UIAlertAction actionWithTitle:@"查看符号（不附加）"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *a) {
+        [self showSymbolsForModuleBase:base name:name];
+    }]];
+
     [sheet addAction:[UIAlertAction actionWithTitle:@"直接读内存（前 64 字节，不附加）"
                                               style:UIAlertActionStyleDefault
                                             handler:^(UIAlertAction *a) {
@@ -683,6 +697,28 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
 
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+- (void)showMainExecutableSymbols
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    if (!kum_prepare(self.procAddr)) {
+        [self presentAlertWithTitle:@"不可用" message:@"页表上下文准备失败。"];
+        return;
+    }
+
+    uint64_t base = 0;
+    if (!kum_main_executable_base(&base)) {
+        [self presentAlertWithTitle:@"未找到主程序" message:@"没能定位主程序基址。"];
+        return;
+    }
+
+    [self showSymbolsForModuleBase:base name:[NSString stringWithFormat:@"%@ 主程序", self.processName]];
 }
 
 #pragma mark - 指针链
@@ -980,6 +1016,25 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     }
 
     return report;
+}
+
+#pragma mark - 符号
+
+- (void)showSymbolsForModuleBase:(uint64_t)base name:(NSString *)name
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    SymbolListViewController *symbols =
+        [[SymbolListViewController alloc] initWithProcessName:self.processName
+                                                          pid:self.pid
+                                                     procAddr:self.procAddr
+                                                   moduleBase:base
+                                                   moduleName:name];
+    [self.navigationController pushViewController:symbols animated:YES];
 }
 
 #pragma mark - 内核直读内存
