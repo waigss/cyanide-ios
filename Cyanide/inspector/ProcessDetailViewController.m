@@ -32,6 +32,7 @@
 #import "KernelUserMemory.h"
 #import "MemoryReaderViewController.h"
 #import "ProbeListViewController.h"
+#import "PointerChainViewController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -130,6 +131,10 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     self.tableView.rowHeight = 62.0;
 
     self.navigationItem.rightBarButtonItems = @[
+        [[UIBarButtonItem alloc] initWithTitle:@"链"
+                                         style:UIBarButtonItemStylePlain
+                                        target:self
+                                        action:@selector(showPointerChain)],
         [[UIBarButtonItem alloc] initWithTitle:@"读内存"
                                          style:UIBarButtonItemStylePlain
                                         target:self
@@ -138,10 +143,6 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                          style:UIBarButtonItemStylePlain
                                         target:self
                                         action:@selector(showProbeList)],
-        [[UIBarButtonItem alloc] initWithTitle:@"后台监听"
-                                         style:UIBarButtonItemStylePlain
-                                        target:self
-                                        action:@selector(toggleBackgroundWatch)],
     ];
 
     [self buildPlaceholderView];
@@ -646,6 +647,23 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     sheet.popoverPresentationController.sourceRect = [tableView rectForRowAtIndexPath:indexPath];
 
     [self presentViewController:sheet animated:YES completion:nil];
+}
+
+#pragma mark - 指针链
+
+- (void)showPointerChain
+{
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    PointerChainViewController *chain =
+        [[PointerChainViewController alloc] initWithProcessName:self.processName
+                                                             pid:self.pid
+                                                        procAddr:self.procAddr];
+    [self.navigationController pushViewController:chain animated:YES];
 }
 
 #pragma mark - 探针表
