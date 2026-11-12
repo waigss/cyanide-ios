@@ -87,6 +87,14 @@ static BOOL srd(uint64_t addr, void *dst, size_t len)
     return kum_read(addr, dst, len);
 }
 
+static int cmpU64(const void *a, const void *b)
+{
+    uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    if (x < y) return -1;
+    if (x > y) return 1;
+    return 0;
+}
+
 static uint64_t srd64(uint64_t a)
 {
     uint64_t v = 0;
@@ -187,6 +195,8 @@ NSString *df_scan_collect(void)
     g_nReg = 0;
     vm_map_iterate_entries(vmMap, ^(uint64_t s, uint64_t e, uint64_t entry, BOOL *stop) {
         if (e <= s) return;
+        if (s >= 0x8000000000ULL) return;                 // not user space
+        if ((e - s) > 0x100000000ULL) return;             // bogus / implausible
         if (g_nReg < MAX_REGIONS) {
             g_regStart[g_nReg] = s;
             g_regEnd[g_nReg] = e;
@@ -251,36 +261,49 @@ NSString *df_scan_collect(void)
     }
     [out appendFormat:@"heap-pointer slots = %zu\n", ns];
 
-    // ---- verify objects (guarded, capped) ----
-    uint64_t *objs = (uint64_t *)malloc(sizeof(uint64_t) * MAX_CAND * 4);
+    // ---- verify objects: probe EVERY slot (reads are region-guarded) ----
+    uint64_t *objs = (uint64_t *)malloc(sizeof(uint64_t) * ns);
+    if (!objs) { free(slots); free(buf); return @"oom2"; }
     size_t no = 0;
-    size_t limit = ns < 3000 ? ns : 3000;
-    for (size_t i = 0; i < limit && no < MAX_CAND * 4; i++) {
+    for (size_t i = 0; i < ns; i++) {
         uint64_t c = slots[i];
         if (!isObject(c)) continue;
-        BOOL dup = NO;
-        for (size_t k = 0; k < no; k++) if (objs[k] == c) { dup = YES; break; }
-        if (!dup) objs[no++] = c;
+        objs[no++] = c;
     }
+    // dedupe by sort
+    qsort(objs, no, 8, cmpU64);
+    size_t nu2 = 0;
+    for (size_t i = 0; i < no; i++)
+        if (i == 0 || objs[i] != objs[i-1]) objs[nu2++] = objs[i];
+    no = nu2;
+
     [out appendFormat:@"verified UObjects = %zu\n", no];
+    cyanide_log_sync(@"[DF] objects=%zu", no);
 
     // ---- find UWorld: object with a TArray whose first element is an object
     //      that has an Actors TArray at +0x28 ----
     uint64_t world = 0, levelsData = 0;
-    static uint8_t blk[0x400];
+    static uint8_t blk[0x680];
+    static int offHist[256];
+    memset(offHist, 0, sizeof(offHist));
+    int arrHits = 0, objWithArr = 0;
 
     for (size_t i = 0; i < no && !world; i++) {
         uint64_t cand = objs[i];
-        if (!srd(cand, blk, 0x320)) continue;
+        if (!srd(cand, blk, sizeof(blk))) continue;
 
-        for (size_t o = 0x08; o <= 0x300; o += 8) {
+        BOOL anyArr = NO;
+        for (size_t o = 0x08; o + 0x10 <= sizeof(blk) && o <= 0x600; o += 8) {
             uint64_t d; uint32_t nn, mm;
-            if (!parseTArray(blk, 0x320, o, &d, &nn, &mm)) continue;
+            if (!parseTArray(blk, sizeof(blk), o, &d, &nn, &mm)) continue;
             if (nn > 100000) continue;
+
+            ++arrHits;
+            anyArr = YES;
+            offHist[(o - 0x08) / 8]++;
 
             uint64_t lv = srd64(d);
             if (!isHeapPtr(lv)) continue;
-            if (lv < g_base + 0x1000) continue;
             if (!isObject(lv)) continue;
 
             uint8_t lb[0x40];
@@ -297,7 +320,20 @@ NSString *df_scan_collect(void)
                               world, (unsigned long)o, nn, lv, data, num];
             break;
         }
+        if (anyArr) ++objWithArr;
     }
+
+    [out appendFormat:@"objects with >=1 TArray = %d, tarray matches = %d\n",
+                      objWithArr, arrHits];
+    [out appendString:@"offset histogram (top 10):\n"];
+    for (int r = 0; r < 10; r++) {
+        int bi = -1, bv = 0;
+        for (int k = 0; k < 256; k++) if (offHist[k] > bv) { bv = offHist[k]; bi = k; }
+        if (bi < 0) break;
+        [out appendFormat:@"  +0x%03X  x%d\n", 0x08 + bi * 8, bv];
+        offHist[bi] = 0;
+    }
+    [out appendString:@"\n"];
 
     if (!world) {
         [out appendFormat:@"\nNO UWorld among %zu objects\n", no];
