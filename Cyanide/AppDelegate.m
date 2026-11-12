@@ -219,6 +219,18 @@ NSString *df_scan_collect(void)
 
     if (g_nReg < 4) return @"vm_map walk produced too few regions";
 
+    // ---- diagnostics: does a plain read at region0 work? ----
+    {
+        uint32_t probe[8] = {0};
+        BOOL ok0 = kum_read(g_regStart[0], probe, sizeof(probe));
+        [out appendFormat:@"map=[0x%llx, 0x%llx]\n", kum_map_min(), kum_map_max()];
+        [out appendFormat:@"probe 0x%llx -> %s magic=0x%08x cputype=0x%08x ft=%u ncmds=%u\n\n",
+                          g_regStart[0], ok0 ? @"ok" : @"FAIL",
+                          probe[0], probe[1], probe[3], probe[4]];
+        cyanide_log_sync(@"[DF] probe 0x%llx %s magic=0x%08x",
+                         g_regStart[0], ok0 ? "ok" : "FAIL", probe[0]);
+    }
+
     // ---- base ----
     g_base = findBase();
     if (!g_base) { [out appendString:@"main exec not found\n"]; return out; }
