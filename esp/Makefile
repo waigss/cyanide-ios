@@ -12,7 +12,7 @@ CFLAGS := -arch arm64 -arch arm64e \
           -miphoneos-version-min=15.0 \
           -isysroot $(SDK) \
           -dynamiclib -O2 -fobjc-arc \
-          -framework Foundation \
+          -framework Foundation -framework UIKit \
           -Wno-deprecated-declarations
 
 all: $(LIB)
