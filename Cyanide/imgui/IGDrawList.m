@@ -238,6 +238,11 @@ static void IGDrawLineText(CGContextRef ctx, const char *utf8, CGPoint origin, C
 
 - (UIImage *)renderWithSize:(CGSize)size scale:(CGFloat)scale
 {
+    return [self renderWithSize:size scale:scale translate:IGVec2Make(0.0, 0.0)];
+}
+
+- (UIImage *)renderWithSize:(CGSize)size scale:(CGFloat)scale translate:(IGVec2)offset
+{
     if (size.width < 1.0 || size.height < 1.0) return nil;
     if (scale <= 0.0) scale = 1.0;
 
@@ -253,6 +258,10 @@ static void IGDrawLineText(CGContextRef ctx, const char *utf8, CGPoint origin, C
         CGContextSetShouldAntialias(ctx, true);
         CGContextSetLineJoin(ctx, kCGLineJoinRound);
         CGContextSetLineCap(ctx, kCGLineCapRound);
+
+        if (offset.x != 0.0 || offset.y != 0.0) {
+            CGContextTranslateCTM(ctx, -offset.x, -offset.y);
+        }
 
         for (NSUInteger i = 0; i < self->_count; i++) {
             const IGDrawCmd *cmd = &self->_cmds[i];
