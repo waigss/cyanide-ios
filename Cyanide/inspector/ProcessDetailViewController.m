@@ -37,6 +37,7 @@
 #import "LibraryOverlayController.h"
 #import "CyanideImGuiOverlay.h"
 #import "ImGuiViewController.h"
+#import "CyanideOverlayDiagnostics.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -144,6 +145,13 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
 
     [self buildPlaceholderView];
     [self loadModules];
+}
+
+#pragma mark - 悬浮窗自检
+
+- (void)showOverlayDiagnostics
+{
+    [CyanideOverlayDiagnostics presentFrom:self];
 }
 
 #pragma mark - ImGui 本地演示
@@ -261,6 +269,13 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                     identifier:nil
                                        handler:^(UIAction *a) {
         [weakSelf showImGuiDemo];
+    }]];
+
+    [items addObject:[UIAction actionWithTitle:@"悬浮窗自检"
+                                         image:[UIImage systemImageNamed:@"stethoscope"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showOverlayDiagnostics];
     }]];
 
     NSString *watchTitle = self.watching ? @"停止后台监听" : @"后台监听";
