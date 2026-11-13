@@ -93,6 +93,7 @@ static uint32_t px_bitmap_info(void)
 {
     if (!session) return NO;
     if (frame.size.width < 1.0 || frame.size.height < 1.0) return NO;
+    (void)scene;   // 不再依赖 windowScene：initWithFrame: + makeKeyAndVisible 就够了
     if (scale <= 0.0) scale = 1.0;
 
     _session = session;
@@ -131,13 +132,11 @@ static uint32_t px_bitmap_info(void)
         uint64_t windowAlloc = px_msg(windowClass, @"alloc", 0, 0, 0, 0);
         if (!r_is_objc_ptr(windowAlloc)) { failStage = "UIWindow alloc"; return; }
 
-        // 没有 scene 的 UIWindow 在 iOS 13+ 不会进显示链，所以这里不退到
-        // initWithFrame:，直接报错，免得「创建成功但看不见」。
-        if (!r_is_objc_ptr(scene)) { failStage = "no windowScene"; return; }
-        window = px_msg(windowAlloc, @"initWithWindowScene:", scene, 0, 0, 0);
-        if (r_is_objc_ptr(window)) {
-            r_msg2_main_raw(window, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
-        }
+        // 照抄仓库里那个确实能显示的悬浮窗（tweaks/notepad_tweak.m）：
+        // 用 initWithFrame: 建窗，最后 makeKeyAndVisible。只设 hidden=NO 的话，
+        // 窗口对象存在、句柄有效、setImage: 也成功，但永远不会被合成到屏幕上。
+        window = r_msg2_main_raw(windowAlloc, "initWithFrame:", &frame, sizeof(frame),
+                                 NULL, 0, NULL, 0, NULL, 0);
         if (!r_is_objc_ptr(window)) { failStage = "initWithWindowScene"; return; }
 
         r_msg2_main_raw(window, "setWindowLevel:", &windowLevel, sizeof(windowLevel),
@@ -158,8 +157,9 @@ static uint32_t px_bitmap_info(void)
         px_msg(imageView, @"setContentMode:", 1, 0, 0, 0);   // scaleAspectFit
         if (r_is_objc_ptr(clear)) px_msg(imageView, @"setBackgroundColor:", clear, 0, 0, 0);
         px_msg(window, @"addSubview:", imageView, 0, 0, 0);
-        // 顺序照抄仓库里能显示的那个悬浮窗：先加子视图，最后才取消隐藏
-        px_msg(window, @"setHidden:", 0, 0, 0, 0);
+
+        // 先加子视图，隐藏状态留给 makeKeyAndVisible 统一处理
+        px_msg(window, @"setHidden:", 1, 0, 0, 0);
 
         // 远程像素缓冲 + CGBitmapContext（数据直接指向它，之后 memcpy 即可）
         pixelBuffer = r_dlsym_call(R_TIMEOUT, "malloc", _pixelBufferBytes, 0, 0, 0, 0, 0, 0, 0);
@@ -313,6 +313,23 @@ static uint32_t px_bitmap_info(void)
     _lastCallCount = calls;
     _lastUpdateMS = (CACurrentMediaTime() - begin) * 1000.0;
     return ok;
+}
+
+- (void)makeKeyAndVisible
+{
+    if (!_ready || !_session || !r_is_objc_ptr(_window)) return;
+
+    uint64_t window = _window;
+    RemoteCallSession *session = _session;
+    uint32_t previousSettle = r_settle_us(0);
+
+    remote_call_with_session(session, ^{
+        px_msg(window, @"setHidden:", 0, 0, 0, 0);
+        r_msg2_main(window, "makeKeyAndVisible", 0, 0, 0, 0);
+    });
+
+    r_settle_us(previousSettle);
+    cyanide_log(@"[PIXEL] makeKeyAndVisible 0x%llx", window);
 }
 
 - (BOOL)blitPixels:(const void *)pixels byteLength:(NSUInteger)byteLength
