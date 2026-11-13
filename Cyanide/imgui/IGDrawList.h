@@ -107,6 +107,12 @@ CGFloat IGTextWidth(NSString *text, CGFloat fontSize);
 // 渲染成透明底 UIImage。scale 为像素倍率（2.0 = 2 倍图）。
 - (nullable UIImage *)renderWithSize:(CGSize)size scale:(CGFloat)scale;
 
+// 同上，但先把原点上移 offset：图元用屏幕坐标画、只输出其中一块区域时用。
+// 例如面板占 (10,64,252,300)，就 renderWithSize:{252,300} translate:{10,64}。
+- (nullable UIImage *)renderWithSize:(CGSize)size
+                               scale:(CGFloat)scale
+                           translate:(IGVec2)offset;
+
 @end
 
 NS_ASSUME_NONNULL_END
