@@ -35,6 +35,7 @@
 #import "PointerChainViewController.h"
 #import "SymbolListViewController.h"
 #import "LibraryOverlayController.h"
+#import "CyanideImGuiOverlay.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -144,6 +145,41 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     [self loadModules];
 }
 
+#pragma mark - ImGui 悬浮窗
+
+// 三层窗口：全屏透明画布（穿透）+ ImGui 面板 + 收起后的圆钮。
+// start 是异步的（挂载要在后台队列里跑几秒远程调用），这里只给入口和提示。
+- (void)toggleImGuiOverlay
+{
+    CyanideImGuiOverlay *overlay = [CyanideImGuiOverlay sharedOverlay];
+
+    if ([overlay isActive] || [overlay isStarting]) {
+        [overlay stop];
+        [self rebuildToolsMenu];
+        [self presentAlertWithTitle:@"ImGui 悬浮窗已关闭" message:nil];
+        return;
+    }
+
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    [overlay start];
+    [self rebuildToolsMenu];
+
+    [self presentAlertWithTitle:@"ImGui 悬浮窗正在挂载"
+                        message:[NSString stringWithFormat:
+                                 @"SpringBoard 里正在创建三层窗口：\n\n"
+                                 @"· 全屏透明画布（点击穿透）—— 可在屏幕上画线\n"
+                                 @"· ImGui 面板（252pt）—— 复选框 / 滑条 / 位置\n"
+                                 @"· 收起后的圆钮 —— 点一下恢复面板\n\n"
+                                 @"挂载要几秒，完成后面板会自己出现；\n"
+                                 @"开关拨动后约 0.2~0.5s 生效。\n"
+                                 @"当前目标：%@", self.processName]];
+}
+
 #pragma mark - 工具菜单
 
 - (void)rebuildToolsMenu
@@ -186,6 +222,14 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                     identifier:nil
                                        handler:^(UIAction *a) {
         [weakSelf toggleOverlayMenu];
+    }]];
+
+    BOOL imguiOn = [[CyanideImGuiOverlay sharedOverlay] isActive];
+    [items addObject:[UIAction actionWithTitle:(imguiOn ? @"关闭 ImGui 悬浮窗" : @"ImGui 悬浮窗")
+                                         image:[UIImage systemImageNamed:@"rectangle.inset.filled"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf toggleImGuiOverlay];
     }]];
 
     NSString *watchTitle = self.watching ? @"停止后台监听" : @"后台监听";
