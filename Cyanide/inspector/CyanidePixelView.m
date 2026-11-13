@@ -129,14 +129,12 @@ static uint32_t px_bitmap_info(void)
         uint64_t windowAlloc = px_msg(windowClass, @"alloc", 0, 0, 0, 0);
         if (!r_is_objc_ptr(windowAlloc)) { failStage = "UIWindow alloc"; return; }
 
-        if (r_is_objc_ptr(scene)) {
-            window = px_msg(windowAlloc, @"initWithWindowScene:", scene, 0, 0, 0);
-            if (r_is_objc_ptr(window)) {
-                r_msg2_main_raw(window, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
-            }
-        } else {
-            window = r_msg2_main_raw(windowAlloc, "initWithFrame:", &frame, sizeof(frame),
-                                     NULL, 0, NULL, 0, NULL, 0);
+        // 没有 scene 的 UIWindow 在 iOS 13+ 不会进显示链，所以这里不退到
+        // initWithFrame:，直接报错，免得「创建成功但看不见」。
+        if (!r_is_objc_ptr(scene)) { failStage = "no windowScene"; return; }
+        window = px_msg(windowAlloc, @"initWithWindowScene:", scene, 0, 0, 0);
+        if (r_is_objc_ptr(window)) {
+            r_msg2_main_raw(window, "setFrame:", &frame, sizeof(frame), NULL, 0, NULL, 0, NULL, 0);
         }
         if (!r_is_objc_ptr(window)) { failStage = "initWithWindowScene"; return; }
 
@@ -181,7 +179,7 @@ static uint32_t px_bitmap_info(void)
 
         // 关联到 UIApplication，避免窗口被释放
         uint64_t app = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-        uint64_t key = px_sel(@"cyanidePixelViewWindow");
+        static NSUInteger assocSeed = 0;`n        uint64_t key = px_sel([NSString stringWithFormat:@"cyanidePixelViewWindow%lu", (unsigned long)(++assocSeed)]);
         if (r_is_objc_ptr(app) && key) {
             r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, key, window, 1, 0, 0, 0, 0);
         }
@@ -337,7 +335,7 @@ static uint32_t px_bitmap_info(void)
                 r_dlsym_call(R_TIMEOUT, "free", buffer, 0, 0, 0, 0, 0, 0, 0);
             }
             uint64_t app = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-            uint64_t key = px_sel(@"cyanidePixelViewWindow");
+            static NSUInteger assocSeed = 0;`n        uint64_t key = px_sel([NSString stringWithFormat:@"cyanidePixelViewWindow%lu", (unsigned long)(++assocSeed)]);
             if (r_is_objc_ptr(app) && key) {
                 r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, key, 0, 1, 0, 0, 0, 0);
             }
