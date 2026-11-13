@@ -41,10 +41,11 @@ static const CGFloat kIGPanelWidth = 252.0;
 static const CGFloat kIGPanelMargin = 10.0;
 static const CGFloat kIGPanelTop = 64.0;
 static const CGFloat kIGBubbleSize = 38.0;
-// 和仓库里已经验证过能显示的 LibraryOverlayController 同一层级（999999），
-// 画布压在它下面一层，避免层级过高压到 SpringBoard 自己的东西。
-static const CGFloat kIGCanvasLevel = 999998.0;
-static const CGFloat kIGPanelLevel = 999999.0;
+// 层级只用 2000 多一点：仓库里能显示的 notepad_tweak 用的是 2000，
+// 远高于 UIWindowLevelStatusBar(1000) 足以压住所有 App，
+// 又不像 1e6 那样可能被系统特殊对待。
+static const CGFloat kIGCanvasLevel = 1999.0;
+static const CGFloat kIGPanelLevel = 2000.0;
 static const CGFloat kIGMaxRenderScale = 2.0;
 
 static const NSTimeInterval kIGTickInterval = 1.0 / 60.0;
@@ -432,12 +433,8 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
             scene = anyScene;
             cyanide_log(@"[IMGUI] scene fallback (connectedScenes) = 0x%llx", scene);
         }
-        if (!r_is_objc_ptr(scene)) {
-            [self setStatus:@"拿不到 windowScene · 窗口无法显示"];
-            [self teardownLocked];
-            @synchronized (self) { _state = IGOverlayStateFailed; }
-            return;
-        }
+        // scene 现在只用于日志：窗口改用 initWithFrame: + makeKeyAndVisible，
+        // 不再依赖 windowScene。
     }
 
     CGRect screenRect = CGRectMake(0.0, 0.0, _screenSize.width, _screenSize.height);
@@ -449,6 +446,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
                                               frame:screenRect
                                               level:kIGCanvasLevel
                                               scale:1.0];
+    [_canvasView makeKeyAndVisible];
     if (!_canvasView) {
         [self setStatus:@"画布创建失败"];
         [self teardownLocked];
@@ -461,6 +459,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
                                             frame:panelRect
                                             level:kIGPanelLevel
                                             scale:_renderScale];
+    [_panelView makeKeyAndVisible];
     if (!_panelView) {
         [self setStatus:@"面板创建失败"];
         [self teardownLocked];
