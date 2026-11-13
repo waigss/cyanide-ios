@@ -169,6 +169,20 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     [overlay start];
     [self rebuildToolsMenu];
 
+    // 挂载是异步的：8 秒后回报结果。失败时把 statusLine 直接弹出来，
+    // 免得用户端只剩「没出来」这一个现象。
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        CyanideImGuiOverlay *current = [CyanideImGuiOverlay sharedOverlay];
+        NSString *line = current.statusLine ?: @"";
+        if ([current isActive]) {
+            [weakSelf presentAlertWithTitle:@"ImGui 悬浮窗已开启" message:line];
+        } else {
+            [weakSelf presentAlertWithTitle:@"ImGui 悬浮窗没起来" message:line];
+        }
+    });
+
     [self presentAlertWithTitle:@"ImGui 悬浮窗正在挂载"
                         message:[NSString stringWithFormat:
                                  @"SpringBoard 里正在创建三层窗口：\n\n"
