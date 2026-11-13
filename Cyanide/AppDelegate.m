@@ -12,6 +12,7 @@
 #import "inspector/CyanideLog.h"
 #import "inspector/KernelUserMemory.h"
 #import "inspector/CyanideImGuiOverlay.h"
+#import "inspector/CyanideOverlayDiagnostics.h"
 #import "kexploit/kexploit_opa334.h"
 #import "kexploit/kutils.h"
 #import "kexploit/krw.h"
@@ -414,16 +415,77 @@ static dispatch_source_t g_sigterm_source;
     [self installBarAppearances];
 
     // 开机自动把全局悬浮窗拉起来：内核已就绪就直接挂，否则先初始化一次。
+    // 初始化放到后台队列，避免把主线程卡住（exploit 初始化可能要几十秒）。
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{
-        log_user("[AUTO] boot: starting global overlay\n");
-        if (!kexploit_krw_ready()) {
-            settings_ensure_kernel_ready();
-        }
-        [[CyanideImGuiOverlay sharedOverlay] start];
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+            log_user("[AUTO] boot: initializing kernel for global overlay\n");
+            if (!kexploit_krw_ready()) {
+                settings_ensure_kernel_ready();
+            }
+            dispatch_async(dispatch_get_main_queue(), ^{
+                log_user("[AUTO] boot: starting global overlay\n");
+                [[CyanideImGuiOverlay sharedOverlay] start];
+            });
+        });
+    });
+
+    // 8 秒后在 App 内弹一个状态框：不依赖任何菜单，一定能看见，并且带「自检」入口。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(8.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [self presentOverlayStatusAlert];
     });
 
     return YES;
+}
+
+// 找到当前最上层的控制器
+static UIViewController *cy_top_view_controller(UIViewController *root)
+{
+    UIViewController *current = root;
+    while (current.presentedViewController) {
+        current = current.presentedViewController;
+    }
+    if ([current isKindOfClass:[UINavigationController class]]) {
+        UINavigationController *nav = (UINavigationController *)current;
+        if (nav.visibleViewController) return cy_top_view_controller(nav.visibleViewController);
+    }
+    if ([current isKindOfClass:[UITabBarController class]]) {
+        UITabBarController *tab = (UITabBarController *)current;
+        if (tab.selectedViewController) return cy_top_view_controller(tab.selectedViewController);
+    }
+    return current;
+}
+
+- (void)presentOverlayStatusAlert
+{
+    UIWindow *keyWindow = UIApplication.sharedApplication.keyWindow;
+    UIViewController *root = keyWindow.rootViewController;
+    if (!root) return;
+
+    UIViewController *presenter = cy_top_view_controller(root);
+    if (!presenter || presenter.presentedViewController) return;
+
+    CyanideImGuiOverlay *overlay = [CyanideImGuiOverlay sharedOverlay];
+    NSString *build = [NSString stringWithFormat:@"%s %s", __DATE__, __TIME__];
+    NSString *message = [NSString stringWithFormat:
+                         @"状态：%@\n\n如果屏幕上没出现悬浮窗，点「自检」把 SpringBoard 里的真实状态读回来。\n\nbuild：%@",
+                         overlay.statusLine ?: @"?",
+                         build];
+
+    UIAlertController *alert =
+        [UIAlertController alertControllerWithTitle:@"全局悬浮窗"
+                                            message:message
+                                     preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"自检"
+                                              style:UIAlertActionStyleDefault
+                                            handler:^(UIAlertAction *action) {
+        [CyanideOverlayDiagnostics presentFrom:presenter];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"知道了"
+                                              style:UIAlertActionStyleCancel
+                                            handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)logBootIdentity {
