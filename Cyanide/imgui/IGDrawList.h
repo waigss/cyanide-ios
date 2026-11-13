@@ -113,6 +113,10 @@ CGFloat IGTextWidth(NSString *text, CGFloat fontSize);
                                scale:(CGFloat)scale
                            translate:(IGVec2)offset;
 
+// 直接画进调用方给好的 CGContext（CTM 已经按 point 坐标设好）。
+// 位图传输用这个，省掉一次 UIImage 中转。
+- (void)drawIntoContext:(CGContextRef)ctx;
+
 @end
 
 NS_ASSUME_NONNULL_END
