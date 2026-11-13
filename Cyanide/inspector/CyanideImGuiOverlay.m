@@ -413,6 +413,21 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         scene = foundScene;
         cyanide_log(@"[IMGUI] scene lookup: keyWindow=0x%llx windows=%llu scene=0x%llx",
                     foundKeyWindow, windowCount, scene);
+
+        // 兜底：keyWindow 拿不到就退到 connectedScenes 里任意一个 scene。
+        if (!r_is_objc_ptr(scene)) {
+            __block uint64_t anyScene = 0;
+            remote_call_with_session(session, ^{
+                uint64_t app = ig_msg_main(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
+                if (!r_is_objc_ptr(app)) return;
+                uint64_t scenes = ig_msg_main(app, @"connectedScenes", 0, 0, 0, 0);
+                if (!r_is_objc_ptr(scenes)) return;
+                uint64_t any = ig_msg_main(scenes, @"anyObject", 0, 0, 0, 0);
+                if (r_is_objc_ptr(any)) anyScene = any;
+            });
+            scene = anyScene;
+            cyanide_log(@"[IMGUI] scene fallback (connectedScenes) = 0x%llx", scene);
+        }
         if (!r_is_objc_ptr(scene)) {
             [self setStatus:@"拿不到 windowScene · 窗口无法显示"];
             [self teardownLocked];
