@@ -56,6 +56,10 @@ NS_ASSUME_NONNULL_BEGIN
 // 方便的一次性接口（内部包一层 blitWithScale:）。
 - (BOOL)blitImage:(nullable UIImage *)image;
 
+// 真正把窗口挂上显示的一步：setHidden:0 + makeKeyAndVisible。
+// 只在需要接收/显示的窗口上调（画布、面板），隐藏的小圆钮不要调。
+- (void)makeKeyAndVisible;
+
 // 直接把一整帧 BGRA（alpha 预乘）推过去，跳过 CoreGraphics 绘制。
 // 用于 ImGui 离屏渲染出来的像素。
 - (BOOL)blitPixels:(const void *)pixels byteLength:(NSUInteger)byteLength;
