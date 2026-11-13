@@ -20,6 +20,7 @@
 #import "CyanideImGuiOverlay.h"
 
 #import "CyanidePixelView.h"
+#import "../imgui_core/ImGuiOffscreenRenderer.h"
 #import "../imgui/IGUI.h"
 #import "../imgui/IGDrawList.h"
 #import "../TaskRop/RemoteCall.h"
@@ -230,6 +231,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     CyanidePixelView *_canvasView;
     CyanidePixelView *_panelView;
     CyanidePixelView *_bubbleView;
+    ImGuiOffscreenRenderer *_imgui;      // 画布内容由 ImGui 离屏渲染
+    uint64_t _canaryLabel;               // 窗口能不能显示的探针（图推成功就隐藏）
+    BOOL _canaryHidden;
 
     uint64_t _switchDemo;
     uint64_t _switchGrid;
@@ -478,6 +482,17 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         }
     }
 
+    // 全局窗口的内容 = ImGui 离屏渲染出来的像素
+    _imgui = [[ImGuiOffscreenRenderer alloc] initWithPixelWidth:(NSUInteger)_screenSize.width
+                                                    pixelHeight:(NSUInteger)_screenSize.height
+                                                          scale:1.0];
+    if (_imgui) {
+        cyanide_log(@"[IMGUI] offscreen imgui renderer ready: %lux%lu",
+                    (unsigned long)_imgui.pixelWidth, (unsigned long)_imgui.pixelHeight);
+    } else {
+        cyanide_log(@"[IMGUI] offscreen imgui renderer failed, falling back to IGDrawList");
+    }
+
     _bubbleView = [CyanidePixelView viewWithSession:session
                                              scene:scene
                                              frame:bubbleRect
@@ -536,6 +551,8 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         });
         r_settle_us(previousSettle);
     }
+
+    _canaryLabel = [self installCanaryLabelLocked];
 
     _switchDemo = swDemo;
     _switchGrid = swGrid;
@@ -694,6 +711,39 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     [ui textDisabled:@"canvas: click-through"];
 }
 
+// 探针：一个纯 UILabel，和仓库里那个能显示的悬浮窗完全相同的建法。
+// 如果窗口在显示、而图像链路没通，这个 label 会露在面板下方；
+// 图像推成功之后它会被隐藏。
+- (uint64_t)installCanaryLabelLocked
+{
+    if (!_session || !r_is_objc_ptr(_panelView.window)) return 0;
+
+    uint64_t window = _panelView.window;
+    uint64_t labelClass = ig_class(@"UILabel");
+    uint64_t white = ig_msg_main(ig_class(@"UIColor"), @"whiteColor", 0, 0, 0, 0);
+    uint64_t text = ig_nsstring(@"GLOBAL WINDOW");
+
+    CGRect frame = CGRectMake(0.0, _panelRect.size.height + 4.0, 200.0, 16.0);
+    __block uint64_t label = 0;
+
+    remote_call_with_session(_session, ^{
+        uint64_t alloc = ig_msg_main(labelClass, @"alloc", 0, 0, 0, 0);
+        label = r_is_objc_ptr(alloc) ? ig_msg_main(alloc, @"init", 0, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(label)) return;
+
+        ig_set_rect(label, "setFrame:", frame);
+        if (r_is_objc_ptr(white)) ig_msg_main(label, @"setTextColor:", white, 0, 0, 0);
+        if (r_is_objc_ptr(text)) {
+            ig_msg_main(label, @"setText:", text, 0, 0, 0);
+            ig_release(text);
+        }
+        ig_msg_main(window, @"addSubview:", label, 0, 0, 0);
+    });
+
+    cyanide_log(@"[IMGUI] canary label = 0x%llx", label);
+    return label;
+}
+
 #pragma mark - 帧循环
 
 - (void)tick
@@ -825,6 +875,28 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 {
     if (!_canvasView) return;
 
+    // 全局窗口的内容就是 ImGui：离屏渲染一帧 → 读回 BGRA → 推给 SpringBoard
+    if (_imgui) {
+        NSTimeInterval begin = CACurrentMediaTime();
+        BOOL rendered = [_imgui renderOverlayFrameWithFPS:_canvasFPS
+                                                  frameMS:_canvasMS
+                                                callCount:_canvasCalls
+                                                 showDemo:_demoEnabled];
+        if (rendered && _imgui.pixels) {
+            _canvasBlitOK = [_canvasView blitPixels:_imgui.pixels byteLength:_imgui.byteLength];
+            _canvasImageHandle = ig_get(_canvasView.imageView, @"image");
+            _canvasMS = (CACurrentMediaTime() - begin) * 1000.0;
+            if (_canvasMS > 0.05) {
+                double instant = 1000.0 / _canvasMS;
+                _canvasFPS = (_canvasFPS < 1.0) ? instant : (_canvasFPS * 0.8 + instant * 0.2);
+            }
+            _canvasCalls = _canvasView.lastCallCount;
+        } else {
+            cyanide_log(@"[IMGUI] imgui renderFrame failed");
+        }
+        return;
+    }
+
     IGDrawList *list = _ui.drawList;
     [_ui beginFrameWithDisplaySize:_screenSize];
     if (_gridEnabled) [self drawGridLocked];
@@ -865,6 +937,17 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     }];
     _panelImageHandle = ig_get(_panelView.imageView, @"image");
     _panelCalls = _panelView.lastCallCount;
+
+    if (!_canaryHidden && r_is_objc_ptr(_canaryLabel) && r_is_objc_ptr(_panelImageHandle)) {
+        _canaryHidden = YES;
+        uint64_t label = _canaryLabel;
+        RemoteCallSession *canarySession = _session;
+        if (canarySession) {
+            remote_call_with_session(canarySession, ^{
+                ig_msg_main(label, @"setHidden:", 1, 0, 0, 0);
+            });
+        }
+    }
     _panelMS = (CACurrentMediaTime() - begin) * 1000.0;
 }
 
