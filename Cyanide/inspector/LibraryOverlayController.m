@@ -27,6 +27,7 @@
 #import "../kexploit/kutils.h"
 #import "../DSKeepAlive.h"
 #import "../SettingsViewController.h"
+#import "KernelUserMemory.h"
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
@@ -155,6 +156,7 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 @property (nonatomic, assign) uint64_t titleLabel;
 @property (nonatomic, assign) uint64_t bodyLabel;
 @property (nonatomic, assign) uint64_t runSwitch;
+@property (nonatomic, assign) uint64_t menuSwitches[3];
 
 @property (nonatomic, assign) int frontmostToken;
 @property (nonatomic, strong) dispatch_source_t timer;
@@ -332,32 +334,83 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 
 - (void)pollRunSwitchLocked
 {
-    if (!r_is_objc_ptr(self.runSwitch) || !self.springboardSession) return;
+    if (!self.springboardSession) return;
+    if (!r_is_objc_ptr(self.menuSwitches[0]) &&
+        !r_is_objc_ptr(self.menuSwitches[1]) &&
+        !r_is_objc_ptr(self.menuSwitches[2])) return;
 
-    __block BOOL pressed = NO;
+    __block BOOL pressed[3] = {NO, NO, NO};
+
     remote_call_with_session(self.springboardSession, ^{
-        pressed = (r_msg2_main(self.runSwitch, "isOn", 0, 0, 0, 0) & 0xff) != 0;
-        if (pressed) {
-            // 由本进程复位，用户看到的是一个会自动弹回的开关。
-            r_msg2_main(self.runSwitch, "setOn:animated:", 0, 0, 0, 0);
+        for (int i = 0; i < 3; i++) {
+            if (!r_is_objc_ptr(self.menuSwitches[i])) continue;
+            BOOL on = (r_msg2_main(self.menuSwitches[i], "isOn", 0, 0, 0, 0) & 0xff) != 0;
+            if (on) {
+                pressed[i] = YES;
+                r_msg2_main(self.menuSwitches[i], "setOn:animated:", 0, 0, 0, 0);
+            }
         }
     });
 
-    if (!pressed) return;
-
-    [self setStatusLineLocked:@"已按下：正在初始化内核并查找目标…"];
-
-    BOOL ok = settings_ensure_kernel_ready();
-    if (!ok) {
-        [self setStatusLineLocked:@"内核初始化失败，详见 Cyanide 的 Log 页"];
+    if (pressed[2]) {
+        cyanide_log(@"[悬浮菜单] 收到关闭指令");
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [[NSNotificationCenter defaultCenter] postNotificationName:@"CyanideOverlayCloseRequested" object:nil];
+        });
         return;
     }
 
-    // 重新按名字定位，避免用旧的 proc 地址。
-    self.procAddr = 0;
-    self.pid = 0;
-    self.lastRefreshAt = CFAbsoluteTimeGetCurrent();
-    [self refreshLibrariesLocked];
+    if (pressed[0]) {
+        [self setStatusLineLocked:@"执行：读取目标库列表…"];
+        cyanide_log(@"[悬浮菜单] 执行：读取库列表");
+        [self refreshLibrariesLocked];
+    }
+
+    if (pressed[1]) {
+        [self setStatusLineLocked:@"执行：指针链…"];
+        cyanide_log(@"[悬浮菜单] 执行：指针链");
+        [self runPointerChainLocked];
+    }
+}
+
+// 悬浮菜单里的指针链：主程序基址 + 0x16A627B0 → ptr → +0xF8 → ptr → +0x98 → ptr → +0xA8 int32
+- (void)runPointerChainLocked
+{
+    if (!kexploit_krw_ready()) {
+        [self setStatusLineLocked:@"内核未就绪"];
+        return;
+    }
+
+    uint64_t base = 0;
+    if (!kum_main_executable_base(&base)) {
+        [self setStatusLineLocked:@"未找到主程序基址"];
+        return;
+    }
+
+    uint64_t addr = base + 0x16A627B0ULL;
+    uint8_t buf[8] = {0};
+
+    uint64_t p1 = 0, p2 = 0, p3 = 0;
+    if (!kum_read(addr, buf, 8)) { [self setStatusLineLocked:@"L1 未映射"]; return; }
+    memcpy(&p1, buf, 8);
+
+    if (!kum_read(p1 + 0xF8, buf, 8)) { [self setStatusLineLocked:@"L2 未映射"]; return; }
+    memcpy(&p2, buf, 8);
+
+    if (!kum_read(p2 + 0x98, buf, 8)) { [self setStatusLineLocked:@"L3 未映射"]; return; }
+    memcpy(&p3, buf, 8);
+
+    int32_t value = 0;
+    if (!kum_read(p3 + 0xA8, &value, 4)) { [self setStatusLineLocked:@"L4 未映射"]; return; }
+
+    NSString *text = [NSString stringWithFormat:
+        @"base+0x16A627B0 = 0x%llx\n+0xF8 → 0x%llx\n+0x98 → 0x%llx\n+0xA8 = %d",
+        (unsigned long long)p1, (unsigned long long)p2, (unsigned long long)p3, value];
+
+    cyanide_log(@"[悬浮菜单] 指针链结果：%@", [text stringByReplacingOccurrencesOfString:@"\n" withString:@" | "]);
+
+    self.lastListText = text;
+    [self setStatusLineLocked:@"指针链读取完成"];
 }
 
 #pragma mark - 悬浮窗
@@ -366,16 +419,11 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 {
     if (!kexploit_krw_ready()) return NO;
 
-    // proc_self() 还没解析出来时，proc_find_by_name() 会直接返回 0，
-    // init_remote_call 只会打一行 "process not found or invalid ... proc=0"。
-    // 与其打噪音日志，不如这一轮直接跳过，下一拍重新解析。
     if (!proc_self()) {
         kutils_reset_self_cache();
         return NO;
     }
 
-    // 上一次给目标进程设置的 override 绝不能被 SpringBoard 会话消费掉，
-    // 否则会把 remote call 的线程开进目标 App 里。
     g_RC_targetProcOverride = 0;
 
     RemoteCallSession *session =
@@ -390,7 +438,7 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
     __block uint64_t builtWindow = 0;
     __block uint64_t builtTitle = 0;
     __block uint64_t builtBody = 0;
-    __block uint64_t builtSwitch = 0;
+    __block uint64_t builtSwitches[3] = {0, 0, 0};
 
     CGFloat screenW = MAX(200.0, self.screenSize.width);
     CGFloat screenH = MAX(320.0, self.screenSize.height);
@@ -422,19 +470,30 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
             ? r_msg2_main(allocated, "initWithWindowScene:", scene, 0, 0, 0) : 0;
         if (!r_is_objc_ptr(window)) return;
 
-        // 这个窗口会吃掉它覆盖区域内的触摸，所以别开太大，
-        // 保住屏幕下半部分仍然可以正常操作目标 App。
-        CGFloat width = MIN(MAX(240.0, screenW - 16.0), 380.0);
-        CGFloat height = MIN(screenH * 0.34, 330.0);
-        CGRect windowRect = CGRectMake(8.0, 56.0, width, height);
+        // ImGui 风格：紧凑、深色、1px 边框
+        CGFloat width = 240.0;
+        CGFloat height = 24.0 + 3.0 * 34.0 + 44.0;
+        CGRect windowRect = CGRectMake(16.0, 96.0, width, height);
 
         ov_set_rect(window, "setFrame:", windowRect);
         ov_set_double(window, "setWindowLevel:", 999999.0);
         r_msg2_main(window, "setUserInteractionEnabled:", 1, 0, 0, 0);
 
-        uint64_t background = ov_color(0.0, 0.85);
+        uint64_t background = ov_color(0.11, 0.96);
         if (r_is_objc_ptr(background)) {
             r_msg2_main(window, "setBackgroundColor:", background, 0, 0, 0);
+        }
+
+        uint64_t layer = r_msg2_main(window, "layer", 0, 0, 0, 0);
+        if (r_is_objc_ptr(layer)) {
+            ov_set_double(layer, "setCornerRadius:", 4.0);
+            r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
+            ov_set_double(layer, "setBorderWidth:", 1.0);
+            uint64_t border = ov_color(0.24, 1.0);
+            if (r_is_objc_ptr(border)) {
+                uint64_t cg = r_msg2_main(border, "CGColor", 0, 0, 0, 0);
+                if (r_is_objc_ptr(cg)) r_msg2_main(layer, "setBorderColor:", cg, 0, 0, 0);
+            }
         }
 
         uint64_t UILabelClass = r_class("UILabel");
@@ -442,80 +501,91 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         uint64_t UIColorClass = r_class("UIColor");
         if (!r_is_objc_ptr(UILabelClass) || !r_is_objc_ptr(UIFontClass)) return;
 
-        uint64_t whiteColor = r_is_objc_ptr(UIColorClass)
+        uint64_t white = r_is_objc_ptr(UIColorClass)
             ? r_msg2_main(UIColorClass, "whiteColor", 0, 0, 0, 0) : 0;
+        uint64_t gray = r_is_objc_ptr(UIColorClass)
+            ? r_msg2_main_raw(UIColorClass, "colorWithWhite:alpha:",
+                              &(double){0.62}, sizeof(double),
+                              &(double){1.0}, sizeof(double),
+                              NULL, 0, NULL, 0) : 0;
 
-        // 标题
+        // 标题栏
         uint64_t titleAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
         uint64_t title = r_is_objc_ptr(titleAllocated)
             ? r_msg2_main(titleAllocated, "init", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(title)) return;
-
-        r_msg2_main(title, "setTag:", kOverlayTitleTag, 0, 0, 0);
-        double titleSize = 11.0;
-        double bold = 0.4;
-        uint64_t titleFont = r_msg2_main_raw(UIFontClass, "systemFontOfSize:weight:",
-                                             &titleSize, sizeof(titleSize),
-                                             &bold, sizeof(bold),
-                                             NULL, 0, NULL, 0);
-        if (r_is_objc_ptr(titleFont)) r_msg2_main(title, "setFont:", titleFont, 0, 0, 0);
-        if (r_is_objc_ptr(whiteColor)) r_msg2_main(title, "setTextColor:", whiteColor, 0, 0, 0);
-        ov_set_rect(title, "setFrame:", CGRectMake(10.0, 6.0, width - 130.0, 18.0));
-        uint64_t titleStr = ov_nsstring("Cyanide · 库地址");
-        if (r_is_objc_ptr(titleStr)) r_msg2_main(title, "setText:", titleStr, 0, 0, 0);
-        r_msg2_main(window, "addSubview:", title, 0, 0, 0);
-
-        // 「执行」标签
-        uint64_t runAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
-        uint64_t runLabel = r_is_objc_ptr(runAllocated)
-            ? r_msg2_main(runAllocated, "init", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(runLabel)) {
-            r_msg2_main(runLabel, "setTag:", kOverlayRunLabelTag, 0, 0, 0);
-            double runSize = 11.0;
-            uint64_t runFont = r_msg2_main_raw(UIFontClass, "systemFontOfSize:",
-                                               &runSize, sizeof(runSize),
-                                               NULL, 0, NULL, 0, NULL, 0);
-            if (r_is_objc_ptr(runFont)) r_msg2_main(runLabel, "setFont:", runFont, 0, 0, 0);
-            if (r_is_objc_ptr(whiteColor)) r_msg2_main(runLabel, "setTextColor:", whiteColor, 0, 0, 0);
-            ov_set_rect(runLabel, "setFrame:", CGRectMake(width - 120.0, 8.0, 44.0, 16.0));
-            uint64_t runText = ov_nsstring("执行");
-            if (r_is_objc_ptr(runText)) r_msg2_main(runLabel, "setText:", runText, 0, 0, 0);
-            r_msg2_main(window, "addSubview:", runLabel, 0, 0, 0);
+        if (r_is_objc_ptr(title)) {
+            r_msg2_main(title, "setTag:", kOverlayTitleTag, 0, 0, 0);
+            double titleSize = 11.0;
+            uint64_t font = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                            &titleSize, sizeof(titleSize),
+                                            &(double){0.5}, sizeof(double),
+                                            NULL, 0, NULL, 0);
+            if (r_is_objc_ptr(font)) r_msg2_main(title, "setFont:", font, 0, 0, 0);
+            if (r_is_objc_ptr(white)) r_msg2_main(title, "setTextColor:", white, 0, 0, 0);
+            ov_set_rect(title, "setFrame:", CGRectMake(8.0, 4.0, width - 16.0, 18.0));
+            uint64_t str = ov_nsstring("Cyanide · 悬浮菜单");
+            if (r_is_objc_ptr(str)) r_msg2_main(title, "setText:", str, 0, 0, 0);
+            r_msg2_main(window, "addSubview:", title, 0, 0, 0);
+            builtTitle = title;
         }
 
-        // 执行开关
+        // 三行开关
+        const char *rowTitles[3] = {"读取库列表", "执行指针链", "关闭悬浮窗"};
+
         uint64_t switchClass = r_class("UISwitch");
-        uint64_t switchAllocated = r_is_objc_ptr(switchClass)
-            ? r_msg2_main(switchClass, "alloc", 0, 0, 0, 0) : 0;
-        uint64_t runSwitch = r_is_objc_ptr(switchAllocated)
-            ? r_msg2_main(switchAllocated, "init", 0, 0, 0, 0) : 0;
-        if (r_is_objc_ptr(runSwitch)) {
-            r_msg2_main(runSwitch, "setTag:", kOverlaySwitchTag, 0, 0, 0);
-            r_msg2_main(runSwitch, "setOn:", 0, 0, 0, 0);
-            ov_set_rect(runSwitch, "setFrame:", CGRectMake(width - 74.0, 0.0, 64.0, 32.0));
-            r_msg2_main(window, "addSubview:", runSwitch, 0, 0, 0);
-            builtSwitch = runSwitch;
+
+        for (int i = 0; i < 3; i++) {
+            CGFloat y = 24.0 + i * 34.0;
+
+            uint64_t rowAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+            uint64_t rowLabel = r_is_objc_ptr(rowAllocated)
+                ? r_msg2_main(rowAllocated, "init", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(rowLabel)) {
+                double rowSize = 12.0;
+                uint64_t rowFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                                   &rowSize, sizeof(rowSize),
+                                                   &(double){0.0}, sizeof(double),
+                                                   NULL, 0, NULL, 0);
+                if (r_is_objc_ptr(rowFont)) r_msg2_main(rowLabel, "setFont:", rowFont, 0, 0, 0);
+                if (r_is_objc_ptr(white)) r_msg2_main(rowLabel, "setTextColor:", white, 0, 0, 0);
+                ov_set_rect(rowLabel, "setFrame:", CGRectMake(10.0, y + 6.0, width - 70.0, 18.0));
+                uint64_t str = ov_nsstring(rowTitles[i]);
+                if (r_is_objc_ptr(str)) r_msg2_main(rowLabel, "setText:", str, 0, 0, 0);
+                r_msg2_main(window, "addSubview:", rowLabel, 0, 0, 0);
+            }
+
+            uint64_t switchAllocated = r_is_objc_ptr(switchClass)
+                ? r_msg2_main(switchClass, "alloc", 0, 0, 0, 0) : 0;
+            uint64_t rowSwitch = r_is_objc_ptr(switchAllocated)
+                ? r_msg2_main(switchAllocated, "init", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(rowSwitch)) {
+                r_msg2_main(rowSwitch, "setTag:", kOverlaySwitchTag + i, 0, 0, 0);
+                r_msg2_main(rowSwitch, "setOn:", 0, 0, 0, 0);
+                ov_set_rect(rowSwitch, "setFrame:", CGRectMake(width - 58.0, y, 52.0, 30.0));
+                r_msg2_main(window, "addSubview:", rowSwitch, 0, 0, 0);
+                builtSwitches[i] = rowSwitch;
+            }
         }
 
-        // 正文
+        // 状态行
         uint64_t bodyAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
         uint64_t body = r_is_objc_ptr(bodyAllocated)
             ? r_msg2_main(bodyAllocated, "init", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(body)) return;
+        if (r_is_objc_ptr(body)) {
+            r_msg2_main(body, "setTag:", kOverlayBodyTag, 0, 0, 0);
+            r_msg2_main(body, "setNumberOfLines:", 2, 0, 0, 0);
+            double bodySize = 10.0;
+            uint64_t bodyFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                                &bodySize, sizeof(bodySize),
+                                                &(double){0.0}, sizeof(double),
+                                                NULL, 0, NULL, 0);
+            if (r_is_objc_ptr(bodyFont)) r_msg2_main(body, "setFont:", bodyFont, 0, 0, 0);
+            if (r_is_objc_ptr(gray)) r_msg2_main(body, "setTextColor:", gray, 0, 0, 0);
+            ov_set_rect(body, "setFrame:", CGRectMake(10.0, 24.0 + 3.0 * 34.0, width - 20.0, 34.0));
+            r_msg2_main(window, "addSubview:", body, 0, 0, 0);
+            builtBody = body;
+        }
 
-        r_msg2_main(body, "setTag:", kOverlayBodyTag, 0, 0, 0);
-        r_msg2_main(body, "setNumberOfLines:", 0, 0, 0, 0);
-        double bodySize = 9.0;
-        double regular = 0.0;
-        uint64_t bodyFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
-                                            &bodySize, sizeof(bodySize),
-                                            &regular, sizeof(regular),
-                                            NULL, 0, NULL, 0);
-        if (r_is_objc_ptr(bodyFont)) r_msg2_main(body, "setFont:", bodyFont, 0, 0, 0);
-        if (r_is_objc_ptr(whiteColor)) r_msg2_main(body, "setTextColor:", whiteColor, 0, 0, 0);
-        ov_set_rect(body, "setFrame:", CGRectMake(10.0, 40.0, width - 20.0, height - 50.0));
-
-        r_msg2_main(window, "addSubview:", body, 0, 0, 0);
         r_msg2_main(window, "setHidden:", 0, 0, 0, 0);
 
         uint64_t key = r_sel(kOverlayAssocKey);
@@ -525,54 +595,24 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         }
 
         builtWindow = window;
-        builtTitle = title;
-        builtBody = body;
         ok = YES;
     });
 
     self.window = builtWindow;
     self.titleLabel = builtTitle;
     self.bodyLabel = builtBody;
-    self.runSwitch = builtSwitch;
+    self.runSwitch = builtSwitches[0];
+    for (int i = 0; i < 3; i++) {
+        self.menuSwitches[i] = builtSwitches[i];
+    }
 
     if (!ok) {
         self.springboardSession = nil;
         return NO;
     }
 
-    [self setStatusLineLocked:@"就绪：按右上角「执行」初始化内核并读取目标"];
+    [self setStatusLineLocked:@"就绪：拨动开关执行对应动作"];
     return YES;
-}
-
-- (void)setStatusLineLocked:(NSString *)line
-{
-    self.statusLine = line ?: @"";
-    [self pushBodyTextLocked];
-}
-
-- (void)pushBodyTextLocked
-{
-    if (!self.springboardSession || !r_is_objc_ptr(self.bodyLabel)) return;
-
-    NSMutableString *text = [NSMutableString string];
-    [text appendFormat:@"目标: %@%@\n", self.processName ?: @"?",
-     self.pid > 0 ? [NSString stringWithFormat:@" (PID %d)", self.pid] : @""];
-    [text appendFormat:@"%@\n", self.statusLine ?: @""];
-
-    if (self.lastListText.length > 0) {
-        [text appendString:@"\n"];
-        [text appendString:self.lastListText];
-    }
-
-    const char *utf8 = text.UTF8String;
-    if (!utf8) return;
-
-    remote_call_with_session(self.springboardSession, ^{
-        uint64_t str = ov_nsstring(utf8);
-        if (r_is_objc_ptr(str)) {
-            r_msg2_main(self.bodyLabel, "setText:", str, 0, 0, 0);
-        }
-    });
 }
 
 - (void)removeOverlayLocked
@@ -581,7 +621,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         self.window = 0;
         self.titleLabel = 0;
         self.bodyLabel = 0;
-        self.runSwitch = 0;
+        self.menuSwitches[0] = 0;
+        self.menuSwitches[1] = 0;
+        self.menuSwitches[2] = 0;
         return;
     }
 
@@ -604,7 +646,34 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
     self.window = 0;
     self.titleLabel = 0;
     self.bodyLabel = 0;
-    self.runSwitch = 0;
+    self.menuSwitches[0] = 0;
+    self.menuSwitches[1] = 0;
+    self.menuSwitches[2] = 0;
+}
+
+- (void)setStatusLineLocked:(NSString *)line
+{
+    self.statusLine = line ?: @"";
+    [self pushBodyTextLocked];
+}
+
+- (void)pushBodyTextLocked
+{
+    if (!self.springboardSession || !r_is_objc_ptr(self.bodyLabel)) return;
+
+    NSMutableString *text = [NSMutableString string];
+    [text appendFormat:@"目标 %@（PID %d）\n", self.processName ?: @"?", self.pid];
+    [text appendString:self.statusLine ?: @""];
+
+    const char *utf8 = text.UTF8String;
+    if (!utf8) return;
+
+    remote_call_with_session(self.springboardSession, ^{
+        uint64_t str = ov_nsstring(utf8);
+        if (r_is_objc_ptr(str)) {
+            r_msg2_main(self.bodyLabel, "setText:", str, 0, 0, 0);
+        }
+    });
 }
 
 #pragma mark - 目标定位
@@ -642,122 +711,66 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 - (void)refreshLibrariesLocked
 {
     if (!kexploit_krw_ready()) {
-        [self setStatusLineLocked:@"内核未就绪"];
+        [self setStatusLineLocked:@"KERNEL_NOT_READY"];
         return;
     }
 
-    // 同上：self proc 没解析出来时整张进程表都走不动，先等下一拍。
     if (!proc_self()) {
         kutils_reset_self_cache();
-        [self setStatusLineLocked:@"内核会话建立中…"];
+        [self setStatusLineLocked:@"KERNEL_SESSION_BUILDING"];
         return;
     }
 
     if (![self lookupTargetLocked]) {
         self.lastListText = nil;
-        [self setStatusLineLocked:[NSString stringWithFormat:@"没有找到进程 %@（未运行？）",
+        [self setStatusLineLocked:[NSString stringWithFormat:@"TARGET_NOT_FOUND %@",
                                    self.processName ?: @"?"]];
         return;
     }
 
-    RemoteCallSession *session = ov_attach(self.processName, self.procAddr,
-                                           kOverlayAttachTimeoutMS, NO);
-    if (!session) {
-        [self setStatusLineLocked:@"目标当前不在前台（已挂起），等待中…"];
+    // Kernel direct read first: no attach, no threads, works while target is suspended.
+    NSArray<NSDictionary<NSString *, id> *> *rows = nil;
+    NSString *error = nil;
+
+    if (kum_prepare(self.procAddr)) {
+        rows = kum_read_dyld_images(&error);
+    } else {
+        error = @"KUM_PREPARE_FAILED";
+    }
+
+    if (rows.count > 0) {
+        NSMutableString *text = [NSMutableString string];
+        [text appendFormat:@"TOTAL %lu (kernel-direct)\n", (unsigned long)rows.count];
+
+        NSUInteger shown = 0;
+        for (NSDictionary *row in rows) {
+            if (shown >= 10) break;
+            [text appendFormat:@"0x%llx %@\n",
+             [row[@"base"] unsignedLongLongValue], row[@"name"]];
+            shown += 1;
+        }
+        if (rows.count > shown) {
+            [text appendFormat:@"... +%lu\n", (unsigned long)(rows.count - shown)];
+        }
+
+        self.lastListText = text;
+        [self setStatusLineLocked:[NSString stringWithFormat:@"READ %lu MODULES",
+                                   (unsigned long)rows.count]];
+        cyanide_log(@"[OVERLAY] kernel direct read ok: %lu modules", (unsigned long)rows.count);
         return;
     }
 
-    NSMutableString *text = [NSMutableString string];
-    NSMutableArray<NSString *> *mainLines = [NSMutableArray array];
-    NSMutableArray<NSString *> *thirdLines = [NSMutableArray array];
-    NSMutableArray<NSString *> *systemLines = [NSMutableArray array];
+    cyanide_log(@"[OVERLAY] kernel direct read failed: %@", error ?: @"unknown");
 
-    __block NSUInteger total = 0;
-    __block NSUInteger thirdCount = 0;
-    __block NSUInteger systemCount = 0;
-    __block BOOL truncated = NO;
-
-    remote_call_with_session(session, ^{
-        uint64_t count = r_dlsym_call(kOverlayDylibCallTimeout, "_dyld_image_count",
-                                      0, 0, 0, 0, 0, 0, 0, 0);
-        if (count == 0 || count > 4096) return;
-
-        CFAbsoluteTime deadline = CFAbsoluteTimeGetCurrent() + kOverlayDylibDeadline;
-
-        for (uint64_t i = 0; i < count; i++) {
-            if (CFAbsoluteTimeGetCurrent() > deadline) {
-                truncated = YES;
-                break;
-            }
-
-            uint64_t base = r_dlsym_call(kOverlayDylibCallTimeout, "_dyld_get_image_header",
-                                         i, 0, 0, 0, 0, 0, 0, 0);
-            uint64_t namePtr = r_dlsym_call(kOverlayDylibCallTimeout, "_dyld_get_image_name",
-                                            i, 0, 0, 0, 0, 0, 0, 0);
-
-            char buffer[512] = {0};
-            if (namePtr != 0) {
-                remote_read(namePtr, buffer, sizeof(buffer) - 1);
-            }
-
-            NSString *path = [NSString stringWithUTF8String:buffer];
-            if (path.length == 0) path = @"";
-
-            total += 1;
-
-            if (i == 0) {
-                [mainLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                      (unsigned long long)base, ov_short_name(path, 26)]];
-            } else if (ov_path_is_third_party(path)) {
-                thirdCount += 1;
-                if (thirdLines.count < kOverlayMaxThirdParty) {
-                    [thirdLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                           (unsigned long long)base, ov_short_name(path, 24)]];
-                }
-            } else {
-                systemCount += 1;
-                if (systemLines.count < kOverlayMaxSystem) {
-                    [systemLines addObject:[NSString stringWithFormat:@"  0x%llx %@",
-                                            (unsigned long long)base, ov_short_name(path, 24)]];
-                }
-            }
-        }
-    });
-
-    if (total == 0) {
-        [self setStatusLineLocked:@"读取失败（dyld 返回 0）"];
+    uint64_t base = 0;
+    if (kum_main_executable_base(&base)) {
+        self.lastListText = [NSString stringWithFormat:@"MAIN BASE 0x%llx\n%@",
+                             (unsigned long long)base, error ?: @"unknown"];
+        [self setStatusLineLocked:@"MAIN_BASE_ONLY"];
         return;
     }
 
-    [text appendFormat:@"共 %lu 项 · 第三方 %lu · 系统 %lu%@\n",
-     (unsigned long)total, (unsigned long)thirdCount, (unsigned long)systemCount,
-     truncated ? @"（超时）" : @""];
-
-    if (mainLines.count > 0) {
-        [text appendString:@"主程序\n"];
-        for (NSString *line in mainLines) [text appendFormat:@"%@\n", line];
-    }
-    if (thirdLines.count > 0) {
-        [text appendString:@"第三方库\n"];
-        for (NSString *line in thirdLines) [text appendFormat:@"%@\n", line];
-        if (thirdCount > thirdLines.count) {
-            [text appendFormat:@"  … 共 %lu 个\n", (unsigned long)thirdCount];
-        }
-    }
-    if (systemLines.count > 0) {
-        [text appendString:@"系统库\n"];
-        for (NSString *line in systemLines) [text appendFormat:@"%@\n", line];
-        if (systemCount > systemLines.count) {
-            [text appendFormat:@"  … 共 %lu 个\n", (unsigned long)systemCount];
-        }
-    }
-
-    self.lastListText = text;
-
-    NSDateFormatter *formatter = [[NSDateFormatter alloc] init];
-    formatter.dateFormat = @"HH:mm:ss";
-    [self setStatusLineLocked:[NSString stringWithFormat:@"已更新 %@",
-                               [formatter stringFromDate:[NSDate date]]]];
+    [self setStatusLineLocked:(error ?: @"READ_FAILED")];
 }
 
 @end
