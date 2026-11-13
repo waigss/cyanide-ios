@@ -141,6 +141,14 @@ static uint32_t px_bitmap_info(void)
 
         r_msg2_main_raw(window, "setWindowLevel:", &windowLevel, sizeof(windowLevel),
                         NULL, 0, NULL, 0, NULL, 0);
+
+        // 现代 iOS 上有 rootViewController 的窗口才会走完整的布局/合成路径。
+        uint64_t vcAlloc = px_msg(r_class("UIViewController"), @"alloc", 0, 0, 0, 0);
+        uint64_t rootController = r_is_objc_ptr(vcAlloc) ? px_msg(vcAlloc, @"init", 0, 0, 0, 0) : 0;
+        if (r_is_objc_ptr(rootController)) {
+            px_msg(window, @"setRootViewController:", rootController, 0, 0, 0);
+            px_msg(rootController, @"release", 0, 0, 0, 0);
+        }
         px_msg(window, @"setOpaque:", 0, 0, 0, 0);
         px_msg(window, @"setUserInteractionEnabled:", 0, 0, 0, 0);
         uint64_t clear = px_msg(r_class("UIColor"), @"clearColor", 0, 0, 0, 0);
