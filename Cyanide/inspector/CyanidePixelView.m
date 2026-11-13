@@ -14,6 +14,7 @@
 #import <string.h>
 
 static NSMutableDictionary<NSString *, NSNumber *> *gPxSelectorCache = nil;
+static NSUInteger gPxAssocSeed = 0;   // 每块视图一个独立的关联 key
 
 static uint64_t px_sel(NSString *name)
 {
@@ -54,6 +55,7 @@ static uint32_t px_bitmap_info(void)
     uint64_t _pixelBuffer;      // 远程 malloc 的像素内存
     uint64_t _context;          // 远程 CGBitmapContext（数据指向 _pixelBuffer）
     uint64_t _lastImage;        // 上一帧的 CGImage，我们持有 +1
+    uint64_t _assocKey;         // 关联到 UIApplication 的 key（每块视图不同）
     uint32_t _pixelBufferBytes;
 
     CGSize _pixelSize;
@@ -177,11 +179,13 @@ static uint32_t px_bitmap_info(void)
                                0);
         if (!r_is_objc_ptr(context)) { failStage = "CGBitmapContextCreate"; return; }
 
-        // 关联到 UIApplication，避免窗口被释放
+        // 关联到 UIApplication，避免窗口被释放；三块视图必须用不同的 key，
+        // 共用一个 key 会互相顶掉引用。
         uint64_t app = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-        static NSUInteger assocSeed = 0;`n        uint64_t key = px_sel([NSString stringWithFormat:@"cyanidePixelViewWindow%lu", (unsigned long)(++assocSeed)]);
-        if (r_is_objc_ptr(app) && key) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, key, window, 1, 0, 0, 0, 0);
+        _assocKey = px_sel([NSString stringWithFormat:@"cyanidePixelViewWindow%lu",
+                            (unsigned long)(++gPxAssocSeed)]);
+        if (r_is_objc_ptr(app) && _assocKey) {
+            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, _assocKey, window, 1, 0, 0, 0, 0);
         }
 
         ok = YES;
@@ -319,6 +323,7 @@ static uint32_t px_bitmap_info(void)
     uint64_t context = _context;
     uint64_t buffer = _pixelBuffer;
     uint64_t lastImage = _lastImage;
+    uint64_t assocKey = _assocKey;
 
     if (session) {
         uint32_t previousSettle = r_settle_us(0);
@@ -335,9 +340,8 @@ static uint32_t px_bitmap_info(void)
                 r_dlsym_call(R_TIMEOUT, "free", buffer, 0, 0, 0, 0, 0, 0, 0);
             }
             uint64_t app = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-            static NSUInteger assocSeed = 0;`n        uint64_t key = px_sel([NSString stringWithFormat:@"cyanidePixelViewWindow%lu", (unsigned long)(++assocSeed)]);
-            if (r_is_objc_ptr(app) && key) {
-                r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, key, 0, 1, 0, 0, 0, 0);
+            if (r_is_objc_ptr(app) && assocKey) {
+                r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocKey, 0, 1, 0, 0, 0, 0);
             }
         });
         r_settle_us(previousSettle);
