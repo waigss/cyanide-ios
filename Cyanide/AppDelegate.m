@@ -11,6 +11,8 @@
 #import "LogTextView.h"
 #import "inspector/CyanideLog.h"
 #import "inspector/KernelUserMemory.h"
+#import "inspector/CyanideImGuiOverlay.h"
+#import "kexploit/kexploit_opa334.h"
 #import "kexploit/kutils.h"
 #import "kexploit/krw.h"
 #import "kexploit/offsets.h"
@@ -410,6 +412,17 @@ static dispatch_source_t g_sigterm_source;
     ds_keepalive_apply_enabled([[NSUserDefaults standardUserDefaults] boolForKey:kSettingsKeepAlive]);
     [self installTerminationHandlers];
     [self installBarAppearances];
+
+    // 开机自动把全局悬浮窗拉起来：内核已就绪就直接挂，否则先初始化一次。
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        log_user("[AUTO] boot: starting global overlay\n");
+        if (!kexploit_krw_ready()) {
+            settings_ensure_kernel_ready();
+        }
+        [[CyanideImGuiOverlay sharedOverlay] start];
+    });
+
     return YES;
 }
 
