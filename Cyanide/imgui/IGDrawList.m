@@ -241,30 +241,16 @@ static void IGDrawLineText(CGContextRef ctx, const char *utf8, CGPoint origin, C
     return [self renderWithSize:size scale:scale translate:IGVec2Make(0.0, 0.0)];
 }
 
-- (UIImage *)renderWithSize:(CGSize)size scale:(CGFloat)scale translate:(IGVec2)offset
+- (void)drawIntoContext:(CGContextRef)ctx
 {
-    if (size.width < 1.0 || size.height < 1.0) return nil;
-    if (scale <= 0.0) scale = 1.0;
+    if (!ctx) return;
 
-    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
-    format.opaque = NO;
-    format.scale = scale;
+    CGContextSetShouldAntialias(ctx, true);
+    CGContextSetLineJoin(ctx, kCGLineJoinRound);
+    CGContextSetLineCap(ctx, kCGLineCapRound);
 
-    UIGraphicsImageRenderer *renderer =
-        [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
-
-    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
-        CGContextRef ctx = rendererContext.CGContext;
-        CGContextSetShouldAntialias(ctx, true);
-        CGContextSetLineJoin(ctx, kCGLineJoinRound);
-        CGContextSetLineCap(ctx, kCGLineCapRound);
-
-        if (offset.x != 0.0 || offset.y != 0.0) {
-            CGContextTranslateCTM(ctx, -offset.x, -offset.y);
-        }
-
-        for (NSUInteger i = 0; i < self->_count; i++) {
-            const IGDrawCmd *cmd = &self->_cmds[i];
+        for (NSUInteger i = 0; i < _count; i++) {
+            const IGDrawCmd *cmd = &_cmds[i];
             switch (cmd->type) {
                 case IGDrawCmdTypeLine: {
                     CGContextSetStrokeColorWithColor(ctx, IGColorRef(cmd->color));
@@ -331,6 +317,26 @@ static void IGDrawLineText(CGContextRef ctx, const char *utf8, CGPoint origin, C
                 }
             }
         }
+}
+
+- (UIImage *)renderWithSize:(CGSize)size scale:(CGFloat)scale translate:(IGVec2)offset
+{
+    if (size.width < 1.0 || size.height < 1.0) return nil;
+    if (scale <= 0.0) scale = 1.0;
+
+    UIGraphicsImageRendererFormat *format = [UIGraphicsImageRendererFormat defaultFormat];
+    format.opaque = NO;
+    format.scale = scale;
+
+    UIGraphicsImageRenderer *renderer =
+        [[UIGraphicsImageRenderer alloc] initWithSize:size format:format];
+
+    return [renderer imageWithActions:^(UIGraphicsImageRendererContext *rendererContext) {
+        CGContextRef ctx = rendererContext.CGContext;
+        if (offset.x != 0.0 || offset.y != 0.0) {
+            CGContextTranslateCTM(ctx, -offset.x, -offset.y);
+        }
+        [self drawIntoContext:ctx];
     }];
 }
 
