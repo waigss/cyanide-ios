@@ -305,13 +305,13 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         if (!self.springboardSession) {
             if (!kexploit_krw_ready()) {
                 if (!self.autoInitKernel) return;
-                [self setStatusLineLocked:@"正在初始化内核…"];
+                [self setStatusLineLocked:@"INIT_KERNEL"];
                 BOOL ok = settings_ensure_kernel_ready();
                 if (!ok) {
-                    [self setStatusLineLocked:@"内核初始化失败，稍后自动重试…"];
+                    [self setStatusLineLocked:@"KRW_INIT_FAILED"];
                     return;
                 }
-                [self setStatusLineLocked:@"内核已就绪，正在挂载悬浮窗…"];
+                [self setStatusLineLocked:@"KRW_OK_MOUNTING"];
             }
 
             if (![self installOverlayLocked]) {
@@ -437,10 +437,16 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 
 - (BOOL)installOverlayLocked
 {
-    if (!kexploit_krw_ready()) return NO;
+    cyanide_log(@"[OVERLAY] install begin: krw=%d proc_self=0x%llx",
+                kexploit_krw_ready() ? 1 : 0, proc_self());
 
+    if (!kexploit_krw_ready()) {
+        cyanide_log(@"[OVERLAY] fail: KRW not ready");
+        return NO;
+    }
     if (!proc_self()) {
         kutils_reset_self_cache();
+        cyanide_log(@"[OVERLAY] fail: proc_self == 0");
         return NO;
     }
 
@@ -450,162 +456,131 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         [[RemoteCallSession alloc] initWithProcess:@"SpringBoard"
                                useMigFilterBypass:NO
                           firstExceptionTimeoutMS:12000];
-    if (!session) return NO;
+    if (!session) {
+        cyanide_log(@"[OVERLAY] fail: SpringBoard session init, reason=%d",
+                    (int)remote_call_last_init_failure());
+        return NO;
+    }
 
+    cyanide_log(@"[OVERLAY] SpringBoard session ok");
     self.springboardSession = session;
 
     __block BOOL ok = NO;
     __block uint64_t builtWindow = 0;
     __block uint64_t builtTitle = 0;
     __block uint64_t builtBody = 0;
-    __block uint64_t builtSwitchLibList = 0;
-    __block uint64_t builtSwitchChain = 0;
-    __block uint64_t builtSwitchClose = 0;
+    __block uint64_t builtLib = 0;
+    __block uint64_t builtChain = 0;
+    __block uint64_t builtClose = 0;
 
     CGFloat screenW = MAX(200.0, self.screenSize.width);
     CGFloat screenH = MAX(320.0, self.screenSize.height);
+    (void)screenW;
+    (void)screenH;
 
     remote_call_with_session(session, ^{
         uint64_t UIApplication = r_class("UIApplication");
         uint64_t app = r_is_objc_ptr(UIApplication)
             ? r_msg2_main(UIApplication, "sharedApplication", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(app)) return;
+        if (!r_is_objc_ptr(app)) { cyanide_log(@"[OVERLAY] fail: no UIApplication"); return; }
 
         uint64_t keyWindow = r_msg2_main(app, "keyWindow", 0, 0, 0, 0);
         if (!r_is_objc_ptr(keyWindow)) {
             uint64_t windows = r_msg2_main(app, "windows", 0, 0, 0, 0);
-            uint64_t count = r_is_objc_ptr(windows)
-                ? r_msg2_main(windows, "count", 0, 0, 0, 0) : 0;
-            if (count > 0 && count < 64) {
-                keyWindow = r_msg2_main(windows, "objectAtIndex:", 0, 0, 0, 0);
-            }
+            uint64_t count = r_is_objc_ptr(windows) ? r_msg2_main(windows, "count", 0, 0, 0, 0) : 0;
+            if (count > 0 && count < 64) keyWindow = r_msg2_main(windows, "objectAtIndex:", 0, 0, 0, 0);
         }
-        if (!r_is_objc_ptr(keyWindow)) return;
+        if (!r_is_objc_ptr(keyWindow)) { cyanide_log(@"[OVERLAY] fail: no keyWindow"); return; }
 
         uint64_t scene = r_msg2_main(keyWindow, "windowScene", 0, 0, 0, 0);
-        if (!r_is_objc_ptr(scene)) return;
+        if (!r_is_objc_ptr(scene)) { cyanide_log(@"[OVERLAY] fail: no windowScene"); return; }
 
-        uint64_t UIWindowClass = r_class("UIWindow");
-        uint64_t allocated = r_is_objc_ptr(UIWindowClass)
-            ? r_msg2_main(UIWindowClass, "alloc", 0, 0, 0, 0) : 0;
-        uint64_t window = r_is_objc_ptr(allocated)
-            ? r_msg2_main(allocated, "initWithWindowScene:", scene, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(window)) return;
+        uint64_t windowClass = r_class("UIWindow");
+        uint64_t alloc = r_is_objc_ptr(windowClass) ? r_msg2_main(windowClass, "alloc", 0, 0, 0, 0) : 0;
+        uint64_t window = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "initWithWindowScene:", scene, 0, 0, 0) : 0;
+        if (!r_is_objc_ptr(window)) { cyanide_log(@"[OVERLAY] fail: UIWindow init"); return; }
 
-        // ImGui 风格：紧凑、深色、1px 边框
         CGFloat width = 240.0;
         CGFloat height = 24.0 + 3.0 * 34.0 + 44.0;
-        CGRect windowRect = CGRectMake(16.0, 96.0, width, height);
 
-        ov_set_rect(window, "setFrame:", windowRect);
+        ov_set_rect(window, "setFrame:", CGRectMake(16.0, 96.0, width, height));
         ov_set_double(window, "setWindowLevel:", 999999.0);
         r_msg2_main(window, "setUserInteractionEnabled:", 1, 0, 0, 0);
 
-        uint64_t background = ov_color(0.11, 0.96);
-        if (r_is_objc_ptr(background)) {
-            r_msg2_main(window, "setBackgroundColor:", background, 0, 0, 0);
-        }
+        uint64_t bg = ov_color(0.11, 0.96);
+        if (r_is_objc_ptr(bg)) r_msg2_main(window, "setBackgroundColor:", bg, 0, 0, 0);
 
         uint64_t layer = r_msg2_main(window, "layer", 0, 0, 0, 0);
         if (r_is_objc_ptr(layer)) {
             ov_set_double(layer, "setCornerRadius:", 4.0);
             r_msg2_main(layer, "setMasksToBounds:", 1, 0, 0, 0);
-            ov_set_double(layer, "setBorderWidth:", 1.0);
-            uint64_t border = ov_color(0.24, 1.0);
-            if (r_is_objc_ptr(border)) {
-                uint64_t cg = r_msg2_main(border, "CGColor", 0, 0, 0, 0);
-                if (r_is_objc_ptr(cg)) r_msg2_main(layer, "setBorderColor:", cg, 0, 0, 0);
-            }
         }
 
         uint64_t UILabelClass = r_class("UILabel");
         uint64_t UIFontClass = r_class("UIFont");
         uint64_t UIColorClass = r_class("UIColor");
-        if (!r_is_objc_ptr(UILabelClass) || !r_is_objc_ptr(UIFontClass)) return;
+        if (!r_is_objc_ptr(UILabelClass)) { cyanide_log(@"[OVERLAY] fail: no UILabel"); return; }
 
-        uint64_t white = r_is_objc_ptr(UIColorClass)
-            ? r_msg2_main(UIColorClass, "whiteColor", 0, 0, 0, 0) : 0;
-        uint64_t gray = r_is_objc_ptr(UIColorClass)
-            ? r_msg2_main_raw(UIColorClass, "colorWithWhite:alpha:",
-                              &(double){0.62}, sizeof(double),
-                              &(double){1.0}, sizeof(double),
-                              NULL, 0, NULL, 0) : 0;
+        uint64_t white = r_is_objc_ptr(UIColorClass) ? r_msg2_main(UIColorClass, "whiteColor", 0, 0, 0, 0) : 0;
 
-        // 标题栏
-        uint64_t titleAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
-        uint64_t title = r_is_objc_ptr(titleAllocated)
-            ? r_msg2_main(titleAllocated, "init", 0, 0, 0, 0) : 0;
+        uint64_t titleAlloc = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+        uint64_t title = r_is_objc_ptr(titleAlloc) ? r_msg2_main(titleAlloc, "init", 0, 0, 0, 0) : 0;
         if (r_is_objc_ptr(title)) {
-            r_msg2_main(title, "setTag:", kOverlayTitleTag, 0, 0, 0);
-            double titleSize = 11.0;
+            double sz = 11.0; double wt = 0.5;
             uint64_t font = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
-                                            &titleSize, sizeof(titleSize),
-                                            &(double){0.5}, sizeof(double),
-                                            NULL, 0, NULL, 0);
+                                            &sz, sizeof(sz), &wt, sizeof(wt), NULL, 0, NULL, 0);
             if (r_is_objc_ptr(font)) r_msg2_main(title, "setFont:", font, 0, 0, 0);
             if (r_is_objc_ptr(white)) r_msg2_main(title, "setTextColor:", white, 0, 0, 0);
             ov_set_rect(title, "setFrame:", CGRectMake(8.0, 4.0, width - 16.0, 18.0));
-            uint64_t str = ov_nsstring("Cyanide · 悬浮菜单");
-            if (r_is_objc_ptr(str)) r_msg2_main(title, "setText:", str, 0, 0, 0);
+            uint64_t s = ov_nsstring("Cyanide Menu");
+            if (r_is_objc_ptr(s)) r_msg2_main(title, "setText:", s, 0, 0, 0);
             r_msg2_main(window, "addSubview:", title, 0, 0, 0);
             builtTitle = title;
         }
 
-        // 三行开关
-        const char *rowTitles[3] = {"读取库列表", "执行指针链", "关闭悬浮窗"};
-
         uint64_t switchClass = r_class("UISwitch");
+        const char *rowNames[3] = { "Read Libraries", "Run Pointer Chain", "Close Menu" };
 
         for (int i = 0; i < 3; i++) {
             CGFloat y = 24.0 + i * 34.0;
 
-            uint64_t rowAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
-            uint64_t rowLabel = r_is_objc_ptr(rowAllocated)
-                ? r_msg2_main(rowAllocated, "init", 0, 0, 0, 0) : 0;
-            if (r_is_objc_ptr(rowLabel)) {
-                double rowSize = 12.0;
-                uint64_t rowFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
-                                                   &rowSize, sizeof(rowSize),
-                                                   &(double){0.0}, sizeof(double),
-                                                   NULL, 0, NULL, 0);
-                if (r_is_objc_ptr(rowFont)) r_msg2_main(rowLabel, "setFont:", rowFont, 0, 0, 0);
-                if (r_is_objc_ptr(white)) r_msg2_main(rowLabel, "setTextColor:", white, 0, 0, 0);
-                ov_set_rect(rowLabel, "setFrame:", CGRectMake(10.0, y + 6.0, width - 70.0, 18.0));
-                uint64_t str = ov_nsstring(rowTitles[i]);
-                if (r_is_objc_ptr(str)) r_msg2_main(rowLabel, "setText:", str, 0, 0, 0);
-                r_msg2_main(window, "addSubview:", rowLabel, 0, 0, 0);
+            uint64_t la = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+            uint64_t lb = r_is_objc_ptr(la) ? r_msg2_main(la, "init", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(lb)) {
+                double sz = 12.0; double wt = 0.0;
+                uint64_t f = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                             &sz, sizeof(sz), &wt, sizeof(wt), NULL, 0, NULL, 0);
+                if (r_is_objc_ptr(f)) r_msg2_main(lb, "setFont:", f, 0, 0, 0);
+                if (r_is_objc_ptr(white)) r_msg2_main(lb, "setTextColor:", white, 0, 0, 0);
+                ov_set_rect(lb, "setFrame:", CGRectMake(10.0, y + 6.0, width - 70.0, 18.0));
+                uint64_t s = ov_nsstring(rowNames[i]);
+                if (r_is_objc_ptr(s)) r_msg2_main(lb, "setText:", s, 0, 0, 0);
+                r_msg2_main(window, "addSubview:", lb, 0, 0, 0);
             }
 
-            uint64_t switchAllocated = r_is_objc_ptr(switchClass)
-                ? r_msg2_main(switchClass, "alloc", 0, 0, 0, 0) : 0;
-            uint64_t rowSwitch = r_is_objc_ptr(switchAllocated)
-                ? r_msg2_main(switchAllocated, "init", 0, 0, 0, 0) : 0;
-            if (r_is_objc_ptr(rowSwitch)) {
-                r_msg2_main(rowSwitch, "setTag:", kOverlaySwitchTag + i, 0, 0, 0);
-                r_msg2_main(rowSwitch, "setOn:", 0, 0, 0, 0);
-                ov_set_rect(rowSwitch, "setFrame:", CGRectMake(width - 58.0, y, 52.0, 30.0));
-                r_msg2_main(window, "addSubview:", rowSwitch, 0, 0, 0);
-                if (i == 0) builtSwitchLibList = rowSwitch;
-                else if (i == 1) builtSwitchChain = rowSwitch;
-                else builtSwitchClose = rowSwitch;
+            uint64_t sa = r_is_objc_ptr(switchClass) ? r_msg2_main(switchClass, "alloc", 0, 0, 0, 0) : 0;
+            uint64_t sw = r_is_objc_ptr(sa) ? r_msg2_main(sa, "init", 0, 0, 0, 0) : 0;
+            if (r_is_objc_ptr(sw)) {
+                r_msg2_main(sw, "setOn:", 0, 0, 0, 0);
+                ov_set_rect(sw, "setFrame:", CGRectMake(width - 58.0, y, 52.0, 30.0));
+                r_msg2_main(window, "addSubview:", sw, 0, 0, 0);
+                if (i == 0) builtLib = sw;
+                else if (i == 1) builtChain = sw;
+                else builtClose = sw;
             }
         }
 
-        // 状态行
-        uint64_t bodyAllocated = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
-        uint64_t body = r_is_objc_ptr(bodyAllocated)
-            ? r_msg2_main(bodyAllocated, "init", 0, 0, 0, 0) : 0;
+        uint64_t ba = r_msg2_main(UILabelClass, "alloc", 0, 0, 0, 0);
+        uint64_t body = r_is_objc_ptr(ba) ? r_msg2_main(ba, "init", 0, 0, 0, 0) : 0;
         if (r_is_objc_ptr(body)) {
-            r_msg2_main(body, "setTag:", kOverlayBodyTag, 0, 0, 0);
             r_msg2_main(body, "setNumberOfLines:", 2, 0, 0, 0);
-            double bodySize = 10.0;
-            uint64_t bodyFont = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
-                                                &bodySize, sizeof(bodySize),
-                                                &(double){0.0}, sizeof(double),
-                                                NULL, 0, NULL, 0);
-            if (r_is_objc_ptr(bodyFont)) r_msg2_main(body, "setFont:", bodyFont, 0, 0, 0);
-            if (r_is_objc_ptr(gray)) r_msg2_main(body, "setTextColor:", gray, 0, 0, 0);
+            double sz = 10.0; double wt = 0.0;
+            uint64_t f = r_msg2_main_raw(UIFontClass, "monospacedSystemFontOfSize:weight:",
+                                         &sz, sizeof(sz), &wt, sizeof(wt), NULL, 0, NULL, 0);
+            if (r_is_objc_ptr(f)) r_msg2_main(body, "setFont:", f, 0, 0, 0);
             ov_set_rect(body, "setFrame:", CGRectMake(10.0, 24.0 + 3.0 * 34.0, width - 20.0, 34.0));
+            uint64_t s = ov_nsstring("ready");
+            if (r_is_objc_ptr(s)) r_msg2_main(body, "setText:", s, 0, 0, 0);
             r_msg2_main(window, "addSubview:", body, 0, 0, 0);
             builtBody = body;
         }
@@ -614,27 +589,30 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 
         uint64_t key = r_sel(kOverlayAssocKey);
         if (key) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject",
-                         app, key, window, 1, 0, 0, 0, 0);
+            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, key, window, 1, 0, 0, 0, 0);
         }
 
         builtWindow = window;
         ok = YES;
+        cyanide_log(@"[OVERLAY] window created 0x%llx", window);
     });
 
     self.window = builtWindow;
     self.titleLabel = builtTitle;
     self.bodyLabel = builtBody;
-    self.switchLibList = builtSwitchLibList;
-    self.switchChain = builtSwitchChain;
-    self.switchClose = builtSwitchClose;
+    self.switchLibList = builtLib;
+    self.switchChain = builtChain;
+    self.switchClose = builtClose;
 
     if (!ok) {
+        cyanide_log(@"[OVERLAY] fail: build did not complete");
         self.springboardSession = nil;
         return NO;
     }
 
-    [self setStatusLineLocked:@"就绪：拨动开关执行对应动作"];
+    cyanide_log(@"[OVERLAY] install success: win=0x%llx sw=%llx/%llx/%llx",
+                builtWindow, builtLib, builtChain, builtClose);
+    [self setStatusLineLocked:@"READY"];
     return YES;
 }
 
