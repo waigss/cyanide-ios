@@ -365,7 +365,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         _primitives = [NSMutableArray array];
         _primitivesLock = [[NSLock alloc] init];
         _ui = [[IGUI alloc] init];
-        _ui.style.itemSpacingY = 4.0;
+        IGStyle style = _ui.style;
+        style.itemSpacingY = 4.0;
+        _ui.style = style;
         _renderScale = kIGRenderScale;
         _widthIndex = 1;                       // 线宽 2.0
         _alphaIndex = 3;                       // 不透明度 205
