@@ -34,6 +34,7 @@
 #import "ProbeListViewController.h"
 #import "PointerChainViewController.h"
 #import "SymbolListViewController.h"
+#import "LibraryOverlayController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -177,6 +178,14 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                     identifier:nil
                                        handler:^(UIAction *a) {
         [weakSelf showProbeList];
+    }]];
+
+    BOOL overlayOn = [[LibraryOverlayController sharedOverlay] isActive];
+    [items addObject:[UIAction actionWithTitle:(overlayOn ? @"关闭悬浮窗" : @"悬浮窗菜单")
+                                         image:[UIImage systemImageNamed:@"rectangle.on.rectangle"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf toggleOverlayMenu];
     }]];
 
     NSString *watchTitle = self.watching ? @"停止后台监听" : @"后台监听";
@@ -719,6 +728,38 @@ static RemoteCallSession *cyanide_attach_to_process(NSString *name,
     }
 
     [self showSymbolsForModuleBase:base name:[NSString stringWithFormat:@"%@ 主程序", self.processName]];
+}
+
+#pragma mark - 悬浮窗
+
+- (void)toggleOverlayMenu
+{
+    LibraryOverlayController *overlay = [LibraryOverlayController sharedOverlay];
+
+    if ([overlay isActive]) {
+        [overlay stopByUser];
+        [self rebuildToolsMenu];
+        [self presentAlertWithTitle:@"悬浮窗已关闭" message:nil];
+        return;
+    }
+
+    if (!kexploit_krw_ready()) {
+        [self presentAlertWithTitle:@"内核未就绪"
+                            message:@"请先回到「进程」页初始化内核。"];
+        return;
+    }
+
+    [overlay startForProcessName:self.processName pid:self.pid procAddr:self.procAddr];
+    [self rebuildToolsMenu];
+
+    [self presentAlertWithTitle:@"悬浮菜单已开启"
+                        message:[NSString stringWithFormat:
+                                 @"SpringBoard 里已挂出菜单，浮在任意 App 之上：\n\n"
+                                 @"· 读取库列表 —— 读 %@ 的模块与基址\n"
+                                 @"· 执行指针链 —— 读 base+0x16A627B0 那条链\n"
+                                 @"· 关闭悬浮窗 —— 菜单自己消失\n\n"
+                                 @"打开游戏后直接拨开关即可；本 App 会自动保活。",
+                                 self.processName]];
 }
 
 #pragma mark - 指针链
