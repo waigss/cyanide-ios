@@ -29,12 +29,14 @@ static uint64_t px_sel(NSString *name)
     return sel;
 }
 
+// 建窗口/加子视图/设 hidden 全部必须在 SpringBoard 主线程上做：UIWindow 在非主线程
+// 创建不会进入显示链，窗口就永远不出现。r_msg2_main 走
+// performSelectorOnMainThread:waitUntilDone:YES，是同步的。
+// 每帧的 setImage: 不用它，用单次 performSelectorOnMainThread:（见 blitWithScale:）。
 static uint64_t px_msg(uint64_t obj, NSString *selName, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 {
-    if (!r_is_objc_ptr(obj)) return 0;
-    uint64_t sel = px_sel(selName);
-    if (!sel) return 0;
-    return r_msg(obj, sel, a0, a1, a2, a3);
+    if (!r_is_objc_ptr(obj) || !selName) return 0;
+    return r_msg2_main(obj, selName.UTF8String, a0, a1, a2, a3);
 }
 
 // 位图格式：BGRA little-endian + premultiplied first，和 UIGraphicsImageRenderer
@@ -113,18 +115,19 @@ static uint32_t px_bitmap_info(void)
     CGFloat windowLevel = level;
     CGRect imageFrame = CGRectMake(0.0, 0.0, frame.size.width, frame.size.height);
 
+    __block const char *failStage = "none";
     __block uint64_t window = 0;
     __block uint64_t imageView = 0;
     __block uint64_t pixelBuffer = 0;
     __block uint64_t context = 0;
     __block BOOL ok = NO;
 
-    uint32_t previousSettle = r_settle_us(8000);
+    uint32_t previousSettle = r_settle_us(0);
 
     remote_call_with_session(session, ^{
         uint64_t windowClass = r_class("UIWindow");
         uint64_t windowAlloc = px_msg(windowClass, @"alloc", 0, 0, 0, 0);
-        if (!r_is_objc_ptr(windowAlloc)) return;
+        if (!r_is_objc_ptr(windowAlloc)) { failStage = "UIWindow alloc"; return; }
 
         if (r_is_objc_ptr(scene)) {
             window = px_msg(windowAlloc, @"initWithWindowScene:", scene, 0, 0, 0);
@@ -135,14 +138,12 @@ static uint32_t px_bitmap_info(void)
             window = r_msg2_main_raw(windowAlloc, "initWithFrame:", &frame, sizeof(frame),
                                      NULL, 0, NULL, 0, NULL, 0);
         }
-        if (!r_is_objc_ptr(window)) return;
+        if (!r_is_objc_ptr(window)) { failStage = "initWithWindowScene"; return; }
 
         r_msg2_main_raw(window, "setWindowLevel:", &windowLevel, sizeof(windowLevel),
                         NULL, 0, NULL, 0, NULL, 0);
         px_msg(window, @"setOpaque:", 0, 0, 0, 0);
         px_msg(window, @"setUserInteractionEnabled:", 0, 0, 0, 0);
-        px_msg(window, @"setHidden:", 0, 0, 0, 0);
-
         uint64_t clear = px_msg(r_class("UIColor"), @"clearColor", 0, 0, 0, 0);
         if (r_is_objc_ptr(clear)) px_msg(window, @"setBackgroundColor:", clear, 0, 0, 0);
 
@@ -151,19 +152,21 @@ static uint32_t px_bitmap_info(void)
             ? r_msg2_main_raw(imageAlloc, "initWithFrame:", &imageFrame, sizeof(imageFrame),
                               NULL, 0, NULL, 0, NULL, 0)
             : 0;
-        if (!r_is_objc_ptr(imageView)) return;
+        if (!r_is_objc_ptr(imageView)) { failStage = "UIImageView init"; return; }
 
         px_msg(imageView, @"setUserInteractionEnabled:", 0, 0, 0, 0);
         px_msg(imageView, @"setContentMode:", 1, 0, 0, 0);   // scaleAspectFit
         if (r_is_objc_ptr(clear)) px_msg(imageView, @"setBackgroundColor:", clear, 0, 0, 0);
         px_msg(window, @"addSubview:", imageView, 0, 0, 0);
+        // 顺序照抄仓库里能显示的那个悬浮窗：先加子视图，最后才取消隐藏
+        px_msg(window, @"setHidden:", 0, 0, 0, 0);
 
         // 远程像素缓冲 + CGBitmapContext（数据直接指向它，之后 memcpy 即可）
         pixelBuffer = r_dlsym_call(R_TIMEOUT, "malloc", _pixelBufferBytes, 0, 0, 0, 0, 0, 0, 0);
-        if (!r_is_objc_ptr(pixelBuffer)) return;
+        if (!r_is_objc_ptr(pixelBuffer)) { failStage = "malloc pixels"; return; }
 
         uint64_t colorSpaceRemote = r_dlsym_call(R_TIMEOUT, "CGColorSpaceCreateDeviceRGB", 0, 0, 0, 0, 0, 0, 0, 0);
-        if (!r_is_objc_ptr(colorSpaceRemote)) return;
+        if (!r_is_objc_ptr(colorSpaceRemote)) { failStage = "CGColorSpace"; return; }
 
         context = r_dlsym_call(R_TIMEOUT, "CGBitmapContextCreate",
                                pixelBuffer,
@@ -174,7 +177,7 @@ static uint32_t px_bitmap_info(void)
                                colorSpaceRemote,
                                (uint64_t)px_bitmap_info(),
                                0);
-        if (!r_is_objc_ptr(context)) return;
+        if (!r_is_objc_ptr(context)) { failStage = "CGBitmapContextCreate"; return; }
 
         // 关联到 UIApplication，避免窗口被释放
         uint64_t app = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
@@ -187,6 +190,7 @@ static uint32_t px_bitmap_info(void)
     });
 
     r_settle_us(previousSettle);
+    if (!ok) cyanide_log(@"[PIXEL] setup failed at stage: %s", failStage);
 
     if (!ok) {
         cyanide_log(@"[PIXEL] setup failed %.0fx%.0f @%.1fx", frame.size.width, frame.size.height, scale);
@@ -319,7 +323,7 @@ static uint32_t px_bitmap_info(void)
     uint64_t lastImage = _lastImage;
 
     if (session) {
-        uint32_t previousSettle = r_settle_us(8000);
+        uint32_t previousSettle = r_settle_us(0);
         remote_call_with_session(session, ^{
             if (r_is_objc_ptr(imageView)) px_msg(imageView, @"setImage:", 0, 0, 0, 0);
             if (r_is_objc_ptr(window)) px_msg(window, @"setHidden:", 1, 0, 0, 0);
