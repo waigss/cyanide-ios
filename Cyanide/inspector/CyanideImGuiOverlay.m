@@ -40,8 +40,10 @@ static const CGFloat kIGPanelWidth = 252.0;
 static const CGFloat kIGPanelMargin = 10.0;
 static const CGFloat kIGPanelTop = 64.0;
 static const CGFloat kIGBubbleSize = 38.0;
-static const CGFloat kIGCanvasLevel = 1000000.0;
-static const CGFloat kIGPanelLevel = 1000001.0;
+// 和仓库里已经验证过能显示的 LibraryOverlayController 同一层级（999999），
+// 画布压在它下面一层，避免层级过高压到 SpringBoard 自己的东西。
+static const CGFloat kIGCanvasLevel = 999998.0;
+static const CGFloat kIGPanelLevel = 999999.0;
 static const CGFloat kIGMaxRenderScale = 2.0;
 
 static const NSTimeInterval kIGTickInterval = 1.0 / 60.0;
@@ -121,6 +123,19 @@ static void ig_set_double(uint64_t obj, const char *selName, double value)
 {
     if (!r_is_objc_ptr(obj) || !selName) return;
     r_msg2_main_raw(obj, selName, &value, sizeof(value), NULL, 0, NULL, 0, NULL, 0);
+}
+
+// 只在自检里用：造一个远程 UIColor（4 个 CGFloat 实参，走 NSInvocation）
+static uint64_t ig_remote_color(CGFloat r, CGFloat g, CGFloat b, CGFloat a)
+{
+    uint64_t cls = ig_class(@"UIColor");
+    if (!r_is_objc_ptr(cls)) return 0;
+    double rgba[4] = {(double)r, (double)g, (double)b, (double)a};
+    return r_msg2_main_raw(cls, "colorWithRed:green:blue:alpha:",
+                           &rgba[0], sizeof(double),
+                           &rgba[1], sizeof(double),
+                           &rgba[2], sizeof(double),
+                           &rgba[3], sizeof(double));
 }
 
 static uint64_t ig_nsstring(NSString *text)
@@ -224,6 +239,11 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     uint64_t _segAlpha;
     uint64_t _segFPS;
     uint64_t _segAnchor;
+
+    BOOL _canvasBlitOK;
+    BOOL _panelBlitOK;
+    uint64_t _canvasImageHandle;
+    uint64_t _panelImageHandle;
 
     BOOL _panelHidden;
     BOOL _panelDirty;
@@ -367,21 +387,38 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     uint64_t scene = 0;
     {
+        // 这段必须在主线程读：SpringBoard 的窗口簿记只在主线程可靠，
+        // 跨线程读 keyWindow 很可能拿到 nil，scene 就变成 0，
+        // 而 iOS 13+ 里没有 scene 的 UIWindow 不会显示。
         __block uint64_t foundScene = 0;
+        __block uint64_t foundKeyWindow = 0;
+        __block uint64_t windowCount = 0;
         remote_call_with_session(session, ^{
             uint64_t app = ig_msg_main(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
             if (!r_is_objc_ptr(app)) return;
-            uint64_t keyWindow = ig_msg(app, @"keyWindow", 0, 0, 0, 0);
+            uint64_t keyWindow = ig_msg_main(app, @"keyWindow", 0, 0, 0, 0);
             if (!r_is_objc_ptr(keyWindow)) {
-                uint64_t windows = ig_msg(app, @"windows", 0, 0, 0, 0);
-                uint64_t count = r_is_objc_ptr(windows) ? ig_msg(windows, @"count", 0, 0, 0, 0) : 0;
+                uint64_t windows = ig_msg_main(app, @"windows", 0, 0, 0, 0);
+                uint64_t count = r_is_objc_ptr(windows) ? ig_msg_main(windows, @"count", 0, 0, 0, 0) : 0;
+                windowCount = count;
                 if (count > 0 && count < 64) {
-                    keyWindow = ig_msg(windows, @"objectAtIndex:", 0, 0, 0, 0);
+                    keyWindow = ig_msg_main(windows, @"objectAtIndex:", 0, 0, 0, 0);
                 }
             }
-            if (r_is_objc_ptr(keyWindow)) foundScene = ig_msg(keyWindow, @"windowScene", 0, 0, 0, 0);
+            if (r_is_objc_ptr(keyWindow)) {
+                foundKeyWindow = keyWindow;
+                foundScene = ig_msg_main(keyWindow, @"windowScene", 0, 0, 0, 0);
+            }
         });
         scene = foundScene;
+        cyanide_log(@"[IMGUI] scene lookup: keyWindow=0x%llx windows=%llu scene=0x%llx",
+                    foundKeyWindow, windowCount, scene);
+        if (!r_is_objc_ptr(scene)) {
+            [self setStatus:@"拿不到 windowScene · 窗口无法显示"];
+            [self teardownLocked];
+            @synchronized (self) { _state = IGOverlayStateFailed; }
+            return;
+        }
     }
 
     CGRect screenRect = CGRectMake(0.0, 0.0, _screenSize.width, _screenSize.height);
@@ -410,6 +447,20 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         [self teardownLocked];
         @synchronized (self) { _state = IGOverlayStateFailed; }
         return;
+    }
+
+    // 面板窗口本身给个深色背景：这样「窗口在不在显示」和「图有没有推上去」
+    // 是两件可以分开看的事。
+    {
+        uint64_t panelWindowHandle = _panelView.window;
+        uint64_t dark = ig_remote_color(0.05, 0.05, 0.07, 0.95);
+        if (r_is_objc_ptr(panelWindowHandle) && r_is_objc_ptr(dark)) {
+            __block uint64_t windowHandle = panelWindowHandle;
+            __block uint64_t color = dark;
+            remote_call_with_session(session, ^{
+                ig_msg_main(windowHandle, @"setBackgroundColor:", color, 0, 0, 0);
+            });
+        }
     }
 
     _bubbleView = [CyanidePixelView viewWithSession:session
@@ -485,7 +536,11 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     [self blitCanvasLocked];
 
     [self startTimerLocked];
-    [self setStatus:[NSString stringWithFormat:@"运行中 · %.0f×%.0f", _screenSize.width, _screenSize.height]];
+    [self setStatus:[NSString stringWithFormat:@"运行中 %.0fx%.0f | blit %d/%d | img %d/%d",
+                      _screenSize.width, _screenSize.height,
+                      _canvasBlitOK ? 1 : 0, _panelBlitOK ? 1 : 0,
+                      r_is_objc_ptr(_canvasImageHandle) ? 1 : 0,
+                      r_is_objc_ptr(_panelImageHandle) ? 1 : 0]];
     @synchronized (self) { _state = IGOverlayStateRunning; }
     cyanide_log(@"[IMGUI] running canvas=0x%llx panel=0x%llx bubble=0x%llx",
                 _canvasView.imageView, _panelView.imageView,
@@ -762,9 +817,10 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     if (_demoEnabled) [self drawDemoLocked];
     [_ui endFrame];
 
-    [_canvasView blitWithScale:1.0 draw:^(CGContextRef ctx, CGSize pointSize) {
+    _canvasBlitOK = [_canvasView blitWithScale:1.0 draw:^(CGContextRef ctx, CGSize pointSize) {
         [list drawIntoContext:ctx];
     }];
+    _canvasImageHandle = ig_get(_canvasView.imageView, @"image");
 
     _canvasCalls = _canvasView.lastCallCount;
     _canvasMS = _canvasView.lastUpdateMS;
@@ -788,10 +844,11 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     [_ui endFrame];
 
     NSTimeInterval begin = CACurrentMediaTime();
-    [_panelView blitWithScale:_renderScale draw:^(CGContextRef ctx, CGSize pointSize) {
+    _panelBlitOK = [_panelView blitWithScale:_renderScale draw:^(CGContextRef ctx, CGSize pointSize) {
         CGContextTranslateCTM(ctx, -rect.origin.x, -rect.origin.y);
         [list drawIntoContext:ctx];
     }];
+    _panelImageHandle = ig_get(_panelView.imageView, @"image");
     _panelCalls = _panelView.lastCallCount;
     _panelMS = (CACurrentMediaTime() - begin) * 1000.0;
 }
