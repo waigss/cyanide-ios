@@ -2,27 +2,26 @@
 //  CyanideImGuiOverlay.m
 //  Cyanide
 //
-//  SpringBoard 全局悬浮窗 + 全屏透明画布，界面是 ImGui 的样子。
+//  这版换掉了「整屏 PNG 推图」：
 //
-//  为什么是「本地渲染 + 远程贴图」而不是在 SpringBoard 里建视图树：
-//    远程建一个控件要十几条 ROP 消息（每条带 settle 等待），一条分隔线都要
-//    花钱；而把整帧画成一张 PNG 再推过去，帧成本和图元数量无关 ——
-//    malloc + remote_write（共享页 memcpy）+ 2 条消息。
+//  旧：每帧 CoreGraphics 画整屏 → PNG encode → remote_write 几 MB →
+//      +[NSData dataWithBytes:length:] → +[UIImage imageWithData:] → setImage:
+//      后三步走 r_msg2_main_raw，而那套内部每条消息就是几十次远程调用 + settle，
+//      一帧 400~600ms，5 fps 都不到。
 //
-//  输入怎么回来：
-//    远程进程里跑不了我们的代码，所以点不了 UIButton。这里用一组「隐形控件」
-//    —— UISwitch / UISlider / UISegmentedControl + alpha 0.02（UIKit 的
-//    hitTest 只忽略 alpha < 0.01，所以 0.02 仍然可点、但基本看不见），
-//    按 ImGui 的绘制位置摆好，本进程每 160ms 读一次 isOn / value /
-//    selectedSegmentIndex，读到变化就重画。
+//  新：画线交给 SpringBoard 里的 CAShapeLayer。我们只把「点数组」写进共享页，
+//      再让远程 CoreGraphics 建一条 CGPath 设给图层（见 CyanideScreenCanvas）：
+//      与点数量无关，一帧 4 + 折线条数 次单条调用。
 //
-//  点击穿透：
-//    canvasWindow 的 userInteractionEnabled = NO，画布以下全是游戏本身；
-//    panelWindow 只有面板那么大，面板以外的触摸不会被它接住。
+//      面板（ImGui 样子那块）仍然是一张图，但只渲染面板本身（252×H），
+//      推图只用 3 条 objc_msgSend：dataWithBytes:length: → imageWithData: →
+//      performSelectorOnMainThread:withObject:waitUntilDone:（setImage:）。
+//      只有控件变化时才推。
 //
 
 #import "CyanideImGuiOverlay.h"
 
+#import "CyanideScreenCanvas.h"
 #import "../imgui/IGUI.h"
 #import "../imgui/IGDrawList.h"
 #import "../TaskRop/RemoteCall.h"
@@ -33,145 +32,95 @@
 #import "../SettingsViewController.h"
 #import "CyanideLog.h"
 
-#import <UIKit/UIKit.h>
+#import <QuartzCore/QuartzCore.h>
 #import <math.h>
 #import <string.h>
 
 #pragma mark - 常量
 
-static const char *kIGKeyCanvas = "cyanideImGuiCanvasWindow";
-static const char *kIGKeyPanel  = "cyanideImGuiPanelWindow";
+static const char *kIGKeyPanel = "cyanideImGuiPanelWindow";
 static const char *kIGKeyBubble = "cyanideImGuiBubbleWindow";
 
-static const CGFloat kIGPanelWidth   = 252.0;
-static const CGFloat kIGPanelMargin  = 10.0;
-static const CGFloat kIGPanelTop     = 64.0;
-static const CGFloat kIGBubbleSize   = 38.0;
-static const CGFloat kIGCanvasLevel  = 1000000.0;
-static const CGFloat kIGPanelLevel   = 1000001.0;
-static const CGFloat kIGRenderScale  = 2.0;
+static const CGFloat kIGPanelWidth = 252.0;
+static const CGFloat kIGPanelMargin = 10.0;
+static const CGFloat kIGPanelTop = 64.0;
+static const CGFloat kIGBubbleSize = 38.0;
+static const CGFloat kIGPanelLevel = 1000001.0;
+static const CGFloat kIGRenderScale = 2.0;
 
-static const NSTimeInterval kIGTickInterval    = 0.16;
-static const NSTimeInterval kIGMinPushInterval = 0.15;
+static const NSTimeInterval kIGTickInterval = 1.0 / 60.0;   // 定时器节拍
+static const NSTimeInterval kIGPollInterval = 0.066;        // 读控件 15Hz
+static const NSTimeInterval kIGPanelPushInterval = 0.10;    // 面板最多 10Hz
 
-// 远程消息之间的等待。默认 50ms 是给「一条一条点」的场景留的余量；
-// 这里要连续推帧、轮询，降到 8ms。调大更稳，调小更快。
-static const uint32_t kIGSettleMicroseconds = 8000;
+static const uint32_t kIGPanelBufferBytes = 2u * 1024u * 1024u;
 
-static const uint32_t kIGRemoteBufferBytes = 4u * 1024u * 1024u;
-
-// 不透明度只有 5 档（UISegmentedControl 的 selectedSegmentIndex 是整数，
-// 能一条 objc_msgSend 读回来；UISlider 的 value 是 float，读不回来）。
 static const CGFloat kIGAlphaSteps[5] = {40.0, 95.0, 150.0, 205.0, 255.0};
-static const int kIGMaxPushFailures = 4;
+static const NSInteger kIGFPSSteps[3] = {15, 30, 60};
 
-#pragma mark - 画布图元
-
-@interface IGCanvasItem : NSObject
-@property (nonatomic) IGDrawCmdType type;
-@property (nonatomic) IGVec2 a;
-@property (nonatomic) IGVec2 b;
-@property (nonatomic) CGFloat radius;
-@property (nonatomic) CGFloat thickness;
-@property (nonatomic) CGFloat fontSize;
-@property (nonatomic) uint32_t color;
-@property (nonatomic, copy) NSString *text;
-@end
-
-@implementation IGCanvasItem
-@end
-
-#pragma mark - 远程小工具
+#pragma mark - 远程小工具（全是单次调用）
 
 static NSMutableDictionary<NSString *, NSNumber *> *gIGClassCache = nil;
 static NSMutableDictionary<NSString *, NSNumber *> *gIGSelectorCache = nil;
-static NSRecursiveLock *gIGRemoteCacheLock = nil;
 
-static void ig_remote_cache_init(void)
+static void ig_cache_init(void)
 {
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        gIGClassCache = [NSMutableDictionary dictionaryWithCapacity:24];
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gIGClassCache = [NSMutableDictionary dictionaryWithCapacity:16];
         gIGSelectorCache = [NSMutableDictionary dictionaryWithCapacity:64];
-        gIGRemoteCacheLock = [[NSRecursiveLock alloc] init];
     });
 }
 
-static void ig_remote_cache_reset(void)
+static void ig_cache_reset(void)
 {
-    ig_remote_cache_init();
-    [gIGRemoteCacheLock lock];
+    ig_cache_init();
     [gIGClassCache removeAllObjects];
     [gIGSelectorCache removeAllObjects];
-    [gIGRemoteCacheLock unlock];
 }
 
 static uint64_t ig_class(NSString *name)
 {
-    ig_remote_cache_init();
-    [gIGRemoteCacheLock lock];
+    ig_cache_init();
     NSNumber *cached = gIGClassCache[name];
-    [gIGRemoteCacheLock unlock];
     if (cached) return cached.unsignedLongLongValue;
-
     uint64_t value = r_class(name.UTF8String);
-    if (value) {
-        [gIGRemoteCacheLock lock];
-        gIGClassCache[name] = @(value);
-        [gIGRemoteCacheLock unlock];
-    }
+    if (value) gIGClassCache[name] = @(value);
     return value;
 }
 
 static uint64_t ig_sel(NSString *name)
 {
-    ig_remote_cache_init();
-    [gIGRemoteCacheLock lock];
+    ig_cache_init();
     NSNumber *cached = gIGSelectorCache[name];
-    [gIGRemoteCacheLock unlock];
     if (cached) return cached.unsignedLongLongValue;
-
     uint64_t value = r_sel(name.UTF8String);
-    if (value) {
-        [gIGRemoteCacheLock lock];
-        gIGSelectorCache[name] = @(value);
-        [gIGRemoteCacheLock unlock];
-    }
+    if (value) gIGSelectorCache[name] = @(value);
     return value;
 }
 
-// 无参 getter：直接一条 objc_msgSend ROP，不建 NSInvocation。
-// 只读标量属性，不会改 UIKit 的对象图，所以可以脱离主线程调用。
-static uint64_t ig_get(uint64_t object, NSString *selName)
+static uint64_t ig_msg(uint64_t obj, NSString *selName, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
 {
-    if (!r_is_objc_ptr(object)) return 0;
+    if (!r_is_objc_ptr(obj)) return 0;
     uint64_t sel = ig_sel(selName);
     if (!sel) return 0;
-    return r_msg(object, sel, 0, 0, 0, 0);
+    return r_msg(obj, sel, a0, a1, a2, a3);
 }
 
-static void ig_main_rect(uint64_t object, const char *sel, CGRect rect)
+static uint64_t ig_get(uint64_t obj, NSString *selName)
 {
-    if (!r_is_objc_ptr(object) || !sel) return;
-    r_msg2_main_raw(object, sel, &rect, sizeof(rect), NULL, 0, NULL, 0, NULL, 0);
+    return ig_msg(obj, selName, 0, 0, 0, 0);
 }
 
-static void ig_main_double(uint64_t object, const char *sel, double value)
+static void ig_set_rect(uint64_t obj, const char *selName, CGRect rect)
 {
-    if (!r_is_objc_ptr(object) || !sel) return;
-    r_msg2_main_raw(object, sel, &value, sizeof(value), NULL, 0, NULL, 0, NULL, 0);
+    if (!r_is_objc_ptr(obj) || !selName) return;
+    r_msg2_main_raw(obj, selName, &rect, sizeof(rect), NULL, 0, NULL, 0, NULL, 0);
 }
 
-static void ig_main_call(uint64_t object, const char *sel, uint64_t a0)
+static void ig_set_double(uint64_t obj, const char *selName, double value)
 {
-    if (!r_is_objc_ptr(object) || !sel) return;
-    r_msg2_main(object, sel, a0, 0, 0, 0);
-}
-
-static void ig_main_call0(uint64_t object, const char *sel)
-{
-    if (!r_is_objc_ptr(object) || !sel) return;
-    r_msg2_main(object, sel, 0, 0, 0, 0);
+    if (!r_is_objc_ptr(obj) || !selName) return;
+    r_msg2_main_raw(obj, selName, &value, sizeof(value), NULL, 0, NULL, 0, NULL, 0);
 }
 
 static uint64_t ig_nsstring(NSString *text)
@@ -190,18 +139,9 @@ static void ig_release(uint64_t object)
     r_msg(object, sel, 0, 0, 0, 0);
 }
 
-static uint32_t ig_color_argb(UIColor *color)
+static uint64_t ig_sel_c(const char *name)
 {
-    CGFloat r = 1.0, g = 1.0, b = 1.0, a = 1.0;
-    if (![color getRed:&r green:&g blue:&b alpha:&a]) {
-        CGFloat white = 1.0;
-        CGFloat alpha = 1.0;
-        if ([color getWhite:&white alpha:&alpha]) {
-            r = g = b = white;
-            a = alpha;
-        }
-    }
-    return IGColorMake(r, g, b, a);
+    return ig_sel([NSString stringWithUTF8String:name]);
 }
 
 #pragma mark - 远程视图工厂
@@ -211,45 +151,59 @@ static uint64_t ig_window_create(uint64_t scene, CGRect frame)
     uint64_t cls = ig_class(@"UIWindow");
     if (!r_is_objc_ptr(cls)) return 0;
 
-    uint64_t alloc = r_msg2_main(cls, "alloc", 0, 0, 0, 0);
+    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
     if (!r_is_objc_ptr(alloc)) return 0;
 
     uint64_t window = 0;
     if (r_is_objc_ptr(scene)) {
-        window = r_msg2_main(alloc, "initWithWindowScene:", scene, 0, 0, 0);
-    }
-    if (!r_is_objc_ptr(window)) {
-        alloc = r_msg2_main(cls, "alloc", 0, 0, 0, 0);
+        window = ig_msg(alloc, @"initWithWindowScene:", scene, 0, 0, 0);
+        if (r_is_objc_ptr(window)) ig_set_rect(window, "setFrame:", frame);
+    } else {
+        alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
         if (!r_is_objc_ptr(alloc)) return 0;
         window = r_msg2_main_raw(alloc, "initWithFrame:", &frame, sizeof(frame),
                                  NULL, 0, NULL, 0, NULL, 0);
-    } else if (!CGRectEqualToRect(frame, CGRectZero)) {
-        ig_main_rect(window, "setFrame:", frame);
     }
     return window;
 }
 
-// 隐形开关：alpha 0.02 让 UIKit 仍然做 hitTest，但肉眼基本看不到。
+static uint64_t ig_make_image_view(uint64_t parent, CGRect frame, uint64_t clear)
+{
+    uint64_t imageAlloc = ig_msg(ig_class(@"UIImageView"), @"alloc", 0, 0, 0, 0);
+    if (!r_is_objc_ptr(imageAlloc)) return 0;
+
+    uint64_t view = r_msg2_main_raw(imageAlloc, "initWithFrame:", &frame, sizeof(frame),
+                                    NULL, 0, NULL, 0, NULL, 0);
+    if (!r_is_objc_ptr(view)) return 0;
+
+    ig_msg(view, @"setUserInteractionEnabled:", 0, 0, 0, 0);
+    ig_msg(view, @"setContentMode:", 1, 0, 0, 0);   // scaleAspectFit
+    if (r_is_objc_ptr(clear)) ig_msg(view, @"setBackgroundColor:", clear, 0, 0, 0);
+    ig_msg(parent, @"addSubview:", view, 0, 0, 0);
+    return view;
+}
+
+// 隐形控件：alpha 0.02 —— UIKit 的 hitTest 只忽略 alpha < 0.01，所以还能点。
 static uint64_t ig_make_switch(uint64_t parent, CGRect frame, BOOL on)
 {
     uint64_t cls = ig_class(@"UISwitch");
     if (!r_is_objc_ptr(cls)) return 0;
 
-    uint64_t alloc = r_msg2_main(cls, "alloc", 0, 0, 0, 0);
-    uint64_t control = r_is_objc_ptr(alloc) ? r_msg2_main(alloc, "init", 0, 0, 0, 0) : 0;
+    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
+    uint64_t control = r_is_objc_ptr(alloc) ? ig_msg(alloc, @"init", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(control)) return 0;
 
-    ig_main_rect(control, "setFrame:", frame);
-    ig_main_double(control, "setAlpha:", 0.02);
-    ig_main_call(control, "setOn:", on ? 1 : 0);
+    ig_set_rect(control, "setFrame:", frame);
+    ig_set_double(control, "setAlpha:", 0.02);
+    ig_msg(control, @"setOn:", on ? 1 : 0, 0, 0, 0);
 
-    uint64_t clear = r_msg2_main(ig_class(@"UIColor"), "clearColor", 0, 0, 0, 0);
+    uint64_t clear = ig_msg(ig_class(@"UIColor"), @"clearColor", 0, 0, 0, 0);
     if (r_is_objc_ptr(clear)) {
-        ig_main_call(control, "setOnTintColor:", clear);
-        ig_main_call(control, "setThumbTintColor:", clear);
+        ig_msg(control, @"setOnTintColor:", clear, 0, 0, 0);
+        ig_msg(control, @"setThumbTintColor:", clear, 0, 0, 0);
     }
 
-    ig_main_call(parent, "addSubview:", control);
+    ig_msg(parent, @"addSubview:", control, 0, 0, 0);
     return control;
 }
 
@@ -258,23 +212,23 @@ static uint64_t ig_make_segments(uint64_t parent, CGRect frame, NSArray<NSString
     uint64_t cls = ig_class(@"UISegmentedControl");
     if (!r_is_objc_ptr(cls)) return 0;
 
-    uint64_t alloc = r_msg2_main(cls, "alloc", 0, 0, 0, 0);
+    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
     if (!r_is_objc_ptr(alloc)) return 0;
 
     uint64_t control = r_msg2_main_raw(alloc, "initWithFrame:", &frame, sizeof(frame),
                                        NULL, 0, NULL, 0, NULL, 0);
     if (!r_is_objc_ptr(control)) return 0;
 
-    ig_main_double(control, "setAlpha:", 0.02);
+    ig_set_double(control, "setAlpha:", 0.02);
     for (NSString *label in labels) {
         uint64_t text = ig_nsstring(label);
         if (!r_is_objc_ptr(text)) continue;
-        r_msg2_main(control, "insertSegmentWithTitle:animated:", text, 0, 0, 0);
+        ig_msg(control, @"insertSegmentWithTitle:animated:", text, 0, 0, 0);
         ig_release(text);
     }
-    ig_main_call(control, "setSelectedSegmentIndex:", (uint64_t)MAX((NSInteger)0, active));
+    ig_msg(control, @"setSelectedSegmentIndex:", (uint64_t)MAX((NSInteger)0, active), 0, 0, 0);
 
-    ig_main_call(parent, "addSubview:", control);
+    ig_msg(parent, @"addSubview:", control, 0, 0, 0);
     return control;
 }
 
@@ -302,11 +256,12 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     CGRect _bubbleRect;
     CGFloat _renderScale;
 
-    uint64_t _canvasWindow;
+    CyanideScreenCanvas *_canvas;
+
     uint64_t _panelWindow;
     uint64_t _bubbleWindow;
     uint64_t _imageView;
-    uint64_t _fallbackLabel;
+    uint64_t _bubbleImageView;
 
     uint64_t _switchDemo;
     uint64_t _switchGrid;
@@ -314,44 +269,57 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     uint64_t _switchRestore;
     uint64_t _segWidth;
     uint64_t _segAlpha;
+    uint64_t _segFPS;
     uint64_t _segAnchor;
 
-    uint64_t _remoteBuffer;
-    uint32_t _remoteBufferCapacity;
+    // 每帧要用的句柄，装好之后不再查
+    uint64_t _nsdataClass;
+    uint64_t _uiimageClass;
+    uint64_t _selDataWithBytesLength;
+    uint64_t _selImageWithData;
+    uint64_t _selPerformOnMain;
+    uint64_t _selSetImage;
+
+    uint64_t _panelBuffer;
+    uint32_t _panelBufferCapacity;
 
     BOOL _panelHidden;
-    BOOL _imagePushVerified;
-    int _pushFailures;
-    NSTimeInterval _lastPushAt;
-    double _lastPushMS;
-    double _lastRenderMS;
-    double _fps;
+    BOOL _panelDirty;
+    BOOL _canvasDirty;
+    BOOL _busy;
+
+    int _panelPushFailures;
+    NSTimeInterval _lastPollAt;
+    NSTimeInterval _lastCanvasAt;
+    NSTimeInterval _lastPanelPushAt;
+    double _panelMS;
+    double _canvasMS;
+    double _canvasFPS;
+    NSUInteger _canvasCalls;
     double _demoPhase;
-    NSUInteger _lastPrimCount;
 
     CGFloat _lineWidth;
-    CGFloat _canvasAlpha;
+    UIColor *_strokeColor;
     NSInteger _widthIndex;
     NSInteger _alphaIndex;
+    NSInteger _fpsIndex;
     NSInteger _anchorIndex;
 
     BOOL _demoEnabled;
     BOOL _gridEnabled;
 
-    NSMutableArray<IGCanvasItem *> *_primitives;
-    NSLock *_primitivesLock;
-    IGUI *_ui;
+    NSMutableArray<NSArray<NSValue *> *> *_userStrips;
+    NSLock *_stripsLock;
 
-    BOOL _busy;
-    BOOL _needsPush;
+    IGUI *_ui;
     NSString *_statusLine;
 }
 
 + (instancetype)sharedOverlay
 {
     static CyanideImGuiOverlay *shared = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
         shared = [[CyanideImGuiOverlay alloc] init];
     });
     return shared;
@@ -362,48 +330,41 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     self = [super init];
     if (self) {
         _queue = dispatch_queue_create("com.cyanide.imguioverlay", DISPATCH_QUEUE_SERIAL);
-        _primitives = [NSMutableArray array];
-        _primitivesLock = [[NSLock alloc] init];
+        _userStrips = [NSMutableArray array];
+        _stripsLock = [[NSLock alloc] init];
         _ui = [[IGUI alloc] init];
+
         IGStyle style = _ui.style;
-        style.itemSpacingY = 4.0;
+        style.itemSpacingY = 3.0;
         _ui.style = style;
+
         _renderScale = kIGRenderScale;
-        _widthIndex = 1;                       // 线宽 2.0
-        _alphaIndex = 3;                       // 不透明度 205
-        _lineWidth = (CGFloat)(_widthIndex + 1);
-        _canvasAlpha = kIGAlphaSteps[_alphaIndex];
+        _widthIndex = 1;                        // 线宽 2pt
+        _alphaIndex = 4;                        // 不透明度 255
+        _fpsIndex = 2;                          // 60fps
         _anchorIndex = 0;
+        _lineWidth = (CGFloat)(_widthIndex + 1);
+        _strokeColor = [UIColor colorWithRed:0.26 green:0.59 blue:0.98 alpha:1.0];
         _demoEnabled = NO;
         _gridEnabled = NO;
         _state = IGOverlayStateIdle;
         _statusLine = @"未启动";
+        _canvas = [CyanideScreenCanvas sharedCanvas];
     }
     return self;
 }
 
-- (BOOL)isActive
-{
-    return _state == IGOverlayStateRunning;
-}
-
-- (BOOL)isStarting
-{
-    return _state == IGOverlayStateStarting;
-}
+- (BOOL)isActive { return _state == IGOverlayStateRunning; }
+- (BOOL)isStarting { return _state == IGOverlayStateStarting; }
 
 - (NSString *)statusLine
 {
-    @synchronized (self) {
-        return _statusLine ?: @"";
-    }
+    @synchronized (self) { return _statusLine ?: @""; }
 }
 
 - (void)setStatus:(NSString *)line
 {
-    @synchronized (self) {
-        _statusLine = [line copy];
-    }
+    @synchronized (self) { _statusLine = [line copy]; }
 }
 
 #pragma mark - 生命周期
@@ -428,34 +389,25 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     cyanide_log(@"[IMGUI] start: screen=%.0fx%.0f scale=%.1f",
                 _screenSize.width, _screenSize.height, _renderScale);
 
-    // 切到别的 App 后本进程要被保活，否则轮询和推帧都会停。
     ds_keepalive_apply_enabled(YES);
 
-    dispatch_async(_queue, ^{
-        [self installLocked];
-    });
+    dispatch_async(_queue, ^{ [self installLocked]; });
 }
 
 - (void)stop
 {
-    dispatch_async(_queue, ^{
-        [self teardownLocked];
-    });
+    dispatch_async(_queue, ^{ [self teardownLocked]; });
 }
 
 - (void)installLocked
 {
-    if (!kexploit_krw_ready()) {
-        BOOL ready = settings_ensure_kernel_ready();
-        if (!ready) {
-            [self setStatus:@"内核未就绪"];
-            cyanide_log(@"[IMGUI] install aborted: krw not ready");
-            @synchronized (self) { _state = IGOverlayStateFailed; }
-            return;
-        }
+    if (!kexploit_krw_ready() && !settings_ensure_kernel_ready()) {
+        [self setStatus:@"内核未就绪"];
+        @synchronized (self) { _state = IGOverlayStateFailed; }
+        return;
     }
 
-    ig_remote_cache_reset();
+    ig_cache_reset();
 
     RemoteCallSession *session =
         [[RemoteCallSession alloc] initWithProcess:@"SpringBoard"
@@ -464,22 +416,13 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     if (!session) {
         [self setStatus:[NSString stringWithFormat:@"SpringBoard 会话失败 (%d)",
                          (int)remote_call_last_init_failure()]];
-        cyanide_log(@"[IMGUI] SpringBoard session failed: %d", (int)remote_call_last_init_failure());
         @synchronized (self) { _state = IGOverlayStateFailed; }
         return;
     }
     _session = session;
-    cyanide_log(@"[IMGUI] SpringBoard session ok pid=%d", session.pid);
+    cyanide_log(@"[IMGUI] session ok pid=%d", session.pid);
 
     [self computeLayoutLocked];
-
-    __block uint64_t canvasWindow = 0;
-    __block uint64_t panelWindow = 0;
-    __block uint64_t bubbleWindow = 0;
-    __block uint64_t imageView = 0;
-    __block uint64_t swDemo = 0, swGrid = 0, swHide = 0, swRestore = 0;
-    __block uint64_t slWidth = 0, slAlpha = 0, segAnchor = 0;
-    __block BOOL built = NO;
 
     CGRect panelRect = _panelRect;
     CGRect bubbleRect = _bubbleRect;
@@ -488,87 +431,60 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     BOOL gridOn = _gridEnabled;
     NSInteger widthIndex = _widthIndex;
     NSInteger alphaIndex = _alphaIndex;
+    NSInteger fpsIndex = _fpsIndex;
     NSInteger anchorIndex = _anchorIndex;
 
-    uint32_t previousSettle = r_settle_us(kIGSettleMicroseconds);
+    __block uint64_t panelWindow = 0;
+    __block uint64_t bubbleWindow = 0;
+    __block uint64_t imageView = 0;
+    __block uint64_t bubbleImageView = 0;
+    __block uint64_t swDemo = 0, swGrid = 0, swHide = 0, swRestore = 0;
+    __block uint64_t segWidth = 0, segAlpha = 0, segFPS = 0, segAnchor = 0;
+    __block uint64_t scene = 0;
+    __block BOOL built = NO;
+
+    uint32_t previousSettle = r_settle_us(8000);
 
     remote_call_with_session(session, ^{
-        uint64_t appClass = ig_class(@"UIApplication");
-        uint64_t app = r_is_objc_ptr(appClass)
-            ? r_msg2_main(appClass, "sharedApplication", 0, 0, 0, 0) : 0;
-        if (!r_is_objc_ptr(app)) {
-            cyanide_log(@"[IMGUI] no UIApplication");
-            return;
-        }
+        uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
+        if (!r_is_objc_ptr(app)) return;
 
-        uint64_t keyWindow = r_msg2_main(app, "keyWindow", 0, 0, 0, 0);
+        uint64_t keyWindow = ig_msg(app, @"keyWindow", 0, 0, 0, 0);
         if (!r_is_objc_ptr(keyWindow)) {
-            uint64_t windows = r_msg2_main(app, "windows", 0, 0, 0, 0);
-            uint64_t count = r_is_objc_ptr(windows) ? r_msg2_main(windows, "count", 0, 0, 0, 0) : 0;
+            uint64_t windows = ig_msg(app, @"windows", 0, 0, 0, 0);
+            uint64_t count = r_is_objc_ptr(windows) ? ig_msg(windows, @"count", 0, 0, 0, 0) : 0;
             if (count > 0 && count < 64) {
-                keyWindow = r_msg2_main(windows, "objectAtIndex:", 0, 0, 0, 0);
+                keyWindow = ig_msg(windows, @"objectAtIndex:", 0, 0, 0, 0);
             }
         }
+        scene = r_is_objc_ptr(keyWindow) ? ig_msg(keyWindow, @"windowScene", 0, 0, 0, 0) : 0;
 
-        uint64_t scene = r_is_objc_ptr(keyWindow)
-            ? r_msg2_main(keyWindow, "windowScene", 0, 0, 0, 0) : 0;
+        uint64_t clear = ig_msg(ig_class(@"UIColor"), @"clearColor", 0, 0, 0, 0);
 
-        uint64_t clear = r_msg2_main(ig_class(@"UIColor"), "clearColor", 0, 0, 0, 0);
-
-        // ── 画布窗口：全屏、透明、不吃触摸 ──────────────────────────
-        CGRect screenRect = CGRectMake(0.0, 0.0, screenSize.width, screenSize.height);
-        canvasWindow = ig_window_create(scene, screenRect);
-        if (!r_is_objc_ptr(canvasWindow)) {
-            cyanide_log(@"[IMGUI] canvas window create failed");
-            return;
-        }
-        ig_main_double(canvasWindow, "setWindowLevel:", kIGCanvasLevel);
-        ig_main_call(canvasWindow, "setOpaque:", 0);
-        ig_main_call(canvasWindow, "setUserInteractionEnabled:", 0);
-        if (r_is_objc_ptr(clear)) ig_main_call(canvasWindow, "setBackgroundColor:", clear);
-
-        uint64_t imageClass = ig_class(@"UIImageView");
-        uint64_t imageAlloc = r_msg2_main(imageClass, "alloc", 0, 0, 0, 0);
-        imageView = r_is_objc_ptr(imageAlloc)
-            ? r_msg2_main_raw(imageAlloc, "initWithFrame:", &screenRect, sizeof(screenRect),
-                              NULL, 0, NULL, 0, NULL, 0)
-            : 0;
-        if (!r_is_objc_ptr(imageView)) {
-            cyanide_log(@"[IMGUI] image view create failed");
-            return;
-        }
-        ig_main_call(imageView, "setUserInteractionEnabled:", 0);
-        ig_main_call(imageView, "setContentMode:", 1); // scaleAspectFit
-        if (r_is_objc_ptr(clear)) ig_main_call(imageView, "setBackgroundColor:", clear);
-        ig_main_call(canvasWindow, "addSubview:", imageView);
-        ig_main_call(canvasWindow, "setHidden:", 0);
-
-        // ── 面板窗口：只有面板大小，隐形控件都挂这儿 ────────────────
         panelWindow = ig_window_create(scene, panelRect);
-        if (!r_is_objc_ptr(panelWindow)) {
-            cyanide_log(@"[IMGUI] panel window create failed");
-            return;
-        }
-        ig_main_double(panelWindow, "setWindowLevel:", kIGPanelLevel);
-        ig_main_call(panelWindow, "setOpaque:", 0);
-        if (r_is_objc_ptr(clear)) ig_main_call(panelWindow, "setBackgroundColor:", clear);
-        ig_main_call(panelWindow, "setHidden:", 0);
+        if (!r_is_objc_ptr(panelWindow)) return;
+        ig_set_double(panelWindow, "setWindowLevel:", (double)kIGPanelLevel);
+        ig_msg(panelWindow, @"setOpaque:", 0, 0, 0, 0);
+        ig_msg(panelWindow, @"setHidden:", 0, 0, 0, 0);
+        if (r_is_objc_ptr(clear)) ig_msg(panelWindow, @"setBackgroundColor:", clear, 0, 0, 0);
 
-        // ── 收起后的小圆钮 ─────────────────────────────────────────
+        CGRect imageFrame = CGRectMake(0.0, 0.0, panelRect.size.width, panelRect.size.height);
+        imageView = ig_make_image_view(panelWindow, imageFrame, clear);
+        if (!r_is_objc_ptr(imageView)) return;
+
         bubbleWindow = ig_window_create(scene, bubbleRect);
         if (r_is_objc_ptr(bubbleWindow)) {
-            ig_main_double(bubbleWindow, "setWindowLevel:", kIGPanelLevel);
-            ig_main_call(bubbleWindow, "setOpaque:", 0);
-            if (r_is_objc_ptr(clear)) ig_main_call(bubbleWindow, "setBackgroundColor:", clear);
-            ig_main_call(bubbleWindow, "setHidden:", 1);
+            ig_set_double(bubbleWindow, "setWindowLevel:", (double)kIGPanelLevel);
+            ig_msg(bubbleWindow, @"setOpaque:", 0, 0, 0, 0);
+            if (r_is_objc_ptr(clear)) ig_msg(bubbleWindow, @"setBackgroundColor:", clear, 0, 0, 0);
+            ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
+
+            CGRect bubbleImageFrame = CGRectMake(0.0, 0.0, kIGBubbleSize, kIGBubbleSize);
+            bubbleImageView = ig_make_image_view(bubbleWindow, bubbleImageFrame, clear);
         }
 
-        // 控件矩形：拿和渲染完全同一套布局跑一遍，再减去窗口原点。
-        __block CGRect rowDemo = CGRectZero;
-        __block CGRect rowGrid = CGRectZero;
-        __block CGRect rowHide = CGRectZero;
-        __block CGRect rowWidth = CGRectZero;
-        __block CGRect rowAlpha = CGRectZero;
+        __block CGRect rowDemo = CGRectZero, rowGrid = CGRectZero, rowHide = CGRectZero;
+        __block CGRect rowWidth = CGRectZero, rowAlpha = CGRectZero, rowFPS = CGRectZero;
         __block CGRect rowAnchor = CGRectZero;
 
         [self captureControlRectsLocked:^(NSString *key, CGRect rect) {
@@ -577,6 +493,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
             else if ([key isEqualToString:@"hide"]) rowHide = rect;
             else if ([key isEqualToString:@"width"]) rowWidth = rect;
             else if ([key isEqualToString:@"alpha"]) rowAlpha = rect;
+            else if ([key isEqualToString:@"fps"]) rowFPS = rect;
             else if ([key isEqualToString:@"anchor"]) rowAnchor = rect;
         }];
 
@@ -586,12 +503,12 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         swDemo = ig_make_switch(panelWindow, CGRectOffset(rowDemo, offsetX, offsetY), demoOn);
         swGrid = ig_make_switch(panelWindow, CGRectOffset(rowGrid, offsetX, offsetY), gridOn);
         swHide = ig_make_switch(panelWindow, CGRectOffset(rowHide, offsetX, offsetY), NO);
-        slWidth = ig_make_segments(panelWindow, CGRectOffset(rowWidth, offsetX, offsetY),
-                                   @[@"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8"],
-                                   widthIndex);
-        slAlpha = ig_make_segments(panelWindow, CGRectOffset(rowAlpha, offsetX, offsetY),
-                                   @[@"40", @"95", @"150", @"205", @"255"],
-                                   alphaIndex);
+        segWidth = ig_make_segments(panelWindow, CGRectOffset(rowWidth, offsetX, offsetY),
+                                    @[@"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8"], widthIndex);
+        segAlpha = ig_make_segments(panelWindow, CGRectOffset(rowAlpha, offsetX, offsetY),
+                                    @[@"40", @"95", @"150", @"205", @"255"], alphaIndex);
+        segFPS = ig_make_segments(panelWindow, CGRectOffset(rowFPS, offsetX, offsetY),
+                                  @[@"15", @"30", @"60"], fpsIndex);
         segAnchor = ig_make_segments(panelWindow, CGRectOffset(rowAnchor, offsetX, offsetY),
                                      @[@"Top", @"Right", @"Bottom"], anchorIndex);
 
@@ -600,65 +517,72 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
             swRestore = ig_make_switch(bubbleWindow, restoreFrame, NO);
         }
 
-        // 关联到 UIApplication，避免窗口被释放。
-        uint64_t keyCanvas = r_sel(kIGKeyCanvas);
-        uint64_t keyPanel = r_sel(kIGKeyPanel);
-        uint64_t keyBubble = r_sel(kIGKeyBubble);
-        if (keyCanvas) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyCanvas, canvasWindow, 1, 0, 0, 0, 0);
+        uint64_t assocPanel = ig_sel_c(kIGKeyPanel);
+        uint64_t assocBubble = ig_sel_c(kIGKeyBubble);
+        if (assocPanel) {
+            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocPanel, panelWindow, 1, 0, 0, 0, 0);
         }
-        if (keyPanel) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyPanel, panelWindow, 1, 0, 0, 0, 0);
-        }
-        if (keyBubble && r_is_objc_ptr(bubbleWindow)) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyBubble, bubbleWindow, 1, 0, 0, 0, 0);
+        if (assocBubble && r_is_objc_ptr(bubbleWindow)) {
+            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocBubble, bubbleWindow, 1, 0, 0, 0, 0);
         }
 
-        built = r_is_objc_ptr(canvasWindow) && r_is_objc_ptr(imageView);
-        cyanide_log(@"[IMGUI] windows: canvas=0x%llx panel=0x%llx bubble=0x%llx image=0x%llx",
-                    canvasWindow, panelWindow, bubbleWindow, imageView);
+        built = r_is_objc_ptr(panelWindow) && r_is_objc_ptr(imageView);
+        cyanide_log(@"[IMGUI] panel=0x%llx image=0x%llx bubble=0x%llx scene=0x%llx",
+                    panelWindow, imageView, bubbleWindow, scene);
     });
 
     r_settle_us(previousSettle);
 
-    _canvasWindow = canvasWindow;
     _panelWindow = panelWindow;
     _bubbleWindow = bubbleWindow;
     _imageView = imageView;
+    _bubbleImageView = bubbleImageView;
     _switchDemo = swDemo;
     _switchGrid = swGrid;
     _switchHide = swHide;
     _switchRestore = swRestore;
-    _segWidth = slWidth;
-    _segAlpha = slAlpha;
+    _segWidth = segWidth;
+    _segAlpha = segAlpha;
+    _segFPS = segFPS;
     _segAnchor = segAnchor;
 
-    if (!built || !r_is_objc_ptr(_imageView)) {
-        [self setStatus:@"悬浮窗创建失败"];
-        cyanide_log(@"[IMGUI] install failed: windows not built");
+    if (!built) {
+        [self setStatus:@"面板创建失败"];
         [self teardownLocked];
         @synchronized (self) { _state = IGOverlayStateFailed; }
         return;
     }
 
-    [self ensureRemoteBufferLocked];
+    // 画布：全屏透明、点击穿透，线走 CAShapeLayer
+    if (![_canvas attachWithSession:session scene:scene screenSize:screenSize]) {
+        [self setStatus:@"画布创建失败"];
+        [self teardownLocked];
+        @synchronized (self) { _state = IGOverlayStateFailed; }
+        return;
+    }
+    [_canvas setGridVisible:gridOn];
 
-    // 第一帧顺带验证「推图」这条路通不通。
-    NSData *firstFrame = [self renderFrameLocked];
-    if (firstFrame.length > 0) {
-        [self pushPNGLocked:firstFrame];
+    // 每帧要用的句柄，先查好（之后每帧只发 r_msg）
+    _nsdataClass = ig_class(@"NSData");
+    _uiimageClass = ig_class(@"UIImage");
+    _selDataWithBytesLength = ig_sel(@"dataWithBytes:length:");
+    _selImageWithData = ig_sel(@"imageWithData:");
+    _selPerformOnMain = ig_sel(@"performSelectorOnMainThread:withObject:waitUntilDone:");
+    _selSetImage = ig_sel(@"setImage:");
+
+    [self ensurePanelBufferLocked];
+
+    if (r_is_objc_ptr(_bubbleImageView)) {
+        NSData *bubblePNG = [self renderBubblePNGLocked];
+        if (bubblePNG.length > 0) [self pushPNGLocked:bubblePNG toImageView:_bubbleImageView];
     }
 
-    if (!_imagePushVerified) {
-        cyanide_log(@"[IMGUI] image push not verified, installing fallback label");
-        [self installFallbackLabelLocked];
-    }
+    [self pushPanelLocked];
+    [self updateCanvasLocked];
 
     [self startTimerLocked];
-    [self setStatus:[NSString stringWithFormat:@"运行中 · %.0f×%.0f · 画布可穿透",
-                     _screenSize.width, _screenSize.height]];
+    [self setStatus:[NSString stringWithFormat:@"运行中 · %.0f×%.0f", _screenSize.width, _screenSize.height]];
     @synchronized (self) { _state = IGOverlayStateRunning; }
-    _needsPush = YES;
     cyanide_log(@"[IMGUI] running");
 }
 
@@ -669,58 +593,55 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         _timer = nil;
     }
 
-    uint64_t canvasWindow = _canvasWindow;
+    [_canvas detach];
+
+    RemoteCallSession *session = _session;
     uint64_t panelWindow = _panelWindow;
     uint64_t bubbleWindow = _bubbleWindow;
-    RemoteCallSession *session = _session;
+    uint64_t panelBuffer = _panelBuffer;
 
     if (session) {
-        NSArray<NSNumber *> *handles = @[@(canvasWindow), @(panelWindow), @(bubbleWindow)];
-        uint32_t previousSettle = r_settle_us(kIGSettleMicroseconds);
+        uint32_t previousSettle = r_settle_us(8000);
         remote_call_with_session(session, ^{
-            for (NSNumber *number in handles) {
-                uint64_t handle = number.unsignedLongLongValue;
-                if (!r_is_objc_ptr(handle)) continue;
-                ig_main_call(handle, "setHidden:", 1);
-                ig_main_call0(handle, "removeFromSuperview");
-            }
+            if (r_is_objc_ptr(panelWindow)) ig_msg(panelWindow, @"setHidden:", 1, 0, 0, 0);
+            if (r_is_objc_ptr(bubbleWindow)) ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
 
-            uint64_t app = r_msg2_main(ig_class(@"UIApplication"), "sharedApplication", 0, 0, 0, 0);
+            uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
             if (r_is_objc_ptr(app)) {
-                uint64_t keyCanvas = r_sel(kIGKeyCanvas);
-                uint64_t keyPanel = r_sel(kIGKeyPanel);
-                uint64_t keyBubble = r_sel(kIGKeyBubble);
-                if (keyCanvas) {
-                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyCanvas, 0, 1, 0, 0, 0, 0);
+                uint64_t assocPanel = ig_sel_c(kIGKeyPanel);
+                uint64_t assocBubble = ig_sel_c(kIGKeyBubble);
+                if (assocPanel) {
+                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocPanel, 0, 1, 0, 0, 0, 0);
                 }
-                if (keyPanel) {
-                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyPanel, 0, 1, 0, 0, 0, 0);
+                if (assocBubble) {
+                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocBubble, 0, 1, 0, 0, 0, 0);
                 }
-                if (keyBubble) {
-                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, keyBubble, 0, 1, 0, 0, 0, 0);
-                }
+            }
+            if (r_is_objc_ptr(panelBuffer)) {
+                r_dlsym_call(R_TIMEOUT, "free", panelBuffer, 0, 0, 0, 0, 0, 0, 0);
             }
         });
         r_settle_us(previousSettle);
     }
 
-    _canvasWindow = 0;
     _panelWindow = 0;
     _bubbleWindow = 0;
     _imageView = 0;
-    _fallbackLabel = 0;
+    _bubbleImageView = 0;
     _switchDemo = 0;
     _switchGrid = 0;
     _switchHide = 0;
     _switchRestore = 0;
     _segWidth = 0;
     _segAlpha = 0;
+    _segFPS = 0;
     _segAnchor = 0;
-    _remoteBuffer = 0;
-    _remoteBufferCapacity = 0;
-    _imagePushVerified = NO;
-    _pushFailures = 0;
+    _panelBuffer = 0;
+    _panelBufferCapacity = 0;
     _panelHidden = NO;
+    _panelDirty = NO;
+    _canvasDirty = NO;
+    _panelPushFailures = 0;
     _session = nil;
 
     @synchronized (self) { _state = IGOverlayStateIdle; }
@@ -731,19 +652,18 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 - (void)startTimerLocked
 {
     if (_timer) return;
-
-    __weak typeof(self) weakSelf = self;
     dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, _queue);
     if (!timer) return;
 
+    __weak typeof(self) weakSelf = self;
     dispatch_source_set_timer(timer,
                               dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kIGTickInterval * NSEC_PER_SEC)),
                               (uint64_t)(kIGTickInterval * NSEC_PER_SEC),
-                              (uint64_t)(0.02 * NSEC_PER_SEC));
+                              (uint64_t)(0.002 * NSEC_PER_SEC));
     dispatch_source_set_event_handler(timer, ^{
-        __strong typeof(weakSelf) self = weakSelf;
-        if (!self) return;
-        [self tick];
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        [strongSelf tick];
     });
     dispatch_resume(timer);
     _timer = timer;
@@ -763,15 +683,12 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     CGFloat originX = (_anchorIndex == 1) ? (screenW - kIGPanelWidth - kIGPanelMargin) : kIGPanelMargin;
     CGFloat originY = kIGPanelTop;
-    if (_anchorIndex == 2) {
-        originY = MAX(kIGPanelTop, screenH - panelHeight - 110.0);
-    }
+    if (_anchorIndex == 2) originY = MAX(kIGPanelTop, screenH - panelHeight - 110.0);
 
     _panelRect = CGRectMake(originX, originY, kIGPanelWidth, panelHeight);
     _bubbleRect = CGRectMake(originX, originY, kIGBubbleSize, kIGBubbleSize);
 }
 
-// 用真实原点跑一遍布局，把每个可交互行的屏幕矩形抓出来。
 - (void)captureControlRectsLocked:(void (^)(NSString *key, CGRect rect))capture
 {
     if (!capture) return;
@@ -786,16 +703,16 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 {
     IGUI *ui = _ui;
 
-    [ui text:[NSString stringWithFormat:@"fps %.1f   prims %lu",
-              _fps, (unsigned long)_lastPrimCount]];
-    [ui textDisabled:[NSString stringWithFormat:@"frame %.0fms   settle %ums",
-                      _lastPushMS, (unsigned)kIGSettleMicroseconds / 1000u]];
+    [ui text:[NSString stringWithFormat:@"canvas %.0f fps · %lu calls",
+              _canvasFPS, (unsigned long)_canvasCalls]];
+    [ui textDisabled:[NSString stringWithFormat:@"canvas %.1fms  panel %.1fms",
+                      _canvasMS, _panelMS]];
     [ui separator];
 
     [ui checkbox:@"Demo lines" value:_demoEnabled];
     if (capture) capture(@"demo", ui.lastItemRect);
 
-    [ui checkbox:@"Grid + crosshair" value:_gridEnabled];
+    [ui checkbox:@"Grid" value:_gridEnabled];
     if (capture) capture(@"grid", ui.lastItemRect);
 
     [ui separator];
@@ -811,15 +728,20 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
                  value:_alphaIndex
                    min:0
                    max:4
-             valueText:[NSString stringWithFormat:@"%.0f", _canvasAlpha]];
+             valueText:[NSString stringWithFormat:@"%.0f", kIGAlphaSteps[_alphaIndex]]];
     if (capture) capture(@"alpha", ui.lastItemRect);
+
+    [ui sliderIntTicks:@"FPS cap"
+                 value:_fpsIndex
+                   min:0
+                   max:2
+             valueText:[NSString stringWithFormat:@"%ld", (long)kIGFPSSteps[_fpsIndex]]];
+    if (capture) capture(@"fps", ui.lastItemRect);
 
     [ui separator];
 
     [ui tabBar:@[@"Top", @"Right", @"Bottom"] active:_anchorIndex];
     if (capture) capture(@"anchor", ui.lastItemRect);
-
-    [ui separator];
 
     [ui button:@"Hide panel"];
     if (capture) capture(@"hide", ui.lastItemRect);
@@ -827,7 +749,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     [ui textDisabled:@"canvas: click-through"];
 }
 
-#pragma mark - 轮询
+#pragma mark - 帧循环
 
 - (void)tick
 {
@@ -836,19 +758,206 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     _busy = YES;
     @try {
-        [self pollLocked];
-
         NSTimeInterval now = CACurrentMediaTime();
-        if (_demoEnabled) _needsPush = YES;
 
-        if (_needsPush && (now - _lastPushAt) >= kIGMinPushInterval) {
-            _needsPush = NO;
-            [self renderAndPushLocked];
+        if (now - _lastPollAt >= kIGPollInterval) {
+            _lastPollAt = now;
+            [self pollLocked];
+        }
+
+        NSInteger targetFPS = MAX((NSInteger)1, kIGFPSSteps[_fpsIndex]);
+        NSTimeInterval interval = 1.0 / (NSTimeInterval)targetFPS;
+
+        if ((_demoEnabled || _canvasDirty) && (now - _lastCanvasAt) >= interval) {
+            _lastCanvasAt = now;
+            _canvasDirty = NO;
+            if (_demoEnabled) {
+                _demoPhase += 1.6 / (double)targetFPS;
+                if (_demoPhase > M_PI * 2.0) _demoPhase -= M_PI * 2.0;
+            }
+            [self updateCanvasLocked];
+        }
+
+        if (_panelDirty && !_panelHidden && (now - _lastPanelPushAt) >= kIGPanelPushInterval) {
+            _lastPanelPushAt = now;
+            _panelDirty = NO;
+            [self pushPanelLocked];
         }
     } @finally {
         _busy = NO;
     }
 }
+
+#pragma mark - 画布
+
+- (NSArray<NSArray<NSValue *> *> *)demoStripsLocked
+{
+    CGSize size = _screenSize;
+    CGPoint center = CGPointMake(size.width / 2.0, size.height / 2.0);
+    CGFloat radius = MIN(size.width, size.height) * 0.30;
+
+    // 八根辐条拼成一条折线：每根都从圆心出发，不会有跨辐条的多余连线
+    NSMutableArray<NSValue *> *spokes = [NSMutableArray arrayWithCapacity:18];
+    for (NSInteger i = 0; i <= 8; i++) {
+        CGFloat angle = (CGFloat)_demoPhase + (CGFloat)i * (CGFloat)M_PI / 4.0;
+        [spokes addObject:[NSValue valueWithCGPoint:center]];
+        [spokes addObject:[NSValue valueWithCGPoint:
+                           CGPointMake(center.x + cos(angle) * radius,
+                                       center.y + sin(angle) * radius)]];
+    }
+
+    // 呼吸圆环：48 边形闭合折线
+    CGFloat ringRadius = 42.0 + 9.0 * (CGFloat)sin(_demoPhase * 2.0);
+    NSMutableArray<NSValue *> *ring = [NSMutableArray arrayWithCapacity:49];
+    for (NSInteger i = 0; i <= 48; i++) {
+        CGFloat angle = (CGFloat)i * 2.0 * (CGFloat)M_PI / 48.0;
+        [ring addObject:[NSValue valueWithCGPoint:
+                         CGPointMake(center.x + cos(angle) * ringRadius,
+                                     center.y + sin(angle) * ringRadius)]];
+    }
+
+    return @[spokes, ring];
+}
+
+- (void)updateCanvasLocked
+{
+    NSMutableArray<NSArray<NSValue *> *> *strips = [NSMutableArray array];
+
+    if (_demoEnabled) [strips addObjectsFromArray:[self demoStripsLocked]];
+
+    [_stripsLock lock];
+    if (_userStrips.count > 0) [strips addObjectsFromArray:_userStrips];
+    [_stripsLock unlock];
+
+    UIColor *color = [_strokeColor colorWithAlphaComponent:kIGAlphaSteps[_alphaIndex] / 255.0];
+    [_canvas setStrips:strips color:color width:_lineWidth];
+
+    _canvasCalls = _canvas.lastCallCount;
+    _canvasMS = _canvas.lastUpdateMS;
+    if (_canvasMS > 0.05) {
+        double instant = 1000.0 / _canvasMS;
+        _canvasFPS = (_canvasFPS < 1.0) ? instant : (_canvasFPS * 0.8 + instant * 0.2);
+    }
+}
+
+#pragma mark - 面板推图
+
+- (void)ensurePanelBufferLocked
+{
+    if (r_is_objc_ptr(_panelBuffer) && _panelBufferCapacity >= kIGPanelBufferBytes) return;
+    if (!_session) return;
+
+    RemoteCallSession *session = _session;
+    __block uint64_t buffer = 0;
+    remote_call_with_session(session, ^{
+        buffer = r_dlsym_call(R_TIMEOUT, "malloc", kIGPanelBufferBytes, 0, 0, 0, 0, 0, 0, 0);
+    });
+
+    if (r_is_objc_ptr(buffer)) {
+        _panelBuffer = buffer;
+        _panelBufferCapacity = kIGPanelBufferBytes;
+    } else {
+        cyanide_log(@"[IMGUI] panel buffer alloc failed");
+    }
+}
+
+- (NSData *)renderPanelPNGLocked
+{
+    [_ui beginFrameWithDisplaySize:_screenSize];
+    [_ui beginWindow:@"Cyanide · ImGui" frame:_panelRect];
+    [self buildPanelRowsWithCapture:nil];
+    [_ui endWindow];
+    [_ui endFrame];
+
+    UIImage *image = [_ui.drawList renderWithSize:_panelRect.size
+                                            scale:_renderScale
+                                        translate:IGVec2Make(_panelRect.origin.x,
+                                                             _panelRect.origin.y)];
+    return image ? UIImagePNGRepresentation(image) : nil;
+}
+
+- (NSData *)renderBubblePNGLocked
+{
+    IGDrawList *list = [[IGDrawList alloc] init];
+    CGFloat half = kIGBubbleSize / 2.0;
+    [list addCircleFilledAt:IGVec2Make(half, half)
+                     radius:half - 1.0
+                      color:IGColorMake(0.06, 0.06, 0.06, 0.92)];
+    [list addCircleAt:IGVec2Make(half, half)
+               radius:half - 1.0
+                color:IGColorMake(0.26, 0.59, 0.98, 0.90)
+            thickness:1.5];
+    [list addText:@"IG"
+               at:IGVec2Make(half - 8.0, half - 7.0)
+         fontSize:12.0
+            color:IGColorMake(1.0, 1.0, 1.0, 0.95)];
+    UIImage *image = [list renderWithSize:CGSizeMake(kIGBubbleSize, kIGBubbleSize)
+                                   scale:_renderScale];
+    return image ? UIImagePNGRepresentation(image) : nil;
+}
+
+// 3 条消息：dataWithBytes:length: → imageWithData: → 主线程 setImage:
+- (BOOL)pushPNGLocked:(NSData *)png toImageView:(uint64_t)imageView
+{
+    if (!_session || !r_is_objc_ptr(imageView) || png.length == 0) return NO;
+    if (!r_is_objc_ptr(_panelBuffer)) [self ensurePanelBufferLocked];
+    if (!r_is_objc_ptr(_panelBuffer) || png.length > _panelBufferCapacity) return NO;
+
+    RemoteCallSession *session = _session;
+    uint64_t buffer = _panelBuffer;
+    const void *bytes = png.bytes;
+    uint64_t length = (uint64_t)png.length;
+    uint64_t nsdataClass = _nsdataClass;
+    uint64_t uiimageClass = _uiimageClass;
+    uint64_t selData = _selDataWithBytesLength;
+    uint64_t selImage = _selImageWithData;
+    uint64_t selPerform = _selPerformOnMain;
+    uint64_t selSetImage = _selSetImage;
+
+    __block BOOL ok = NO;
+    remote_call_with_session(session, ^{
+        if (!remote_write(buffer, bytes, length)) {
+            cyanide_log(@"[IMGUI] remote_write failed (%llu bytes)", length);
+            return;
+        }
+
+        uint64_t data = r_msg(nsdataClass, selData, buffer, length, 0, 0);
+        if (!r_is_objc_ptr(data)) return;
+
+        uint64_t image = r_msg(uiimageClass, selImage, data, 0, 0, 0);
+        if (!r_is_objc_ptr(image)) return;
+
+        r_msg(imageView, selPerform, selSetImage, image, 1, 0);
+        ok = YES;
+    });
+    return ok;
+}
+
+- (void)pushPanelLocked
+{
+    if (!_session || !r_is_objc_ptr(_imageView)) return;
+
+    NSTimeInterval begin = CACurrentMediaTime();
+    NSData *png = [self renderPanelPNGLocked];
+    if (png.length == 0) return;
+    if (png.length > _panelBufferCapacity) {
+        cyanide_log(@"[IMGUI] panel png too big: %lu", (unsigned long)png.length);
+        return;
+    }
+
+    BOOL ok = [self pushPNGLocked:png toImageView:_imageView];
+    _panelMS = (CACurrentMediaTime() - begin) * 1000.0;
+
+    if (ok) {
+        _panelPushFailures = 0;
+    } else {
+        _panelPushFailures += 1;
+        cyanide_log(@"[IMGUI] panel push failed (%d)", _panelPushFailures);
+        if (_panelPushFailures >= 5) [self setStatus:@"面板推图连续失败"];
+    }
+}
+
+#pragma mark - 轮询
 
 - (void)pollLocked
 {
@@ -859,9 +968,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         uint64_t restoreSwitch = _switchRestore;
         __block BOOL restore = NO;
         remote_call_with_session(session, ^{
-            if (r_is_objc_ptr(restoreSwitch)) {
-                restore = (ig_get(restoreSwitch, @"isOn") & 0xFF) != 0;
-            }
+            if (r_is_objc_ptr(restoreSwitch)) restore = (ig_get(restoreSwitch, @"isOn") & 0xFF) != 0;
         });
         if (restore) [self showPanelLocked];
         return;
@@ -870,55 +977,69 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     uint64_t demoSwitch = _switchDemo;
     uint64_t gridSwitch = _switchGrid;
     uint64_t hideSwitch = _switchHide;
-    uint64_t widthSegments = _segWidth;
-    uint64_t alphaSegments = _segAlpha;
-    uint64_t anchorSegments = _segAnchor;
+    uint64_t widthSeg = _segWidth;
+    uint64_t alphaSeg = _segAlpha;
+    uint64_t fpsSeg = _segFPS;
+    uint64_t anchorSeg = _segAnchor;
 
-    __block BOOL demo = NO;
-    __block BOOL grid = NO;
-    __block BOOL hide = NO;
-    __block NSInteger widthIndex = _widthIndex;
-    __block NSInteger alphaIndex = _alphaIndex;
-    __block NSInteger anchor = _anchorIndex;
+    __block BOOL demo = NO, grid = NO, hide = NO;
+    __block NSInteger width = _widthIndex, alpha = _alphaIndex;
+    __block NSInteger fps = _fpsIndex, anchor = _anchorIndex;
 
     remote_call_with_session(session, ^{
         if (r_is_objc_ptr(demoSwitch)) demo = (ig_get(demoSwitch, @"isOn") & 0xFF) != 0;
         if (r_is_objc_ptr(gridSwitch)) grid = (ig_get(gridSwitch, @"isOn") & 0xFF) != 0;
         if (r_is_objc_ptr(hideSwitch)) hide = (ig_get(hideSwitch, @"isOn") & 0xFF) != 0;
-        if (r_is_objc_ptr(widthSegments)) {
-            uint64_t index = ig_get(widthSegments, @"selectedSegmentIndex");
-            if (index <= 7) widthIndex = (NSInteger)index;
+
+        if (r_is_objc_ptr(widthSeg)) {
+            uint64_t index = ig_get(widthSeg, @"selectedSegmentIndex");
+            if (index <= 7) width = (NSInteger)index;
         }
-        if (r_is_objc_ptr(alphaSegments)) {
-            uint64_t index = ig_get(alphaSegments, @"selectedSegmentIndex");
-            if (index <= 4) alphaIndex = (NSInteger)index;
+        if (r_is_objc_ptr(alphaSeg)) {
+            uint64_t index = ig_get(alphaSeg, @"selectedSegmentIndex");
+            if (index <= 4) alpha = (NSInteger)index;
         }
-        if (r_is_objc_ptr(anchorSegments)) {
-            uint64_t index = ig_get(anchorSegments, @"selectedSegmentIndex");
+        if (r_is_objc_ptr(fpsSeg)) {
+            uint64_t index = ig_get(fpsSeg, @"selectedSegmentIndex");
+            if (index <= 2) fps = (NSInteger)index;
+        }
+        if (r_is_objc_ptr(anchorSeg)) {
+            uint64_t index = ig_get(anchorSeg, @"selectedSegmentIndex");
             if (index <= 2) anchor = (NSInteger)index;
         }
     });
 
-    if (demo != _demoEnabled) { _demoEnabled = demo; _needsPush = YES; }
-    if (grid != _gridEnabled) { _gridEnabled = grid; _needsPush = YES; }
-    if (widthIndex != _widthIndex) {
-        _widthIndex = widthIndex;
-        _lineWidth = (CGFloat)(widthIndex + 1);
-        _needsPush = YES;
+    if (demo != _demoEnabled) {
+        _demoEnabled = demo;
+        _canvasDirty = YES;
+        _panelDirty = YES;
     }
-    if (alphaIndex != _alphaIndex) {
-        _alphaIndex = alphaIndex;
-        _canvasAlpha = kIGAlphaSteps[alphaIndex];
-        _needsPush = YES;
+    if (grid != _gridEnabled) {
+        _gridEnabled = grid;
+        [_canvas setGridVisible:grid];
+        _panelDirty = YES;
+    }
+    if (width != _widthIndex) {
+        _widthIndex = width;
+        _lineWidth = (CGFloat)(width + 1);
+        _canvasDirty = YES;
+        _panelDirty = YES;
+    }
+    if (alpha != _alphaIndex) {
+        _alphaIndex = alpha;
+        _canvasDirty = YES;
+        _panelDirty = YES;
+    }
+    if (fps != _fpsIndex) {
+        _fpsIndex = fps;
+        _panelDirty = YES;
     }
     if (anchor != _anchorIndex) {
         _anchorIndex = anchor;
         [self movePanelLocked];
     }
 
-    if (hide) {
-        [self hidePanelLocked];
-    }
+    if (hide) [self hidePanelLocked];
 }
 
 - (void)hidePanelLocked
@@ -933,14 +1054,12 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     if (session) {
         remote_call_with_session(session, ^{
-            ig_main_call(panelWindow, "setUserInteractionEnabled:", 0);
-            ig_main_call(hideSwitch, "setOn:", 0);
-            ig_main_call(bubbleWindow, "setHidden:", 0);
+            ig_msg(panelWindow, @"setHidden:", 1, 0, 0, 0);
+            ig_msg(hideSwitch, @"setOn:", 0, 0, 0, 0);
+            ig_msg(bubbleWindow, @"setHidden:", 0, 0, 0, 0);
         });
     }
-    _needsPush = YES;
     [self setStatus:@"面板已收起 · 点左上角圆钮恢复"];
-    cyanide_log(@"[IMGUI] panel hidden");
 }
 
 - (void)showPanelLocked
@@ -955,14 +1074,13 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     if (session) {
         remote_call_with_session(session, ^{
-            ig_main_call(restoreSwitch, "setOn:", 0);
-            ig_main_call(bubbleWindow, "setHidden:", 1);
-            ig_main_call(panelWindow, "setUserInteractionEnabled:", 1);
+            ig_msg(restoreSwitch, @"setOn:", 0, 0, 0, 0);
+            ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
+            ig_msg(panelWindow, @"setHidden:", 0, 0, 0, 0);
         });
     }
-    _needsPush = YES;
+    _panelDirty = YES;
     [self setStatus:@"运行中"];
-    cyanide_log(@"[IMGUI] panel shown");
 }
 
 - (void)movePanelLocked
@@ -976,400 +1094,98 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     uint64_t bubbleWindow = _bubbleWindow;
 
     if (session) {
+        uint32_t previousSettle = r_settle_us(8000);
         remote_call_with_session(session, ^{
-            ig_main_rect(panelWindow, "setFrame:", panelRect);
-            ig_main_rect(bubbleWindow, "setFrame:", bubbleRect);
+            ig_set_rect(panelWindow, "setFrame:", panelRect);
+            ig_set_rect(bubbleWindow, "setFrame:", bubbleRect);
         });
+        r_settle_us(previousSettle);
     }
-    _needsPush = YES;
-    cyanide_log(@"[IMGUI] panel moved to %.0f,%.0f", panelRect.origin.x, panelRect.origin.y);
-}
-
-#pragma mark - 渲染
-
-- (void)drawCanvasPrimitivesLocked
-{
-    [_primitivesLock lock];
-    NSArray<IGCanvasItem *> *items = [_primitives copy];
-    [_primitivesLock unlock];
-
-    if (items.count == 0) return;
-
-    CGFloat alphaScale = _canvasAlpha / 255.0;
-
-    for (IGCanvasItem *item in items) {
-        CGFloat baseAlpha = (CGFloat)((item.color >> 24) & 0xFF) / 255.0;
-        uint32_t color = IGColorAlpha(item.color, baseAlpha * alphaScale);
-
-        switch (item.type) {
-            case IGDrawCmdTypeLine:
-                [_ui.drawList addLineFrom:item.a to:item.b color:color thickness:item.thickness];
-                break;
-            case IGDrawCmdTypeRect:
-                [_ui.drawList addRect:CGRectMake(item.a.x, item.a.y, item.b.x, item.b.y)
-                                color:color
-                            thickness:item.thickness
-                               radius:0.0];
-                break;
-            case IGDrawCmdTypeCircle:
-                [_ui.drawList addCircleAt:item.a radius:item.radius color:color thickness:item.thickness];
-                break;
-            case IGDrawCmdTypeText:
-                [_ui.drawList addText:item.text at:item.a fontSize:item.fontSize color:color];
-                break;
-            default:
-                break;
-        }
-    }
-}
-
-- (void)drawGridLocked
-{
-    CGSize size = _screenSize;
-    uint32_t gridColor = IGColorMake(0.26, 0.59, 0.98, 0.16);
-    uint32_t axisColor = IGColorMake(0.26, 0.59, 0.98, 0.42);
-
-    for (CGFloat x = 0.0; x <= size.width; x += 60.0) {
-        [_ui.drawList addLineFrom:IGVec2Make(x, 0.0) to:IGVec2Make(x, size.height)
-                            color:gridColor
-                        thickness:0.5];
-    }
-    for (CGFloat y = 0.0; y <= size.height; y += 60.0) {
-        [_ui.drawList addLineFrom:IGVec2Make(0.0, y) to:IGVec2Make(size.width, y)
-                            color:gridColor
-                        thickness:0.5];
-    }
-
-    CGPoint center = CGPointMake(size.width / 2.0, size.height / 2.0);
-    [_ui.drawList addLineFrom:IGVec2Make(center.x - 26.0, center.y)
-                            to:IGVec2Make(center.x + 26.0, center.y)
-                         color:axisColor
-                     thickness:1.0];
-    [_ui.drawList addLineFrom:IGVec2Make(center.x, center.y - 26.0)
-                            to:IGVec2Make(center.x, center.y + 26.0)
-                         color:axisColor
-                     thickness:1.0];
-    [_ui.drawList addCircleAt:IGVec2Make(center.x, center.y) radius:14.0 color:axisColor thickness:1.0];
-}
-
-- (void)drawDemoLocked
-{
-    CGSize size = _screenSize;
-    CGPoint center = CGPointMake(size.width / 2.0, size.height / 2.0);
-    CGFloat radius = MIN(size.width, size.height) * 0.30;
-    NSUInteger count = 8;
-
-    for (NSUInteger i = 0; i < count; i++) {
-        CGFloat angle = (CGFloat)_demoPhase + (CGFloat)i * (CGFloat)M_PI * 2.0 / (CGFloat)count;
-        IGVec2 target = IGVec2Make(center.x + cos(angle) * radius,
-                                   center.y + sin(angle) * radius);
-        [_ui.drawList addLineFrom:IGVec2Make(center.x, center.y)
-                                to:target
-                             color:IGColorMake(0.26, 0.59, 0.98, 0.75)
-                         thickness:_lineWidth];
-        [_ui.drawList addCircleAt:target
-                           radius:5.0
-                            color:IGColorMake(1.0, 0.35, 0.35, 0.90)
-                        thickness:1.5];
-    }
-
-    CGFloat pulse = 30.0 + 8.0 * (CGFloat)sin(_demoPhase * 2.0);
-    [_ui.drawList addCircleAt:IGVec2Make(center.x, center.y)
-                        radius:pulse
-                         color:IGColorMake(0.26, 0.59, 0.98, 0.35)
-                     thickness:1.0];
-
-    NSString *label = [NSString stringWithFormat:@"IMGUI DEMO  %.0f deg", _demoPhase * 180.0 / M_PI];
-    [_ui.drawList addText:label
-                       at:IGVec2Make(center.x - 70.0, center.y + radius + 18.0)
-                 fontSize:11.0
-                    color:IGColorMake(0.75, 0.75, 0.75, 0.90)];
-}
-
-- (void)drawBubbleLocked
-{
-    CGRect rect = _bubbleRect;
-    IGVec2 center = IGVec2Make(CGRectGetMidX(rect), CGRectGetMidY(rect));
-
-    [_ui.drawList addCircleFilledAt:center
-                             radius:kIGBubbleSize / 2.0
-                              color:IGColorMake(0.06, 0.06, 0.06, 0.92)];
-    [_ui.drawList addCircleAt:center
-                       radius:kIGBubbleSize / 2.0
-                        color:IGColorMake(0.26, 0.59, 0.98, 0.90)
-                    thickness:1.5];
-    [_ui.drawList addText:@"IG"
-                       at:IGVec2Make(center.x - 8.0, center.y - 7.0)
-                 fontSize:12.0
-                    color:IGColorMake(1.0, 1.0, 1.0, 0.95)];
-}
-
-- (NSData *)renderFrameLocked
-{
-    NSTimeInterval begin = CACurrentMediaTime();
-    CGSize size = _screenSize;
-
-    if (_demoEnabled) {
-        _demoPhase += 0.12;
-        if (_demoPhase > M_PI * 2.0) _demoPhase -= M_PI * 2.0;
-    }
-
-    [_ui beginFrameWithDisplaySize:size];
-
-    [self drawCanvasPrimitivesLocked];
-    if (_gridEnabled) [self drawGridLocked];
-    if (_demoEnabled) [self drawDemoLocked];
-
-    if (_panelHidden) {
-        [self drawBubbleLocked];
-    } else {
-        [_ui beginWindow:@"Cyanide · ImGui" frame:_panelRect];
-        [self buildPanelRowsWithCapture:nil];
-        [_ui endWindow];
-    }
-
-    [_ui endFrame];
-    _lastPrimCount = _ui.drawList.count;
-
-    UIImage *image = [_ui.drawList renderWithSize:size scale:_renderScale];
-    if (!image) return nil;
-
-    NSData *png = UIImagePNGRepresentation(image);
-    _lastRenderMS = (CACurrentMediaTime() - begin) * 1000.0;
-    return png;
-}
-
-- (void)renderAndPushLocked
-{
-    if (_state != IGOverlayStateRunning) return;
-
-    NSData *png = [self renderFrameLocked];
-    if (png.length == 0) {
-        cyanide_log(@"[IMGUI] render produced no data");
-        return;
-    }
-
-    NSTimeInterval begin = CACurrentMediaTime();
-    BOOL ok = [self pushPNGLocked:png];
-    NSTimeInterval elapsed = CACurrentMediaTime() - begin;
-
-    _lastPushAt = CACurrentMediaTime();
-    _lastPushMS = elapsed * 1000.0;
-
-    if (ok) {
-        if (_lastPushMS > 1.0) {
-            double instant = 1000.0 / _lastPushMS;
-            _fps = (_fps < 0.1) ? instant : (_fps * 0.8 + instant * 0.2);
-        }
-        _pushFailures = 0;
-    } else {
-        _pushFailures += 1;
-        cyanide_log(@"[IMGUI] push failed (%d/%d)", _pushFailures, kIGMaxPushFailures);
-        if (_pushFailures >= kIGMaxPushFailures) {
-            [self setStatus:@"推帧连续失败，已停止"];
-            [self teardownLocked];
-        }
-    }
-}
-
-#pragma mark - 远程贴图
-
-- (void)ensureRemoteBufferLocked
-{
-    if (r_is_objc_ptr(_remoteBuffer) && _remoteBufferCapacity >= kIGRemoteBufferBytes) return;
-
-    RemoteCallSession *session = _session;
-    if (!session) return;
-
-    __block uint64_t buffer = 0;
-    remote_call_with_session(session, ^{
-        buffer = r_dlsym_call(R_TIMEOUT, "malloc", kIGRemoteBufferBytes, 0, 0, 0, 0, 0, 0, 0);
-    });
-
-    if (r_is_objc_ptr(buffer)) {
-        _remoteBuffer = buffer;
-        _remoteBufferCapacity = kIGRemoteBufferBytes;
-        cyanide_log(@"[IMGUI] remote buffer 0x%llx (%u bytes)", buffer, kIGRemoteBufferBytes);
-    } else {
-        cyanide_log(@"[IMGUI] remote malloc failed");
-    }
-}
-
-- (BOOL)pushPNGLocked:(NSData *)png
-{
-    RemoteCallSession *session = _session;
-    if (!session || png.length == 0) return NO;
-    if (!r_is_objc_ptr(_imageView)) return NO;
-
-    if (!r_is_objc_ptr(_remoteBuffer) || _remoteBufferCapacity < png.length) {
-        [self ensureRemoteBufferLocked];
-        if (!r_is_objc_ptr(_remoteBuffer) || _remoteBufferCapacity < png.length) return NO;
-    }
-
-    uint64_t buffer = _remoteBuffer;
-    const void *bytes = png.bytes;
-    uint64_t length = (uint64_t)png.length;
-    CGFloat imageScale = _renderScale;
-    uint64_t imageView = _imageView;
-
-    __block BOOL ok = NO;
-    uint32_t previousSettle = r_settle_us(kIGSettleMicroseconds);
-
-    remote_call_with_session(session, ^{
-        if (!remote_write(buffer, bytes, length)) {
-            cyanide_log(@"[IMGUI] remote_write failed len=%llu", length);
-            return;
-        }
-
-        // NSData 从远程缓冲区拷一份，再交给 ImageIO 解码成 UIImage。
-        uint64_t nsdata = r_msg2_main_raw(ig_class(@"NSData"), "dataWithBytes:length:",
-                                          &buffer, sizeof(buffer),
-                                          &length, sizeof(length),
-                                          NULL, 0, NULL, 0);
-        if (!r_is_objc_ptr(nsdata)) return;
-
-        double scale = (double)imageScale;
-        uint64_t image = r_msg2_main_raw(ig_class(@"UIImage"), "imageWithData:scale:",
-                                         &nsdata, sizeof(nsdata),
-                                         &scale, sizeof(scale),
-                                         NULL, 0, NULL, 0);
-        if (!r_is_objc_ptr(image)) return;
-
-        ig_main_call(imageView, "setImage:", image);
-        ok = YES;
-    });
-
-    r_settle_us(previousSettle);
-
-    if (ok) _imagePushVerified = YES;
-    return ok;
-}
-
-- (void)installFallbackLabelLocked
-{
-    RemoteCallSession *session = _session;
-    uint64_t panelWindow = _panelWindow;
-    if (!session || !r_is_objc_ptr(panelWindow)) return;
-
-    CGRect frame = CGRectMake(8.0, 8.0, kIGPanelWidth - 16.0, 60.0);
-    NSString *text = @"ImGui 推图失败\n看 Cyanide 日志 [IMGUI]";
-
-    __block uint64_t label = 0;
-    remote_call_with_session(session, ^{
-        uint64_t cls = ig_class(@"UILabel");
-        uint64_t alloc = r_msg2_main(cls, "alloc", 0, 0, 0, 0);
-        label = r_is_objc_ptr(alloc)
-            ? r_msg2_main_raw(alloc, "initWithFrame:", &frame, sizeof(frame),
-                              NULL, 0, NULL, 0, NULL, 0)
-            : 0;
-        if (!r_is_objc_ptr(label)) return;
-
-        ig_main_call(label, "setNumberOfLines:", 2);
-        uint64_t string = ig_nsstring(text);
-        if (r_is_objc_ptr(string)) {
-            ig_main_call(label, "setText:", string);
-            ig_release(string);
-        }
-        uint64_t white = r_msg2_main(ig_class(@"UIColor"), "whiteColor", 0, 0, 0, 0);
-        if (r_is_objc_ptr(white)) ig_main_call(label, "setTextColor:", white);
-        ig_main_call(panelWindow, "addSubview:", label);
-    });
-
-    _fallbackLabel = label;
+    _panelDirty = YES;
 }
 
 #pragma mark - 画布 API
 
-- (void)appendPrimitive:(IGCanvasItem *)item
+- (void)setStrips:(NSArray<NSArray<NSValue *> *> *)strips
 {
-    if (!item) return;
-    [_primitivesLock lock];
-    if (_primitives.count > 4096) {
-        [_primitives removeAllObjects];
+    [_stripsLock lock];
+    [_userStrips removeAllObjects];
+    if (strips.count > 0) [_userStrips addObjectsFromArray:strips];
+    [_stripsLock unlock];
+    _canvasDirty = YES;
+}
+
+- (void)drawPolyline:(NSArray<NSValue *> *)points
+{
+    if (points.count < 2) return;
+    [_stripsLock lock];
+    [_userStrips addObject:[points copy]];
+    if (_userStrips.count > 64) [_userStrips removeObjectAtIndex:0];
+    [_stripsLock unlock];
+    _canvasDirty = YES;
+}
+
+- (void)drawLineFrom:(CGPoint)from to:(CGPoint)to
+{
+    [self drawPolyline:@[[NSValue valueWithCGPoint:from], [NSValue valueWithCGPoint:to]]];
+}
+
+- (void)drawCircleAt:(CGPoint)center radius:(CGFloat)radius segments:(NSUInteger)segments
+{
+    NSUInteger count = MAX((NSUInteger)8, segments);
+    NSMutableArray<NSValue *> *points = [NSMutableArray arrayWithCapacity:count + 1];
+    for (NSUInteger i = 0; i <= count; i++) {
+        CGFloat angle = (CGFloat)i * 2.0 * (CGFloat)M_PI / (CGFloat)count;
+        [points addObject:[NSValue valueWithCGPoint:
+                           CGPointMake(center.x + cos(angle) * radius,
+                                       center.y + sin(angle) * radius)]];
     }
-    [_primitives addObject:item];
-    [_primitivesLock unlock];
-    _needsPush = YES;
+    [self drawPolyline:points];
 }
 
 - (void)clearCanvas
 {
-    [_primitivesLock lock];
-    [_primitives removeAllObjects];
-    [_primitivesLock unlock];
-    _needsPush = YES;
+    [_stripsLock lock];
+    [_userStrips removeAllObjects];
+    [_stripsLock unlock];
+    [_canvas clear];
+    _canvasDirty = NO;
 }
 
-- (void)drawLineFrom:(CGPoint)from to:(CGPoint)to color:(UIColor *)color width:(CGFloat)width
-{
-    IGCanvasItem *item = [[IGCanvasItem alloc] init];
-    item.type = IGDrawCmdTypeLine;
-    item.a = IGVec2Make(from.x, from.y);
-    item.b = IGVec2Make(to.x, to.y);
-    item.color = ig_color_argb(color ?: [UIColor whiteColor]);
-    item.thickness = MAX(0.5, width);
-    [self appendPrimitive:item];
-}
-
-- (void)drawRect:(CGRect)rect color:(UIColor *)color width:(CGFloat)width
-{
-    IGCanvasItem *item = [[IGCanvasItem alloc] init];
-    item.type = IGDrawCmdTypeRect;
-    item.a = IGVec2Make(rect.origin.x, rect.origin.y);
-    item.b = IGVec2Make(rect.size.width, rect.size.height);
-    item.color = ig_color_argb(color ?: [UIColor whiteColor]);
-    item.thickness = MAX(0.5, width);
-    [self appendPrimitive:item];
-}
-
-- (void)drawCircleAt:(CGPoint)center radius:(CGFloat)radius color:(UIColor *)color width:(CGFloat)width
-{
-    IGCanvasItem *item = [[IGCanvasItem alloc] init];
-    item.type = IGDrawCmdTypeCircle;
-    item.a = IGVec2Make(center.x, center.y);
-    item.radius = MAX(0.5, radius);
-    item.color = ig_color_argb(color ?: [UIColor whiteColor]);
-    item.thickness = MAX(0.5, width);
-    [self appendPrimitive:item];
-}
-
-- (void)drawText:(NSString *)text at:(CGPoint)point size:(CGFloat)size color:(UIColor *)color
-{
-    if (text.length == 0) return;
-    IGCanvasItem *item = [[IGCanvasItem alloc] init];
-    item.type = IGDrawCmdTypeText;
-    item.a = IGVec2Make(point.x, point.y);
-    item.text = text;
-    item.fontSize = MAX(6.0, size);
-    item.color = ig_color_argb(color ?: [UIColor whiteColor]);
-    [self appendPrimitive:item];
-}
-
-- (void)requestRedraw
-{
-    _needsPush = YES;
-}
-
-- (BOOL)demoEnabled
-{
-    return _demoEnabled;
-}
+- (BOOL)demoEnabled { return _demoEnabled; }
 
 - (void)setDemoEnabled:(BOOL)enabled
 {
     _demoEnabled = enabled;
-    _needsPush = YES;
+    _canvasDirty = YES;
+    _panelDirty = YES;
 }
 
-- (BOOL)gridEnabled
-{
-    return _gridEnabled;
-}
+- (BOOL)gridEnabled { return _gridEnabled; }
 
 - (void)setGridEnabled:(BOOL)enabled
 {
     _gridEnabled = enabled;
-    _needsPush = YES;
+    [_canvas setGridVisible:enabled];
+    _panelDirty = YES;
+}
+
+- (CGFloat)lineWidth { return _lineWidth; }
+
+- (void)setLineWidth:(CGFloat)width
+{
+    _lineWidth = MAX(0.5, MIN(12.0, width));
+    _widthIndex = (NSInteger)MAX(0.0, MIN(7.0, _lineWidth - 1.0));
+    _canvasDirty = YES;
+    _panelDirty = YES;
+}
+
+- (UIColor *)strokeColor { return _strokeColor; }
+
+- (void)setStrokeColor:(UIColor *)color
+{
+    _strokeColor = color ?: [UIColor whiteColor];
+    _canvasDirty = YES;
 }
 
 @end
