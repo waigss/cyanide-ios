@@ -8,25 +8,43 @@
 //  一眼就能看见、能改；等它在这里稳定了，再把同一份 framebuffer 交给
 //  CyanidePixelView 推到 SpringBoard 的全局窗口，两边的问题就不会缠在一起。
 //
+//  为什么不用 MTKView：本工程的链接阶段没有 MetalKit.framework（只有 Metal 被
+//  autolink 进来），所以这里用 CAMetalLayer + CADisplayLink 自己驱动渲染循环 ——
+//  MTKView 内部做的也就是这两件事。
+//
 
 #import "ImGuiViewController.h"
 
 #import <Metal/Metal.h>
-#import <MetalKit/MetalKit.h>
 #import <QuartzCore/QuartzCore.h>
+
+#include <math.h>
+#include <stdlib.h>
 
 #import "../imgui_core/imgui.h"
 #import "../imgui_core/imgui_impl_metal.h"
 
 static const float kPi = 3.14159265358979f;
 
-@interface ImGuiViewController () <MTKViewDelegate>
+// CAMetalLayer 支撑的普通 UIView，替代 MTKView。
+@interface ImGuiMetalView : UIView
+@end
+
+@implementation ImGuiMetalView
++ (Class)layerClass
+{
+    return [CAMetalLayer class];
+}
+@end
+
+@interface ImGuiViewController ()
 @end
 
 @implementation ImGuiViewController {
-    MTKView *_metalView;
+    ImGuiMetalView *_metalView;
     id<MTLDevice> _device;
     id<MTLCommandQueue> _commandQueue;
+    CADisplayLink *_displayLink;
     UIButton *_closeButton;
 
     BOOL _started;
@@ -64,16 +82,18 @@ static const float kPi = 3.14159265358979f;
         return;
     }
 
-    _metalView = [[MTKView alloc] initWithFrame:self.view.bounds device:_device];
-    _metalView.delegate = self;
-    _metalView.colorPixelFormat = MTLPixelFormatBGRA8Unorm;
-    _metalView.depthStencilPixelFormat = MTLPixelFormatDepth32Float_Stencil8;
-    _metalView.clearColor = MTLClearColorMake(0.055, 0.06, 0.075, 1.0);
-    _metalView.clearDepth = 1.0;
-    _metalView.preferredFramesPerSecond = 60;
-    _metalView.enableSetNeedsDisplay = NO;
+    _metalView = [[ImGuiMetalView alloc] initWithFrame:self.view.bounds];
     _metalView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _metalView.userInteractionEnabled = YES;
+
+    CAMetalLayer *layer = (CAMetalLayer *)_metalView.layer;
+    layer.device = _device;
+    layer.pixelFormat = MTLPixelFormatBGRA8Unorm;
+    layer.framebufferOnly = YES;
+    layer.opaque = YES;
+
     [self.view addSubview:_metalView];
+    [self updateDrawableSize];
 
     _commandQueue = [_device newCommandQueue];
 
@@ -103,27 +123,48 @@ static const float kPi = 3.14159265358979f;
     _started = YES;
 
     [self installCloseButton];
+
+    _displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(displayLinkFired:)];
+    _displayLink.preferredFramesPerSecond = 60;
+    [_displayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+}
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    [self updateDrawableSize];
+}
+
+- (void)updateDrawableSize
+{
+    if (!_metalView) return;
+    CAMetalLayer *layer = (CAMetalLayer *)_metalView.layer;
+    CGFloat scale = self.view.window.screen.scale;
+    if (scale <= 0.0) scale = [UIScreen mainScreen].scale;
+    if (scale <= 0.0) scale = 2.0;
+
+    layer.contentsScale = scale;
+    CGSize size = _metalView.bounds.size;
+    layer.drawableSize = CGSizeMake(MAX(1.0, size.width * scale), MAX(1.0, size.height * scale));
 }
 
 - (void)installCloseButton
 {
-    if (@available(iOS 13.0, *)) {
-        _closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        [_closeButton setImage:[UIImage systemImageNamed:@"xmark.circle.fill"] forState:UIControlStateNormal];
-        _closeButton.tintColor = [UIColor whiteColor];
-        _closeButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
-        _closeButton.layer.cornerRadius = 18.0;
-        _closeButton.translatesAutoresizingMaskIntoConstraints = NO;
-        [_closeButton addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
-        [self.view addSubview:_closeButton];
+    _closeButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    [_closeButton setImage:[UIImage systemImageNamed:@"xmark.circle.fill"] forState:UIControlStateNormal];
+    _closeButton.tintColor = [UIColor whiteColor];
+    _closeButton.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.35];
+    _closeButton.layer.cornerRadius = 18.0;
+    _closeButton.translatesAutoresizingMaskIntoConstraints = NO;
+    [_closeButton addTarget:self action:@selector(dismissSelf) forControlEvents:UIControlEventTouchUpInside];
+    [self.view addSubview:_closeButton];
 
-        [NSLayoutConstraint activateConstraints:@[
-            [_closeButton.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8.0],
-            [_closeButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
-            [_closeButton.widthAnchor constraintEqualToConstant:36.0],
-            [_closeButton.heightAnchor constraintEqualToConstant:36.0],
-        ]];
-    }
+    [NSLayoutConstraint activateConstraints:@[
+        [_closeButton.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:8.0],
+        [_closeButton.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-12.0],
+        [_closeButton.widthAnchor constraintEqualToConstant:36.0],
+        [_closeButton.heightAnchor constraintEqualToConstant:36.0],
+    ]];
 }
 
 - (void)dismissSelf
@@ -142,37 +183,44 @@ static const float kPi = 3.14159265358979f;
     [self presentViewController:alert animated:YES completion:nil];
 }
 
-#pragma mark - MTKViewDelegate
+#pragma mark - 渲染循环
 
-- (void)mtkView:(MTKView *)view drawableSizeWillChange:(CGSize)size
+- (void)displayLinkFired:(CADisplayLink *)link
 {
-}
-
-- (void)drawInMTKView:(MTKView *)view
-{
-    if (!_started) return;
-
     CFTimeInterval now = CACurrentMediaTime();
     _deltaTime = (float)(now - _lastFrameTime);
     _lastFrameTime = now;
     if (_deltaTime <= 0.0f || _deltaTime > 0.5f) _deltaTime = 1.0f / 60.0f;
     _fps = _fps * 0.9f + (1.0f / _deltaTime) * 0.1f;
 
-    @autoreleasepool {
-        ImGuiIO &io = ImGui::GetIO();
-        io.DisplaySize = ImVec2((float)view.bounds.size.width, (float)view.bounds.size.height);
+    [self renderFrame];
+}
 
-        CGFloat scale = 1.0;
-        if (view.bounds.size.width > 0.5 && view.drawableSize.width > 0.5) {
-            scale = view.drawableSize.width / view.bounds.size.width;
-        }
+- (void)renderFrame
+{
+    if (!_started) return;
+
+    CAMetalLayer *layer = (CAMetalLayer *)_metalView.layer;
+    if (layer.drawableSize.width < 1.0 || layer.drawableSize.height < 1.0) return;
+
+    @autoreleasepool {
+        id<CAMetalDrawable> drawable = [layer nextDrawable];
+        if (!drawable) return;
+
+        ImGuiIO &io = ImGui::GetIO();
+        CGSize points = _metalView.bounds.size;
+        if (points.width < 1.0 || points.height < 1.0) return;
+
+        io.DisplaySize = ImVec2((float)points.width, (float)points.height);
+        CGFloat scale = layer.drawableSize.width / points.width;
         io.DisplayFramebufferScale = ImVec2((float)scale, (float)scale);
         io.DeltaTime = _deltaTime;
 
-        MTLRenderPassDescriptor *pass = view.currentRenderPassDescriptor;
-        if (!pass) return;
-        id<MTLDrawable> drawable = view.currentDrawable;
-        if (!drawable) return;
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = drawable.texture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionClear;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        pass.colorAttachments[0].clearColor = MTLClearColorMake(0.055, 0.06, 0.075, 1.0);
 
         id<MTLCommandBuffer> commandBuffer = [_commandQueue commandBuffer];
         if (!commandBuffer) return;
@@ -259,6 +307,7 @@ static const float kPi = 3.14159265358979f;
 
     float w = (float)size.width;
     float h = (float)size.height;
+    if (w < 1.0f || h < 1.0f) return;
 
     _points[_pointCount].x = w * 0.5f;
     _points[_pointCount].y = h * 0.66f;
@@ -320,8 +369,8 @@ static const float kPi = 3.14159265358979f;
     if (!_started) return;
     _started = NO;
 
-    _metalView.delegate = nil;
-    [_metalView releaseDrawables];
+    [_displayLink invalidate];
+    _displayLink = nil;
 
     ImGui_ImplMetal_Shutdown();
     ImGui::DestroyContext();
