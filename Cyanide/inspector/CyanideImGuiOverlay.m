@@ -2,26 +2,24 @@
 //  CyanideImGuiOverlay.m
 //  Cyanide
 //
-//  这版换掉了「整屏 PNG 推图」：
+//  v3：位图传输。
 //
-//  旧：每帧 CoreGraphics 画整屏 → PNG encode → remote_write 几 MB →
-//      +[NSData dataWithBytes:length:] → +[UIImage imageWithData:] → setImage:
-//      后三步走 r_msg2_main_raw，而那套内部每条消息就是几十次远程调用 + settle，
-//      一帧 400~600ms，5 fps 都不到。
+//  三块「远程位图视图」（CyanidePixelView），每块自己建窗口 + UIImageView，
+//  本进程把一帧画进 BGRA 缓冲，memcpy 进远程 CGBitmapContext，再让远程
+//  CGImage → UIImage → 主线程 setImage:。每帧 6 次单条远程调用，带宽是一次
+//  memcpy。
 //
-//  新：画线交给 SpringBoard 里的 CAShapeLayer。我们只把「点数组」写进共享页，
-//      再让远程 CoreGraphics 建一条 CGPath 设给图层（见 CyanideScreenCanvas）：
-//      与点数量无关，一帧 4 + 折线条数 次单条调用。
+//      canvasView  level 1e6     全屏 1x   网格 / 演示 / 用户折线   点击穿透
+//      panelView   level 1e6+1   面板 2x   ImGui 面板              隐形控件挂这儿
+//      bubbleView  level 1e6+1   圆钮 2x    收起后的恢复按钮
 //
-//      面板（ImGui 样子那块）仍然是一张图，但只渲染面板本身（252×H），
-//      推图只用 3 条 objc_msgSend：dataWithBytes:length: → imageWithData: →
-//      performSelectorOnMainThread:withObject:waitUntilDone:（setImage:）。
-//      只有控件变化时才推。
+//  为什么不是 v2 的 CAShapeLayer 路径：那条路只能表达描边，写不了文字和填充，
+//  而且把「画什么」绑死在 CGPath 上。位图这条路什么都能画，代价只是一次拷贝。
 //
 
 #import "CyanideImGuiOverlay.h"
 
-#import "CyanideScreenCanvas.h"
+#import "CyanidePixelView.h"
 #import "../imgui/IGUI.h"
 #import "../imgui/IGDrawList.h"
 #import "../TaskRop/RemoteCall.h"
@@ -38,26 +36,22 @@
 
 #pragma mark - 常量
 
-static const char *kIGKeyPanel = "cyanideImGuiPanelWindow";
-static const char *kIGKeyBubble = "cyanideImGuiBubbleWindow";
-
 static const CGFloat kIGPanelWidth = 252.0;
 static const CGFloat kIGPanelMargin = 10.0;
 static const CGFloat kIGPanelTop = 64.0;
 static const CGFloat kIGBubbleSize = 38.0;
+static const CGFloat kIGCanvasLevel = 1000000.0;
 static const CGFloat kIGPanelLevel = 1000001.0;
-static const CGFloat kIGRenderScale = 2.0;
+static const CGFloat kIGMaxRenderScale = 2.0;
 
-static const NSTimeInterval kIGTickInterval = 1.0 / 60.0;   // 定时器节拍
-static const NSTimeInterval kIGPollInterval = 0.066;        // 读控件 15Hz
-static const NSTimeInterval kIGPanelPushInterval = 0.10;    // 面板最多 10Hz
-
-static const uint32_t kIGPanelBufferBytes = 2u * 1024u * 1024u;
+static const NSTimeInterval kIGTickInterval = 1.0 / 60.0;
+static const NSTimeInterval kIGPollInterval = 0.066;
+static const NSTimeInterval kIGPanelPushInterval = 0.10;
 
 static const CGFloat kIGAlphaSteps[5] = {40.0, 95.0, 150.0, 205.0, 255.0};
 static const NSInteger kIGFPSSteps[3] = {15, 30, 60};
 
-#pragma mark - 远程小工具（全是单次调用）
+#pragma mark - 远程小工具（单次调用）
 
 static NSMutableDictionary<NSString *, NSNumber *> *gIGClassCache = nil;
 static NSMutableDictionary<NSString *, NSNumber *> *gIGSelectorCache = nil;
@@ -139,51 +133,7 @@ static void ig_release(uint64_t object)
     r_msg(object, sel, 0, 0, 0, 0);
 }
 
-static uint64_t ig_sel_c(const char *name)
-{
-    return ig_sel([NSString stringWithUTF8String:name]);
-}
-
-#pragma mark - 远程视图工厂
-
-static uint64_t ig_window_create(uint64_t scene, CGRect frame)
-{
-    uint64_t cls = ig_class(@"UIWindow");
-    if (!r_is_objc_ptr(cls)) return 0;
-
-    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(alloc)) return 0;
-
-    uint64_t window = 0;
-    if (r_is_objc_ptr(scene)) {
-        window = ig_msg(alloc, @"initWithWindowScene:", scene, 0, 0, 0);
-        if (r_is_objc_ptr(window)) ig_set_rect(window, "setFrame:", frame);
-    } else {
-        alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
-        if (!r_is_objc_ptr(alloc)) return 0;
-        window = r_msg2_main_raw(alloc, "initWithFrame:", &frame, sizeof(frame),
-                                 NULL, 0, NULL, 0, NULL, 0);
-    }
-    return window;
-}
-
-static uint64_t ig_make_image_view(uint64_t parent, CGRect frame, uint64_t clear)
-{
-    uint64_t imageAlloc = ig_msg(ig_class(@"UIImageView"), @"alloc", 0, 0, 0, 0);
-    if (!r_is_objc_ptr(imageAlloc)) return 0;
-
-    uint64_t view = r_msg2_main_raw(imageAlloc, "initWithFrame:", &frame, sizeof(frame),
-                                    NULL, 0, NULL, 0, NULL, 0);
-    if (!r_is_objc_ptr(view)) return 0;
-
-    ig_msg(view, @"setUserInteractionEnabled:", 0, 0, 0, 0);
-    ig_msg(view, @"setContentMode:", 1, 0, 0, 0);   // scaleAspectFit
-    if (r_is_objc_ptr(clear)) ig_msg(view, @"setBackgroundColor:", clear, 0, 0, 0);
-    ig_msg(parent, @"addSubview:", view, 0, 0, 0);
-    return view;
-}
-
-// 隐形控件：alpha 0.02 —— UIKit 的 hitTest 只忽略 alpha < 0.01，所以还能点。
+// 隐形控件：alpha 0.02 —— UIKit 的 hitTest 只忽略 alpha < 0.01，所以还能点
 static uint64_t ig_make_switch(uint64_t parent, CGRect frame, BOOL on)
 {
     uint64_t cls = ig_class(@"UISwitch");
@@ -256,12 +206,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     CGRect _bubbleRect;
     CGFloat _renderScale;
 
-    CyanideScreenCanvas *_canvas;
-
-    uint64_t _panelWindow;
-    uint64_t _bubbleWindow;
-    uint64_t _imageView;
-    uint64_t _bubbleImageView;
+    CyanidePixelView *_canvasView;
+    CyanidePixelView *_panelView;
+    CyanidePixelView *_bubbleView;
 
     uint64_t _switchDemo;
     uint64_t _switchGrid;
@@ -272,30 +219,19 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     uint64_t _segFPS;
     uint64_t _segAnchor;
 
-    // 每帧要用的句柄，装好之后不再查
-    uint64_t _nsdataClass;
-    uint64_t _uiimageClass;
-    uint64_t _selDataWithBytesLength;
-    uint64_t _selImageWithData;
-    uint64_t _selPerformOnMain;
-    uint64_t _selSetImage;
-
-    uint64_t _panelBuffer;
-    uint32_t _panelBufferCapacity;
-
     BOOL _panelHidden;
     BOOL _panelDirty;
     BOOL _canvasDirty;
     BOOL _busy;
 
-    int _panelPushFailures;
     NSTimeInterval _lastPollAt;
     NSTimeInterval _lastCanvasAt;
-    NSTimeInterval _lastPanelPushAt;
-    double _panelMS;
+    NSTimeInterval _lastPanelAt;
     double _canvasMS;
     double _canvasFPS;
+    double _panelMS;
     NSUInteger _canvasCalls;
+    NSUInteger _panelCalls;
     double _demoPhase;
 
     CGFloat _lineWidth;
@@ -338,10 +274,10 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         style.itemSpacingY = 3.0;
         _ui.style = style;
 
-        _renderScale = kIGRenderScale;
-        _widthIndex = 1;                        // 线宽 2pt
-        _alphaIndex = 4;                        // 不透明度 255
-        _fpsIndex = 2;                          // 60fps
+        _renderScale = kIGMaxRenderScale;
+        _widthIndex = 1;
+        _alphaIndex = 4;
+        _fpsIndex = 1;                          // 30fps
         _anchorIndex = 0;
         _lineWidth = (CGFloat)(_widthIndex + 1);
         _strokeColor = [UIColor colorWithRed:0.26 green:0.59 blue:0.98 alpha:1.0];
@@ -349,7 +285,6 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         _gridEnabled = NO;
         _state = IGOverlayStateIdle;
         _statusLine = @"未启动";
-        _canvas = [CyanideScreenCanvas sharedCanvas];
     }
     return self;
 }
@@ -383,7 +318,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     _screenSize = [UIScreen mainScreen].bounds.size;
     CGFloat screenScale = [UIScreen mainScreen].scale;
-    _renderScale = MIN(MAX(screenScale, 1.0), kIGRenderScale);
+    _renderScale = MIN(MAX(screenScale, 1.0), kIGMaxRenderScale);
 
     [self setStatus:@"正在挂载…"];
     cyanide_log(@"[IMGUI] start: screen=%.0fx%.0f scale=%.1f",
@@ -424,9 +359,78 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     [self computeLayoutLocked];
 
+    uint64_t scene = 0;
+    {
+        __block uint64_t foundScene = 0;
+        remote_call_with_session(session, ^{
+            uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
+            if (!r_is_objc_ptr(app)) return;
+            uint64_t keyWindow = ig_msg(app, @"keyWindow", 0, 0, 0, 0);
+            if (!r_is_objc_ptr(keyWindow)) {
+                uint64_t windows = ig_msg(app, @"windows", 0, 0, 0, 0);
+                uint64_t count = r_is_objc_ptr(windows) ? ig_msg(windows, @"count", 0, 0, 0, 0) : 0;
+                if (count > 0 && count < 64) {
+                    keyWindow = ig_msg(windows, @"objectAtIndex:", 0, 0, 0, 0);
+                }
+            }
+            if (r_is_objc_ptr(keyWindow)) foundScene = ig_msg(keyWindow, @"windowScene", 0, 0, 0, 0);
+        });
+        scene = foundScene;
+    }
+
+    CGRect screenRect = CGRectMake(0.0, 0.0, _screenSize.width, _screenSize.height);
     CGRect panelRect = _panelRect;
     CGRect bubbleRect = _bubbleRect;
-    CGSize screenSize = _screenSize;
+
+    _canvasView = [CyanidePixelView viewWithSession:session
+                                              scene:scene
+                                              frame:screenRect
+                                              level:kIGCanvasLevel
+                                              scale:1.0];
+    if (!_canvasView) {
+        [self setStatus:@"画布创建失败"];
+        [self teardownLocked];
+        @synchronized (self) { _state = IGOverlayStateFailed; }
+        return;
+    }
+
+    _panelView = [CyanidePixelView viewWithSession:session
+                                            scene:scene
+                                            frame:panelRect
+                                            level:kIGPanelLevel
+                                            scale:_renderScale];
+    if (!_panelView) {
+        [self setStatus:@"面板创建失败"];
+        [self teardownLocked];
+        @synchronized (self) { _state = IGOverlayStateFailed; }
+        return;
+    }
+
+    _bubbleView = [CyanidePixelView viewWithSession:session
+                                             scene:scene
+                                             frame:bubbleRect
+                                             level:kIGPanelLevel
+                                             scale:_renderScale];
+
+    // 控件挂到面板窗口里（窗口坐标 = 屏幕坐标 - 面板原点）
+    __block CGRect rowDemo = CGRectZero, rowGrid = CGRectZero, rowHide = CGRectZero;
+    __block CGRect rowWidth = CGRectZero, rowAlpha = CGRectZero, rowFPS = CGRectZero;
+    __block CGRect rowAnchor = CGRectZero;
+
+    [self captureControlRectsLocked:^(NSString *key, CGRect rect) {
+        if ([key isEqualToString:@"demo"]) rowDemo = rect;
+        else if ([key isEqualToString:@"grid"]) rowGrid = rect;
+        else if ([key isEqualToString:@"hide"]) rowHide = rect;
+        else if ([key isEqualToString:@"width"]) rowWidth = rect;
+        else if ([key isEqualToString:@"alpha"]) rowAlpha = rect;
+        else if ([key isEqualToString:@"fps"]) rowFPS = rect;
+        else if ([key isEqualToString:@"anchor"]) rowAnchor = rect;
+    }];
+
+    CGFloat offsetX = -panelRect.origin.x;
+    CGFloat offsetY = -panelRect.origin.y;
+    uint64_t panelWindow = _panelView.window;
+
     BOOL demoOn = _demoEnabled;
     BOOL gridOn = _gridEnabled;
     NSInteger widthIndex = _widthIndex;
@@ -434,109 +438,33 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     NSInteger fpsIndex = _fpsIndex;
     NSInteger anchorIndex = _anchorIndex;
 
-    __block uint64_t panelWindow = 0;
-    __block uint64_t bubbleWindow = 0;
-    __block uint64_t imageView = 0;
-    __block uint64_t bubbleImageView = 0;
     __block uint64_t swDemo = 0, swGrid = 0, swHide = 0, swRestore = 0;
     __block uint64_t segWidth = 0, segAlpha = 0, segFPS = 0, segAnchor = 0;
-    __block uint64_t scene = 0;
-    __block BOOL built = NO;
 
-    uint32_t previousSettle = r_settle_us(8000);
-
-    remote_call_with_session(session, ^{
-        uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-        if (!r_is_objc_ptr(app)) return;
-
-        uint64_t keyWindow = ig_msg(app, @"keyWindow", 0, 0, 0, 0);
-        if (!r_is_objc_ptr(keyWindow)) {
-            uint64_t windows = ig_msg(app, @"windows", 0, 0, 0, 0);
-            uint64_t count = r_is_objc_ptr(windows) ? ig_msg(windows, @"count", 0, 0, 0, 0) : 0;
-            if (count > 0 && count < 64) {
-                keyWindow = ig_msg(windows, @"objectAtIndex:", 0, 0, 0, 0);
+    {
+        __block uint64_t bubbleWindow = _bubbleView ? _bubbleView.window : 0;
+        uint32_t previousSettle = r_settle_us(8000);
+        remote_call_with_session(session, ^{
+            swDemo = ig_make_switch(panelWindow, CGRectOffset(rowDemo, offsetX, offsetY), demoOn);
+            swGrid = ig_make_switch(panelWindow, CGRectOffset(rowGrid, offsetX, offsetY), gridOn);
+            swHide = ig_make_switch(panelWindow, CGRectOffset(rowHide, offsetX, offsetY), NO);
+            segWidth = ig_make_segments(panelWindow, CGRectOffset(rowWidth, offsetX, offsetY),
+                                        @[@"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8"], widthIndex);
+            segAlpha = ig_make_segments(panelWindow, CGRectOffset(rowAlpha, offsetX, offsetY),
+                                        @[@"40", @"95", @"150", @"205", @"255"], alphaIndex);
+            segFPS = ig_make_segments(panelWindow, CGRectOffset(rowFPS, offsetX, offsetY),
+                                      @[@"15", @"30", @"60"], fpsIndex);
+            segAnchor = ig_make_segments(panelWindow, CGRectOffset(rowAnchor, offsetX, offsetY),
+                                         @[@"Top", @"Right", @"Bottom"], anchorIndex);
+            if (r_is_objc_ptr(bubbleWindow)) {
+                CGRect restoreFrame = CGRectMake(0.0, 0.0, kIGBubbleSize, kIGBubbleSize);
+                swRestore = ig_make_switch(bubbleWindow, restoreFrame, NO);
+                ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
             }
-        }
-        scene = r_is_objc_ptr(keyWindow) ? ig_msg(keyWindow, @"windowScene", 0, 0, 0, 0) : 0;
+        });
+        r_settle_us(previousSettle);
+    }
 
-        uint64_t clear = ig_msg(ig_class(@"UIColor"), @"clearColor", 0, 0, 0, 0);
-
-        panelWindow = ig_window_create(scene, panelRect);
-        if (!r_is_objc_ptr(panelWindow)) return;
-        ig_set_double(panelWindow, "setWindowLevel:", (double)kIGPanelLevel);
-        ig_msg(panelWindow, @"setOpaque:", 0, 0, 0, 0);
-        ig_msg(panelWindow, @"setHidden:", 0, 0, 0, 0);
-        if (r_is_objc_ptr(clear)) ig_msg(panelWindow, @"setBackgroundColor:", clear, 0, 0, 0);
-
-        CGRect imageFrame = CGRectMake(0.0, 0.0, panelRect.size.width, panelRect.size.height);
-        imageView = ig_make_image_view(panelWindow, imageFrame, clear);
-        if (!r_is_objc_ptr(imageView)) return;
-
-        bubbleWindow = ig_window_create(scene, bubbleRect);
-        if (r_is_objc_ptr(bubbleWindow)) {
-            ig_set_double(bubbleWindow, "setWindowLevel:", (double)kIGPanelLevel);
-            ig_msg(bubbleWindow, @"setOpaque:", 0, 0, 0, 0);
-            if (r_is_objc_ptr(clear)) ig_msg(bubbleWindow, @"setBackgroundColor:", clear, 0, 0, 0);
-            ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
-
-            CGRect bubbleImageFrame = CGRectMake(0.0, 0.0, kIGBubbleSize, kIGBubbleSize);
-            bubbleImageView = ig_make_image_view(bubbleWindow, bubbleImageFrame, clear);
-        }
-
-        __block CGRect rowDemo = CGRectZero, rowGrid = CGRectZero, rowHide = CGRectZero;
-        __block CGRect rowWidth = CGRectZero, rowAlpha = CGRectZero, rowFPS = CGRectZero;
-        __block CGRect rowAnchor = CGRectZero;
-
-        [self captureControlRectsLocked:^(NSString *key, CGRect rect) {
-            if ([key isEqualToString:@"demo"]) rowDemo = rect;
-            else if ([key isEqualToString:@"grid"]) rowGrid = rect;
-            else if ([key isEqualToString:@"hide"]) rowHide = rect;
-            else if ([key isEqualToString:@"width"]) rowWidth = rect;
-            else if ([key isEqualToString:@"alpha"]) rowAlpha = rect;
-            else if ([key isEqualToString:@"fps"]) rowFPS = rect;
-            else if ([key isEqualToString:@"anchor"]) rowAnchor = rect;
-        }];
-
-        CGFloat offsetX = -panelRect.origin.x;
-        CGFloat offsetY = -panelRect.origin.y;
-
-        swDemo = ig_make_switch(panelWindow, CGRectOffset(rowDemo, offsetX, offsetY), demoOn);
-        swGrid = ig_make_switch(panelWindow, CGRectOffset(rowGrid, offsetX, offsetY), gridOn);
-        swHide = ig_make_switch(panelWindow, CGRectOffset(rowHide, offsetX, offsetY), NO);
-        segWidth = ig_make_segments(panelWindow, CGRectOffset(rowWidth, offsetX, offsetY),
-                                    @[@"1", @"2", @"3", @"4", @"5", @"6", @"7", @"8"], widthIndex);
-        segAlpha = ig_make_segments(panelWindow, CGRectOffset(rowAlpha, offsetX, offsetY),
-                                    @[@"40", @"95", @"150", @"205", @"255"], alphaIndex);
-        segFPS = ig_make_segments(panelWindow, CGRectOffset(rowFPS, offsetX, offsetY),
-                                  @[@"15", @"30", @"60"], fpsIndex);
-        segAnchor = ig_make_segments(panelWindow, CGRectOffset(rowAnchor, offsetX, offsetY),
-                                     @[@"Top", @"Right", @"Bottom"], anchorIndex);
-
-        if (r_is_objc_ptr(bubbleWindow)) {
-            CGRect restoreFrame = CGRectMake(0.0, 0.0, kIGBubbleSize, kIGBubbleSize);
-            swRestore = ig_make_switch(bubbleWindow, restoreFrame, NO);
-        }
-
-        uint64_t assocPanel = ig_sel_c(kIGKeyPanel);
-        uint64_t assocBubble = ig_sel_c(kIGKeyBubble);
-        if (assocPanel) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocPanel, panelWindow, 1, 0, 0, 0, 0);
-        }
-        if (assocBubble && r_is_objc_ptr(bubbleWindow)) {
-            r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocBubble, bubbleWindow, 1, 0, 0, 0, 0);
-        }
-
-        built = r_is_objc_ptr(panelWindow) && r_is_objc_ptr(imageView);
-        cyanide_log(@"[IMGUI] panel=0x%llx image=0x%llx bubble=0x%llx scene=0x%llx",
-                    panelWindow, imageView, bubbleWindow, scene);
-    });
-
-    r_settle_us(previousSettle);
-
-    _panelWindow = panelWindow;
-    _bubbleWindow = bubbleWindow;
-    _imageView = imageView;
-    _bubbleImageView = bubbleImageView;
     _switchDemo = swDemo;
     _switchGrid = swGrid;
     _switchHide = swHide;
@@ -546,44 +474,16 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     _segFPS = segFPS;
     _segAnchor = segAnchor;
 
-    if (!built) {
-        [self setStatus:@"面板创建失败"];
-        [self teardownLocked];
-        @synchronized (self) { _state = IGOverlayStateFailed; }
-        return;
-    }
-
-    // 画布：全屏透明、点击穿透，线走 CAShapeLayer
-    if (![_canvas attachWithSession:session scene:scene screenSize:screenSize]) {
-        [self setStatus:@"画布创建失败"];
-        [self teardownLocked];
-        @synchronized (self) { _state = IGOverlayStateFailed; }
-        return;
-    }
-    [_canvas setGridVisible:gridOn];
-
-    // 每帧要用的句柄，先查好（之后每帧只发 r_msg）
-    _nsdataClass = ig_class(@"NSData");
-    _uiimageClass = ig_class(@"UIImage");
-    _selDataWithBytesLength = ig_sel(@"dataWithBytes:length:");
-    _selImageWithData = ig_sel(@"imageWithData:");
-    _selPerformOnMain = ig_sel(@"performSelectorOnMainThread:withObject:waitUntilDone:");
-    _selSetImage = ig_sel(@"setImage:");
-
-    [self ensurePanelBufferLocked];
-
-    if (r_is_objc_ptr(_bubbleImageView)) {
-        NSData *bubblePNG = [self renderBubblePNGLocked];
-        if (bubblePNG.length > 0) [self pushPNGLocked:bubblePNG toImageView:_bubbleImageView];
-    }
-
-    [self pushPanelLocked];
-    [self updateCanvasLocked];
+    [self blitBubbleLocked];
+    [self blitPanelLocked];
+    [self blitCanvasLocked];
 
     [self startTimerLocked];
     [self setStatus:[NSString stringWithFormat:@"运行中 · %.0f×%.0f", _screenSize.width, _screenSize.height]];
     @synchronized (self) { _state = IGOverlayStateRunning; }
-    cyanide_log(@"[IMGUI] running");
+    cyanide_log(@"[IMGUI] running canvas=0x%llx panel=0x%llx bubble=0x%llx",
+                _canvasView.imageView, _panelView.imageView,
+                _bubbleView ? _bubbleView.imageView : 0);
 }
 
 - (void)teardownLocked
@@ -593,41 +493,13 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         _timer = nil;
     }
 
-    [_canvas detach];
+    [_canvasView detach];
+    [_panelView detach];
+    [_bubbleView detach];
+    _canvasView = nil;
+    _panelView = nil;
+    _bubbleView = nil;
 
-    RemoteCallSession *session = _session;
-    uint64_t panelWindow = _panelWindow;
-    uint64_t bubbleWindow = _bubbleWindow;
-    uint64_t panelBuffer = _panelBuffer;
-
-    if (session) {
-        uint32_t previousSettle = r_settle_us(8000);
-        remote_call_with_session(session, ^{
-            if (r_is_objc_ptr(panelWindow)) ig_msg(panelWindow, @"setHidden:", 1, 0, 0, 0);
-            if (r_is_objc_ptr(bubbleWindow)) ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
-
-            uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
-            if (r_is_objc_ptr(app)) {
-                uint64_t assocPanel = ig_sel_c(kIGKeyPanel);
-                uint64_t assocBubble = ig_sel_c(kIGKeyBubble);
-                if (assocPanel) {
-                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocPanel, 0, 1, 0, 0, 0, 0);
-                }
-                if (assocBubble) {
-                    r_dlsym_call(R_TIMEOUT, "objc_setAssociatedObject", app, assocBubble, 0, 1, 0, 0, 0, 0);
-                }
-            }
-            if (r_is_objc_ptr(panelBuffer)) {
-                r_dlsym_call(R_TIMEOUT, "free", panelBuffer, 0, 0, 0, 0, 0, 0, 0);
-            }
-        });
-        r_settle_us(previousSettle);
-    }
-
-    _panelWindow = 0;
-    _bubbleWindow = 0;
-    _imageView = 0;
-    _bubbleImageView = 0;
     _switchDemo = 0;
     _switchGrid = 0;
     _switchHide = 0;
@@ -636,12 +508,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     _segAlpha = 0;
     _segFPS = 0;
     _segAnchor = 0;
-    _panelBuffer = 0;
-    _panelBufferCapacity = 0;
     _panelHidden = NO;
     _panelDirty = NO;
     _canvasDirty = NO;
-    _panelPushFailures = 0;
     _session = nil;
 
     @synchronized (self) { _state = IGOverlayStateIdle; }
@@ -703,10 +572,10 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 {
     IGUI *ui = _ui;
 
-    [ui text:[NSString stringWithFormat:@"canvas %.0f fps · %lu calls",
-              _canvasFPS, (unsigned long)_canvasCalls]];
-    [ui textDisabled:[NSString stringWithFormat:@"canvas %.1fms  panel %.1fms",
-                      _canvasMS, _panelMS]];
+    [ui text:[NSString stringWithFormat:@"%.0f fps · %lu calls · %.1fms",
+              _canvasFPS, (unsigned long)_canvasCalls, _canvasMS]];
+    [ui textDisabled:[NSString stringWithFormat:@"panel %.1fms   sink %ld",
+                      _panelMS, (long)kIGFPSSteps[_fpsIndex]]];
     [ui separator];
 
     [ui checkbox:@"Demo lines" value:_demoEnabled];
@@ -775,186 +644,176 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
                 _demoPhase += 1.6 / (double)targetFPS;
                 if (_demoPhase > M_PI * 2.0) _demoPhase -= M_PI * 2.0;
             }
-            [self updateCanvasLocked];
+            [self blitCanvasLocked];
         }
 
-        if (_panelDirty && !_panelHidden && (now - _lastPanelPushAt) >= kIGPanelPushInterval) {
-            _lastPanelPushAt = now;
+        if (_panelDirty && !_panelHidden && (now - _lastPanelAt) >= kIGPanelPushInterval) {
+            _lastPanelAt = now;
             _panelDirty = NO;
-            [self pushPanelLocked];
+            [self blitPanelLocked];
         }
     } @finally {
         _busy = NO;
     }
 }
 
-#pragma mark - 画布
+#pragma mark - 绘制
 
-- (NSArray<NSArray<NSValue *> *> *)demoStripsLocked
+- (uint32_t)strokeColorValueLocked
+{
+    CGFloat r = 1.0, g = 1.0, b = 1.0, a = 1.0;
+    if (![_strokeColor getRed:&r green:&g blue:&b alpha:&a]) {
+        CGFloat white = 1.0;
+        CGFloat alpha = 1.0;
+        if ([_strokeColor getWhite:&white alpha:&alpha]) {
+            r = g = b = white;
+            a = alpha;
+        }
+    }
+    return IGColorMake(r, g, b, a * (kIGAlphaSteps[_alphaIndex] / 255.0));
+}
+
+- (void)drawGridLocked
+{
+    CGSize size = _screenSize;
+    uint32_t color = IGColorMake(1.0, 1.0, 1.0, 0.14);
+    CGFloat step = 64.0;
+
+    for (CGFloat x = 0.0; x <= size.width; x += step) {
+        [_ui.drawList addLineFrom:IGVec2Make(x, 0.0) to:IGVec2Make(x, size.height)
+                            color:color thickness:0.5];
+    }
+    for (CGFloat y = 0.0; y <= size.height; y += step) {
+        [_ui.drawList addLineFrom:IGVec2Make(0.0, y) to:IGVec2Make(size.width, y)
+                            color:color thickness:0.5];
+    }
+}
+
+- (void)drawUserStripsLocked
+{
+    [_stripsLock lock];
+    NSArray<NSArray<NSValue *> *> *strips = [_userStrips copy];
+    [_stripsLock unlock];
+    if (strips.count == 0) return;
+
+    uint32_t color = [self strokeColorValueLocked];
+    CGFloat thickness = _lineWidth;
+
+    for (NSArray<NSValue *> *strip in strips) {
+        if (strip.count < 2) continue;
+        CGPoint previous = strip[0].CGPointValue;
+        for (NSUInteger i = 1; i < strip.count; i++) {
+            CGPoint point = strip[i].CGPointValue;
+            [_ui.drawList addLineFrom:IGVec2Make(previous.x, previous.y)
+                                   to:IGVec2Make(point.x, point.y)
+                                color:color
+                            thickness:thickness];
+            previous = point;
+        }
+    }
+}
+
+- (void)drawDemoLocked
 {
     CGSize size = _screenSize;
     CGPoint center = CGPointMake(size.width / 2.0, size.height / 2.0);
     CGFloat radius = MIN(size.width, size.height) * 0.30;
+    uint32_t color = [self strokeColorValueLocked];
+    CGFloat thickness = MAX(1.0, _lineWidth);
 
-    // 八根辐条拼成一条折线：每根都从圆心出发，不会有跨辐条的多余连线
-    NSMutableArray<NSValue *> *spokes = [NSMutableArray arrayWithCapacity:18];
-    for (NSInteger i = 0; i <= 8; i++) {
+    for (NSInteger i = 0; i < 8; i++) {
         CGFloat angle = (CGFloat)_demoPhase + (CGFloat)i * (CGFloat)M_PI / 4.0;
-        [spokes addObject:[NSValue valueWithCGPoint:center]];
-        [spokes addObject:[NSValue valueWithCGPoint:
-                           CGPointMake(center.x + cos(angle) * radius,
-                                       center.y + sin(angle) * radius)]];
+        [_ui.drawList addLineFrom:IGVec2Make(center.x, center.y)
+                               to:IGVec2Make(center.x + cos(angle) * radius,
+                                             center.y + sin(angle) * radius)
+                            color:color
+                        thickness:thickness];
     }
 
-    // 呼吸圆环：48 边形闭合折线
     CGFloat ringRadius = 42.0 + 9.0 * (CGFloat)sin(_demoPhase * 2.0);
-    NSMutableArray<NSValue *> *ring = [NSMutableArray arrayWithCapacity:49];
-    for (NSInteger i = 0; i <= 48; i++) {
+    uint32_t ringColor = IGColorMake(1.0, 1.0, 1.0, 0.45);
+    CGPoint previous = CGPointMake(center.x + ringRadius, center.y);
+    for (NSInteger i = 1; i <= 48; i++) {
         CGFloat angle = (CGFloat)i * 2.0 * (CGFloat)M_PI / 48.0;
-        [ring addObject:[NSValue valueWithCGPoint:
-                         CGPointMake(center.x + cos(angle) * ringRadius,
-                                     center.y + sin(angle) * ringRadius)]];
+        CGPoint point = CGPointMake(center.x + cos(angle) * ringRadius,
+                                    center.y + sin(angle) * ringRadius);
+        [_ui.drawList addLineFrom:IGVec2Make(previous.x, previous.y)
+                               to:IGVec2Make(point.x, point.y)
+                            color:ringColor
+                        thickness:1.5];
+        previous = point;
     }
-
-    return @[spokes, ring];
 }
 
-- (void)updateCanvasLocked
+- (void)blitCanvasLocked
 {
-    NSMutableArray<NSArray<NSValue *> *> *strips = [NSMutableArray array];
+    if (!_canvasView) return;
 
-    if (_demoEnabled) [strips addObjectsFromArray:[self demoStripsLocked]];
+    IGDrawList *list = _ui.drawList;
+    [_ui beginFrameWithDisplaySize:_screenSize];
+    if (_gridEnabled) [self drawGridLocked];
+    [self drawUserStripsLocked];
+    if (_demoEnabled) [self drawDemoLocked];
+    [_ui endFrame];
 
-    [_stripsLock lock];
-    if (_userStrips.count > 0) [strips addObjectsFromArray:_userStrips];
-    [_stripsLock unlock];
+    [_canvasView blitWithScale:1.0 draw:^(CGContextRef ctx, CGSize pointSize) {
+        [list drawIntoContext:ctx];
+    }];
 
-    UIColor *color = [_strokeColor colorWithAlphaComponent:kIGAlphaSteps[_alphaIndex] / 255.0];
-    [_canvas setStrips:strips color:color width:_lineWidth];
-
-    _canvasCalls = _canvas.lastCallCount;
-    _canvasMS = _canvas.lastUpdateMS;
+    _canvasCalls = _canvasView.lastCallCount;
+    _canvasMS = _canvasView.lastUpdateMS;
     if (_canvasMS > 0.05) {
         double instant = 1000.0 / _canvasMS;
         _canvasFPS = (_canvasFPS < 1.0) ? instant : (_canvasFPS * 0.8 + instant * 0.2);
     }
 }
 
-#pragma mark - 面板推图
-
-- (void)ensurePanelBufferLocked
+- (void)blitPanelLocked
 {
-    if (r_is_objc_ptr(_panelBuffer) && _panelBufferCapacity >= kIGPanelBufferBytes) return;
-    if (!_session) return;
+    if (!_panelView) return;
 
-    RemoteCallSession *session = _session;
-    __block uint64_t buffer = 0;
-    remote_call_with_session(session, ^{
-        buffer = r_dlsym_call(R_TIMEOUT, "malloc", kIGPanelBufferBytes, 0, 0, 0, 0, 0, 0, 0);
-    });
+    IGDrawList *list = _ui.drawList;
+    CGRect rect = _panelRect;
 
-    if (r_is_objc_ptr(buffer)) {
-        _panelBuffer = buffer;
-        _panelBufferCapacity = kIGPanelBufferBytes;
-    } else {
-        cyanide_log(@"[IMGUI] panel buffer alloc failed");
-    }
-}
-
-- (NSData *)renderPanelPNGLocked
-{
     [_ui beginFrameWithDisplaySize:_screenSize];
-    [_ui beginWindow:@"Cyanide · ImGui" frame:_panelRect];
+    [_ui beginWindow:@"Cyanide · ImGui" frame:rect];
     [self buildPanelRowsWithCapture:nil];
     [_ui endWindow];
     [_ui endFrame];
 
-    UIImage *image = [_ui.drawList renderWithSize:_panelRect.size
-                                            scale:_renderScale
-                                        translate:IGVec2Make(_panelRect.origin.x,
-                                                             _panelRect.origin.y)];
-    return image ? UIImagePNGRepresentation(image) : nil;
+    NSTimeInterval begin = CACurrentMediaTime();
+    [_panelView blitWithScale:_renderScale draw:^(CGContextRef ctx, CGSize pointSize) {
+        CGContextTranslateCTM(ctx, -rect.origin.x, -rect.origin.y);
+        [list drawIntoContext:ctx];
+    }];
+    _panelCalls = _panelView.lastCallCount;
+    _panelMS = (CACurrentMediaTime() - begin) * 1000.0;
 }
 
-- (NSData *)renderBubblePNGLocked
+- (void)blitBubbleLocked
 {
-    IGDrawList *list = [[IGDrawList alloc] init];
+    if (!_bubbleView) return;
+
+    IGDrawList *list = _ui.drawList;
     CGFloat half = kIGBubbleSize / 2.0;
+
+    [_ui beginFrameWithDisplaySize:CGSizeMake(kIGBubbleSize, kIGBubbleSize)];
     [list addCircleFilledAt:IGVec2Make(half, half)
-                     radius:half - 1.0
+                     radius:half - 1.5
                       color:IGColorMake(0.06, 0.06, 0.06, 0.92)];
     [list addCircleAt:IGVec2Make(half, half)
-               radius:half - 1.0
-                color:IGColorMake(0.26, 0.59, 0.98, 0.90)
+               radius:half - 1.5
+                color:IGColorMake(0.26, 0.59, 0.98, 0.95)
             thickness:1.5];
     [list addText:@"IG"
-               at:IGVec2Make(half - 8.0, half - 7.0)
+               at:IGVec2Make(half - 9.0, half - 7.0)
          fontSize:12.0
             color:IGColorMake(1.0, 1.0, 1.0, 0.95)];
-    UIImage *image = [list renderWithSize:CGSizeMake(kIGBubbleSize, kIGBubbleSize)
-                                   scale:_renderScale];
-    return image ? UIImagePNGRepresentation(image) : nil;
-}
+    [_ui endFrame];
 
-// 3 条消息：dataWithBytes:length: → imageWithData: → 主线程 setImage:
-- (BOOL)pushPNGLocked:(NSData *)png toImageView:(uint64_t)imageView
-{
-    if (!_session || !r_is_objc_ptr(imageView) || png.length == 0) return NO;
-    if (!r_is_objc_ptr(_panelBuffer)) [self ensurePanelBufferLocked];
-    if (!r_is_objc_ptr(_panelBuffer) || png.length > _panelBufferCapacity) return NO;
-
-    RemoteCallSession *session = _session;
-    uint64_t buffer = _panelBuffer;
-    const void *bytes = png.bytes;
-    uint64_t length = (uint64_t)png.length;
-    uint64_t nsdataClass = _nsdataClass;
-    uint64_t uiimageClass = _uiimageClass;
-    uint64_t selData = _selDataWithBytesLength;
-    uint64_t selImage = _selImageWithData;
-    uint64_t selPerform = _selPerformOnMain;
-    uint64_t selSetImage = _selSetImage;
-
-    __block BOOL ok = NO;
-    remote_call_with_session(session, ^{
-        if (!remote_write(buffer, bytes, length)) {
-            cyanide_log(@"[IMGUI] remote_write failed (%llu bytes)", length);
-            return;
-        }
-
-        uint64_t data = r_msg(nsdataClass, selData, buffer, length, 0, 0);
-        if (!r_is_objc_ptr(data)) return;
-
-        uint64_t image = r_msg(uiimageClass, selImage, data, 0, 0, 0);
-        if (!r_is_objc_ptr(image)) return;
-
-        r_msg(imageView, selPerform, selSetImage, image, 1, 0);
-        ok = YES;
-    });
-    return ok;
-}
-
-- (void)pushPanelLocked
-{
-    if (!_session || !r_is_objc_ptr(_imageView)) return;
-
-    NSTimeInterval begin = CACurrentMediaTime();
-    NSData *png = [self renderPanelPNGLocked];
-    if (png.length == 0) return;
-    if (png.length > _panelBufferCapacity) {
-        cyanide_log(@"[IMGUI] panel png too big: %lu", (unsigned long)png.length);
-        return;
-    }
-
-    BOOL ok = [self pushPNGLocked:png toImageView:_imageView];
-    _panelMS = (CACurrentMediaTime() - begin) * 1000.0;
-
-    if (ok) {
-        _panelPushFailures = 0;
-    } else {
-        _panelPushFailures += 1;
-        cyanide_log(@"[IMGUI] panel push failed (%d)", _panelPushFailures);
-        if (_panelPushFailures >= 5) [self setStatus:@"面板推图连续失败"];
-    }
+    [_bubbleView blitWithScale:_renderScale draw:^(CGContextRef ctx, CGSize pointSize) {
+        [list drawIntoContext:ctx];
+    }];
 }
 
 #pragma mark - 轮询
@@ -1016,7 +875,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     }
     if (grid != _gridEnabled) {
         _gridEnabled = grid;
-        [_canvas setGridVisible:grid];
+        _canvasDirty = YES;
         _panelDirty = YES;
     }
     if (width != _widthIndex) {
@@ -1048,9 +907,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     _panelHidden = YES;
 
     RemoteCallSession *session = _session;
-    uint64_t panelWindow = _panelWindow;
+    uint64_t panelWindow = _panelView ? _panelView.window : 0;
+    uint64_t bubbleWindow = _bubbleView ? _bubbleView.window : 0;
     uint64_t hideSwitch = _switchHide;
-    uint64_t bubbleWindow = _bubbleWindow;
 
     if (session) {
         remote_call_with_session(session, ^{
@@ -1068,9 +927,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     _panelHidden = NO;
 
     RemoteCallSession *session = _session;
-    uint64_t panelWindow = _panelWindow;
+    uint64_t panelWindow = _panelView ? _panelView.window : 0;
+    uint64_t bubbleWindow = _bubbleView ? _bubbleView.window : 0;
     uint64_t restoreSwitch = _switchRestore;
-    uint64_t bubbleWindow = _bubbleWindow;
 
     if (session) {
         remote_call_with_session(session, ^{
@@ -1086,12 +945,12 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 - (void)movePanelLocked
 {
     [self computeLayoutLocked];
+
     CGRect panelRect = _panelRect;
     CGRect bubbleRect = _bubbleRect;
-
+    uint64_t panelWindow = _panelView ? _panelView.window : 0;
+    uint64_t bubbleWindow = _bubbleView ? _bubbleView.window : 0;
     RemoteCallSession *session = _session;
-    uint64_t panelWindow = _panelWindow;
-    uint64_t bubbleWindow = _bubbleWindow;
 
     if (session) {
         uint32_t previousSettle = r_settle_us(8000);
@@ -1101,7 +960,6 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
         });
         r_settle_us(previousSettle);
     }
-    _panelDirty = YES;
 }
 
 #pragma mark - 画布 API
@@ -1148,8 +1006,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     [_stripsLock lock];
     [_userStrips removeAllObjects];
     [_stripsLock unlock];
-    [_canvas clear];
-    _canvasDirty = NO;
+    _canvasDirty = YES;
 }
 
 - (BOOL)demoEnabled { return _demoEnabled; }
@@ -1166,7 +1023,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 - (void)setGridEnabled:(BOOL)enabled
 {
     _gridEnabled = enabled;
-    [_canvas setGridVisible:enabled];
+    _canvasDirty = YES;
     _panelDirty = YES;
 }
 
