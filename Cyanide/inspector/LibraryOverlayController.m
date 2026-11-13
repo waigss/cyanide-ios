@@ -28,6 +28,7 @@
 #import "../DSKeepAlive.h"
 #import "../SettingsViewController.h"
 #import "KernelUserMemory.h"
+#import "CyanideLog.h"
 
 #import <UIKit/UIKit.h>
 #import <notify.h>
@@ -156,7 +157,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 @property (nonatomic, assign) uint64_t titleLabel;
 @property (nonatomic, assign) uint64_t bodyLabel;
 @property (nonatomic, assign) uint64_t runSwitch;
-@property (nonatomic, assign) uint64_t menuSwitches[3];
+@property (nonatomic, assign) uint64_t switchLibList;
+@property (nonatomic, assign) uint64_t switchChain;
+@property (nonatomic, assign) uint64_t switchClose;
 
 @property (nonatomic, assign) int frontmostToken;
 @property (nonatomic, strong) dispatch_source_t timer;
@@ -335,40 +338,57 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
 - (void)pollRunSwitchLocked
 {
     if (!self.springboardSession) return;
-    if (!r_is_objc_ptr(self.menuSwitches[0]) &&
-        !r_is_objc_ptr(self.menuSwitches[1]) &&
-        !r_is_objc_ptr(self.menuSwitches[2])) return;
+    if (!r_is_objc_ptr(self.switchLibList) &&
+        !r_is_objc_ptr(self.switchChain) &&
+        !r_is_objc_ptr(self.switchClose)) return;
 
-    __block BOOL pressed[3] = {NO, NO, NO};
+    __block BOOL pressedLibList = NO;
+    __block BOOL pressedChain = NO;
+    __block BOOL pressedClose = NO;
+
+    uint64_t libSwitch = self.switchLibList;
+    uint64_t chainSwitch = self.switchChain;
+    uint64_t closeSwitch = self.switchClose;
 
     remote_call_with_session(self.springboardSession, ^{
-        for (int i = 0; i < 3; i++) {
-            if (!r_is_objc_ptr(self.menuSwitches[i])) continue;
-            BOOL on = (r_msg2_main(self.menuSwitches[i], "isOn", 0, 0, 0, 0) & 0xff) != 0;
-            if (on) {
-                pressed[i] = YES;
-                r_msg2_main(self.menuSwitches[i], "setOn:animated:", 0, 0, 0, 0);
+        if (r_is_objc_ptr(libSwitch)) {
+            if ((r_msg2_main(libSwitch, "isOn", 0, 0, 0, 0) & 0xff) != 0) {
+                pressedLibList = YES;
+                r_msg2_main(libSwitch, "setOn:animated:", 0, 0, 0, 0);
+            }
+        }
+        if (r_is_objc_ptr(chainSwitch)) {
+            if ((r_msg2_main(chainSwitch, "isOn", 0, 0, 0, 0) & 0xff) != 0) {
+                pressedChain = YES;
+                r_msg2_main(chainSwitch, "setOn:animated:", 0, 0, 0, 0);
+            }
+        }
+        if (r_is_objc_ptr(closeSwitch)) {
+            if ((r_msg2_main(closeSwitch, "isOn", 0, 0, 0, 0) & 0xff) != 0) {
+                pressedClose = YES;
+                r_msg2_main(closeSwitch, "setOn:animated:", 0, 0, 0, 0);
             }
         }
     });
 
-    if (pressed[2]) {
-        cyanide_log(@"[悬浮菜单] 收到关闭指令");
+    if (pressedClose) {
+        cyanide_log(@"[OVERLAY] close requested");
         dispatch_async(dispatch_get_main_queue(), ^{
-            [[NSNotificationCenter defaultCenter] postNotificationName:@"CyanideOverlayCloseRequested" object:nil];
+            [[NSNotificationCenter defaultCenter]
+                postNotificationName:@"CyanideOverlayCloseRequested" object:nil];
         });
         return;
     }
 
-    if (pressed[0]) {
-        [self setStatusLineLocked:@"执行：读取目标库列表…"];
-        cyanide_log(@"[悬浮菜单] 执行：读取库列表");
+    if (pressedLibList) {
+        [self setStatusLineLocked:@"READ_LIBRARIES"];
+        cyanide_log(@"[OVERLAY] action: read libraries");
         [self refreshLibrariesLocked];
     }
 
-    if (pressed[1]) {
-        [self setStatusLineLocked:@"执行：指针链…"];
-        cyanide_log(@"[悬浮菜单] 执行：指针链");
+    if (pressedChain) {
+        [self setStatusLineLocked:@"RUN_CHAIN"];
+        cyanide_log(@"[OVERLAY] action: pointer chain");
         [self runPointerChainLocked];
     }
 }
@@ -438,7 +458,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
     __block uint64_t builtWindow = 0;
     __block uint64_t builtTitle = 0;
     __block uint64_t builtBody = 0;
-    __block uint64_t builtSwitches[3] = {0, 0, 0};
+    __block uint64_t builtSwitchLibList = 0;
+    __block uint64_t builtSwitchChain = 0;
+    __block uint64_t builtSwitchClose = 0;
 
     CGFloat screenW = MAX(200.0, self.screenSize.width);
     CGFloat screenH = MAX(320.0, self.screenSize.height);
@@ -563,7 +585,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
                 r_msg2_main(rowSwitch, "setOn:", 0, 0, 0, 0);
                 ov_set_rect(rowSwitch, "setFrame:", CGRectMake(width - 58.0, y, 52.0, 30.0));
                 r_msg2_main(window, "addSubview:", rowSwitch, 0, 0, 0);
-                builtSwitches[i] = rowSwitch;
+                if (i == 0) builtSwitchLibList = rowSwitch;
+                else if (i == 1) builtSwitchChain = rowSwitch;
+                else builtSwitchClose = rowSwitch;
             }
         }
 
@@ -601,10 +625,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
     self.window = builtWindow;
     self.titleLabel = builtTitle;
     self.bodyLabel = builtBody;
-    self.runSwitch = builtSwitches[0];
-    for (int i = 0; i < 3; i++) {
-        self.menuSwitches[i] = builtSwitches[i];
-    }
+    self.switchLibList = builtSwitchLibList;
+    self.switchChain = builtSwitchChain;
+    self.switchClose = builtSwitchClose;
 
     if (!ok) {
         self.springboardSession = nil;
@@ -621,9 +644,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
         self.window = 0;
         self.titleLabel = 0;
         self.bodyLabel = 0;
-        self.menuSwitches[0] = 0;
-        self.menuSwitches[1] = 0;
-        self.menuSwitches[2] = 0;
+        self.switchLibList = 0;
+        self.switchChain = 0;
+        self.switchClose = 0;
         return;
     }
 
@@ -646,9 +669,9 @@ static RemoteCallSession *ov_attach(NSString *name, uint64_t procAddr,
     self.window = 0;
     self.titleLabel = 0;
     self.bodyLabel = 0;
-    self.menuSwitches[0] = 0;
-    self.menuSwitches[1] = 0;
-    self.menuSwitches[2] = 0;
+    self.switchLibList = 0;
+    self.switchChain = 0;
+    self.switchClose = 0;
 }
 
 - (void)setStatusLineLocked:(NSString *)line
