@@ -36,6 +36,7 @@
 #import "SymbolListViewController.h"
 #import "LibraryOverlayController.h"
 #import "CyanideImGuiOverlay.h"
+#import "ImGuiViewController.h"
 #import "../DSKeepAlive.h"
 
 // 定义在 ViewController.m：借 SpringBoard 签发 "/" 的 read-write 扩展再本地 consume，
@@ -145,6 +146,15 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
     [self loadModules];
 }
 
+#pragma mark - ImGui 本地演示
+
+// App 自己的窗口里跑真 ImGui（Metal + 触摸），不碰内核、不碰 SpringBoard。
+// 先在本地把 ImGui 跑通，再谈把它推到全局窗口。
+- (void)showImGuiDemo
+{
+    [ImGuiViewController presentFrom:self];
+}
+
 #pragma mark - ImGui 悬浮窗
 
 // 三层窗口：全屏透明画布（穿透）+ ImGui 面板 + 收起后的圆钮。
@@ -244,6 +254,13 @@ typedef NS_ENUM(NSInteger, ModuleListState) {
                                     identifier:nil
                                        handler:^(UIAction *a) {
         [weakSelf toggleImGuiOverlay];
+    }]];
+
+    [items addObject:[UIAction actionWithTitle:@"ImGui 本地演示"
+                                         image:[UIImage systemImageNamed:@"square.grid.2x2"]
+                                    identifier:nil
+                                       handler:^(UIAction *a) {
+        [weakSelf showImGuiDemo];
     }]];
 
     NSString *watchTitle = self.watching ? @"停止后台监听" : @"后台监听";
