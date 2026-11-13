@@ -137,7 +137,32 @@ static uint32_t px_bitmap_info(void)
         // 窗口对象存在、句柄有效、setImage: 也成功，但永远不会被合成到屏幕上。
         window = r_msg2_main_raw(windowAlloc, "initWithFrame:", &frame, sizeof(frame),
                                  NULL, 0, NULL, 0, NULL, 0);
-        if (!r_is_objc_ptr(window)) { failStage = "initWithWindowScene"; return; }
+        if (!r_is_objc_ptr(window)) { failStage = "UIWindow init"; return; }
+
+        // iOS 13+ 的窗口是"场景化"的：没有挂到 UIWindowScene 上的窗口即使
+        // hidden=NO + makeKeyAndVisible 也可能不参与合成。这里从
+        // UIApplication.connectedScenes 里挑一个前台活跃的 scene 显式挂上去。
+        uint64_t applicationObj = px_msg(r_class("UIApplication"), @"sharedApplication", 0, 0, 0, 0);
+        uint64_t scenes = r_is_objc_ptr(applicationObj) ? px_msg(applicationObj, @"connectedScenes", 0, 0, 0, 0) : 0;
+        uint64_t chosenScene = 0;
+        if (r_is_objc_ptr(scenes)) {
+            uint64_t enumerator = px_msg(scenes, @"objectEnumerator", 0, 0, 0, 0);
+            for (int guard = 0; guard < 8 && r_is_objc_ptr(enumerator); guard++) {
+                uint64_t scene = px_msg(enumerator, @"nextObject", 0, 0, 0, 0);
+                if (!r_is_objc_ptr(scene)) break;
+                uint64_t state = px_msg(scene, @"activationState", 0, 0, 0, 0);
+                if (!r_is_objc_ptr(chosenScene)) chosenScene = scene;
+                if (state == 0) {          // UISceneActivationStateForegroundActive
+                    chosenScene = scene;
+                    break;
+                }
+            }
+        }
+        if (r_is_objc_ptr(chosenScene)) {
+            px_msg(window, @"setWindowScene:", chosenScene, 0, 0, 0);
+        } else {
+            cyanide_log(@"[PIXEL] no connected scene; window may not composite");
+        }
 
         r_msg2_main_raw(window, "setWindowLevel:", &windowLevel, sizeof(windowLevel),
                         NULL, 0, NULL, 0, NULL, 0);
