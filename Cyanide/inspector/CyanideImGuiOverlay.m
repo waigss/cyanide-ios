@@ -104,6 +104,12 @@ static uint64_t ig_get(uint64_t obj, NSString *selName)
 {
     return ig_msg(obj, selName, 0, 0, 0, 0);
 }
+// 主线程版：创建/改 UIKit 对象必须用它（非主线程创建的窗口不会显示）
+static uint64_t ig_msg_main(uint64_t obj, NSString *selName, uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3)
+{
+    if (!r_is_objc_ptr(obj) || !selName) return 0;
+    return r_msg2_main(obj, selName.UTF8String, a0, a1, a2, a3);
+}
 
 static void ig_set_rect(uint64_t obj, const char *selName, CGRect rect)
 {
@@ -139,21 +145,21 @@ static uint64_t ig_make_switch(uint64_t parent, CGRect frame, BOOL on)
     uint64_t cls = ig_class(@"UISwitch");
     if (!r_is_objc_ptr(cls)) return 0;
 
-    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
-    uint64_t control = r_is_objc_ptr(alloc) ? ig_msg(alloc, @"init", 0, 0, 0, 0) : 0;
+    uint64_t alloc = ig_msg_main(cls, @"alloc", 0, 0, 0, 0);
+    uint64_t control = r_is_objc_ptr(alloc) ? ig_msg_main(alloc, @"init", 0, 0, 0, 0) : 0;
     if (!r_is_objc_ptr(control)) return 0;
 
     ig_set_rect(control, "setFrame:", frame);
     ig_set_double(control, "setAlpha:", 0.02);
-    ig_msg(control, @"setOn:", on ? 1 : 0, 0, 0, 0);
+    ig_msg_main(control, @"setOn:", on ? 1 : 0, 0, 0, 0);
 
-    uint64_t clear = ig_msg(ig_class(@"UIColor"), @"clearColor", 0, 0, 0, 0);
+    uint64_t clear = ig_msg_main(ig_class(@"UIColor"), @"clearColor", 0, 0, 0, 0);
     if (r_is_objc_ptr(clear)) {
-        ig_msg(control, @"setOnTintColor:", clear, 0, 0, 0);
-        ig_msg(control, @"setThumbTintColor:", clear, 0, 0, 0);
+        ig_msg_main(control, @"setOnTintColor:", clear, 0, 0, 0);
+        ig_msg_main(control, @"setThumbTintColor:", clear, 0, 0, 0);
     }
 
-    ig_msg(parent, @"addSubview:", control, 0, 0, 0);
+    ig_msg_main(parent, @"addSubview:", control, 0, 0, 0);
     return control;
 }
 
@@ -162,7 +168,7 @@ static uint64_t ig_make_segments(uint64_t parent, CGRect frame, NSArray<NSString
     uint64_t cls = ig_class(@"UISegmentedControl");
     if (!r_is_objc_ptr(cls)) return 0;
 
-    uint64_t alloc = ig_msg(cls, @"alloc", 0, 0, 0, 0);
+    uint64_t alloc = ig_msg_main(cls, @"alloc", 0, 0, 0, 0);
     if (!r_is_objc_ptr(alloc)) return 0;
 
     uint64_t control = r_msg2_main_raw(alloc, "initWithFrame:", &frame, sizeof(frame),
@@ -173,12 +179,12 @@ static uint64_t ig_make_segments(uint64_t parent, CGRect frame, NSArray<NSString
     for (NSString *label in labels) {
         uint64_t text = ig_nsstring(label);
         if (!r_is_objc_ptr(text)) continue;
-        ig_msg(control, @"insertSegmentWithTitle:animated:", text, 0, 0, 0);
+        ig_msg_main(control, @"insertSegmentWithTitle:animated:", text, 0, 0, 0);
         ig_release(text);
     }
-    ig_msg(control, @"setSelectedSegmentIndex:", (uint64_t)MAX((NSInteger)0, active), 0, 0, 0);
+    ig_msg_main(control, @"setSelectedSegmentIndex:", (uint64_t)MAX((NSInteger)0, active), 0, 0, 0);
 
-    ig_msg(parent, @"addSubview:", control, 0, 0, 0);
+    ig_msg_main(parent, @"addSubview:", control, 0, 0, 0);
     return control;
 }
 
@@ -363,7 +369,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     {
         __block uint64_t foundScene = 0;
         remote_call_with_session(session, ^{
-            uint64_t app = ig_msg(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
+            uint64_t app = ig_msg_main(ig_class(@"UIApplication"), @"sharedApplication", 0, 0, 0, 0);
             if (!r_is_objc_ptr(app)) return;
             uint64_t keyWindow = ig_msg(app, @"keyWindow", 0, 0, 0, 0);
             if (!r_is_objc_ptr(keyWindow)) {
@@ -443,7 +449,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     {
         __block uint64_t bubbleWindow = _bubbleView ? _bubbleView.window : 0;
-        uint32_t previousSettle = r_settle_us(8000);
+        uint32_t previousSettle = r_settle_us(0);
         remote_call_with_session(session, ^{
             swDemo = ig_make_switch(panelWindow, CGRectOffset(rowDemo, offsetX, offsetY), demoOn);
             swGrid = ig_make_switch(panelWindow, CGRectOffset(rowGrid, offsetX, offsetY), gridOn);
@@ -459,7 +465,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
             if (r_is_objc_ptr(bubbleWindow)) {
                 CGRect restoreFrame = CGRectMake(0.0, 0.0, kIGBubbleSize, kIGBubbleSize);
                 swRestore = ig_make_switch(bubbleWindow, restoreFrame, NO);
-                ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
+                ig_msg_main(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
             }
         });
         r_settle_us(previousSettle);
@@ -913,9 +919,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     if (session) {
         remote_call_with_session(session, ^{
-            ig_msg(panelWindow, @"setHidden:", 1, 0, 0, 0);
-            ig_msg(hideSwitch, @"setOn:", 0, 0, 0, 0);
-            ig_msg(bubbleWindow, @"setHidden:", 0, 0, 0, 0);
+            ig_msg_main(panelWindow, @"setHidden:", 1, 0, 0, 0);
+            ig_msg_main(hideSwitch, @"setOn:", 0, 0, 0, 0);
+            ig_msg_main(bubbleWindow, @"setHidden:", 0, 0, 0, 0);
         });
     }
     [self setStatus:@"面板已收起 · 点左上角圆钮恢复"];
@@ -933,9 +939,9 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
 
     if (session) {
         remote_call_with_session(session, ^{
-            ig_msg(restoreSwitch, @"setOn:", 0, 0, 0, 0);
-            ig_msg(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
-            ig_msg(panelWindow, @"setHidden:", 0, 0, 0, 0);
+            ig_msg_main(restoreSwitch, @"setOn:", 0, 0, 0, 0);
+            ig_msg_main(bubbleWindow, @"setHidden:", 1, 0, 0, 0);
+            ig_msg_main(panelWindow, @"setHidden:", 0, 0, 0, 0);
         });
     }
     _panelDirty = YES;
@@ -953,7 +959,7 @@ typedef NS_ENUM(NSInteger, IGOverlayState) {
     RemoteCallSession *session = _session;
 
     if (session) {
-        uint32_t previousSettle = r_settle_us(8000);
+        uint32_t previousSettle = r_settle_us(0);
         remote_call_with_session(session, ^{
             ig_set_rect(panelWindow, "setFrame:", panelRect);
             ig_set_rect(bubbleWindow, "setFrame:", bubbleRect);
