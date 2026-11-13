@@ -315,6 +315,81 @@ static uint32_t px_bitmap_info(void)
     return ok;
 }
 
+- (BOOL)blitPixels:(const void *)pixels byteLength:(NSUInteger)byteLength
+{
+    if (!_ready || !_session || !pixels) return NO;
+    if (!r_is_objc_ptr(_pixelBuffer) || !r_is_objc_ptr(_context)) return NO;
+    if (byteLength < (NSUInteger)_pixelBufferBytes) {
+        cyanide_log(@"[PIXEL] blitPixels size mismatch: %lu < %u",
+                    (unsigned long)byteLength, _pixelBufferBytes);
+        return NO;
+    }
+
+    NSTimeInterval begin = CACurrentMediaTime();
+
+    RemoteCallSession *session = _session;
+    uint64_t buffer = _pixelBuffer;
+    uint64_t context = _context;
+    uint64_t imageView = _imageView;
+    uint64_t lastImage = _lastImage;
+    uint64_t byteCount = (uint64_t)_pixelBufferBytes;
+    uint64_t imageClass = _imageClass;
+    uint64_t selAlloc = _selAlloc;
+    uint64_t selInit = _selInitWithCGImage;
+    uint64_t selPerform = _selPerformOnMain;
+    uint64_t selSetImage = _selSetImage;
+    uint64_t selRelease = _selRelease;
+
+    __block NSUInteger calls = 0;
+    __block uint64_t newImage = 0;
+    __block BOOL ok = NO;
+
+    remote_call_with_session(session, ^{
+        if (!remote_write(buffer, pixels, byteCount)) {
+            cyanide_log(@"[PIXEL] remote_write failed (%llu bytes)", byteCount);
+            return;
+        }
+
+        uint64_t cgImage = r_dlsym_call(R_TIMEOUT, "CGBitmapContextCreateImage", context, 0, 0, 0, 0, 0, 0, 0);
+        calls += 1;
+        if (!r_is_objc_ptr(cgImage)) return;
+
+        uint64_t allocated = r_msg(imageClass, selAlloc, 0, 0, 0, 0);
+        calls += 1;
+        if (!r_is_objc_ptr(allocated)) {
+            r_dlsym_call(R_TIMEOUT, "CGImageRelease", cgImage, 0, 0, 0, 0, 0, 0, 0);
+            return;
+        }
+
+        uint64_t uiImage = r_msg(allocated, selInit, cgImage, 0, 0, 0);
+        calls += 1;
+        if (!r_is_objc_ptr(uiImage)) {
+            r_dlsym_call(R_TIMEOUT, "CGImageRelease", cgImage, 0, 0, 0, 0, 0, 0, 0);
+            return;
+        }
+
+        r_msg(imageView, selPerform, selSetImage, uiImage, 1, 0);
+        calls += 1;
+
+        r_msg(uiImage, selRelease, 0, 0, 0, 0);
+        calls += 1;
+
+        if (r_is_objc_ptr(lastImage)) {
+            r_dlsym_call(R_TIMEOUT, "CGImageRelease", lastImage, 0, 0, 0, 0, 0, 0, 0);
+            calls += 1;
+        }
+
+        newImage = cgImage;
+        ok = YES;
+    });
+
+    if (ok && r_is_objc_ptr(newImage)) _lastImage = newImage;
+
+    _lastCallCount = calls;
+    _lastUpdateMS = (CACurrentMediaTime() - begin) * 1000.0;
+    return ok;
+}
+
 - (void)detach
 {
     RemoteCallSession *session = _session;
